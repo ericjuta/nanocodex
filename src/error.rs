@@ -18,6 +18,9 @@ pub enum ResponsesError {
     #[error("Responses WebSocket handshake failed")]
     Handshake(#[source] WebSocketError),
 
+    #[error("Responses WebSocket handshake was rejected with HTTP {status}: {body}")]
+    HandshakeRejected { status: u16, body: String },
+
     #[error("failed to send a Responses WebSocket frame")]
     Send(#[source] WebSocketError),
 
@@ -38,6 +41,20 @@ pub enum ResponsesError {
 
     #[error("failed to encode a Responses WebSocket request")]
     EncodeRequest(#[source] serde_json::Error),
+
+    #[error("tool call {call_id} arguments were not valid JSON for exec_command")]
+    InvalidToolArguments {
+        call_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("failed to encode the result for tool call {call_id}")]
+    EncodeToolOutput {
+        call_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
 
     #[error("Responses API event did not match its declared type: {event}")]
     InvalidPayload {
@@ -77,6 +94,9 @@ pub enum AgentError {
 
     #[error("model call limit ({limit}) reached before the task completed")]
     ModelCallLimit { limit: u32 },
+
+    #[error("Responses API requested unsupported function {name} in call {call_id}")]
+    UnsupportedFunction { name: String, call_id: String },
 
     #[error("malformed Responses API event ({detail}): {event}")]
     MalformedResponse {

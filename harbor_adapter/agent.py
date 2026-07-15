@@ -46,6 +46,7 @@ class HarnessAgent(BaseInstalledAgent):
         effort: str = "low",
         max_model_calls: int = 32,
         compact_threshold: int = 350_000,
+        multi_agent: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
@@ -54,6 +55,7 @@ class HarnessAgent(BaseInstalledAgent):
         self._effort = effort
         self._max_model_calls = max_model_calls
         self._compact_threshold = compact_threshold
+        self._multi_agent = multi_agent
 
     @staticmethod
     def name() -> str:
@@ -104,6 +106,8 @@ class HarnessAgent(BaseInstalledAgent):
             "--compact-threshold",
             str(self._compact_threshold),
         ]
+        if self._multi_agent:
+            arguments.append("--multi-agent")
         command = (
             " ".join(shlex.quote(argument) for argument in arguments)
             + f" < {self._INPUT} 2> {self._STDERR} | tee {self._EVENTS}"
@@ -174,7 +178,10 @@ class HarnessAgent(BaseInstalledAgent):
                 name=self.name(),
                 version=self.version() or "unknown",
                 model_name=terminal_payload.get("model"),
-                extra={"transport": terminal_payload.get("transport")},
+                extra={
+                    "transport": terminal_payload.get("transport"),
+                    "orchestration": terminal_payload.get("orchestration"),
+                },
             ),
             steps=[
                 Step(
@@ -218,6 +225,28 @@ class HarnessAgent(BaseInstalledAgent):
                             "tool_wall_duration_ns": terminal_payload.get(
                                 "tool_wall_duration_ns"
                             ),
+                            "injections_sent": terminal_payload.get(
+                                "injections_sent"
+                            ),
+                            "injections_accepted": terminal_payload.get(
+                                "injections_accepted"
+                            ),
+                            "injections_deferred": terminal_payload.get(
+                                "injections_deferred"
+                            ),
+                            "continuations_queued": terminal_payload.get(
+                                "continuations_queued"
+                            ),
+                            "injection_ack_wait_ns": terminal_payload.get(
+                                "injection_ack_wait_ns"
+                            ),
+                            "hosted_multi_agent_calls": terminal_payload.get(
+                                "hosted_multi_agent_calls"
+                            ),
+                            "agent_messages": terminal_payload.get(
+                                "agent_messages"
+                            ),
+                            "compactions": terminal_payload.get("compactions"),
                         },
                     )
                     if model_calls
@@ -249,6 +278,24 @@ class HarnessAgent(BaseInstalledAgent):
                     "tool_wall_duration_ns": terminal_payload.get(
                         "tool_wall_duration_ns"
                     ),
+                    "injections_sent": terminal_payload.get("injections_sent"),
+                    "injections_accepted": terminal_payload.get(
+                        "injections_accepted"
+                    ),
+                    "injections_deferred": terminal_payload.get(
+                        "injections_deferred"
+                    ),
+                    "continuations_queued": terminal_payload.get(
+                        "continuations_queued"
+                    ),
+                    "injection_ack_wait_ns": terminal_payload.get(
+                        "injection_ack_wait_ns"
+                    ),
+                    "hosted_multi_agent_calls": terminal_payload.get(
+                        "hosted_multi_agent_calls"
+                    ),
+                    "agent_messages": terminal_payload.get("agent_messages"),
+                    "compactions": terminal_payload.get("compactions"),
                     "cache_write_input_tokens": usage.get(
                         "cache_write_input_tokens"
                     ),
@@ -274,6 +321,7 @@ class HarnessAgent(BaseInstalledAgent):
             "model": terminal_payload.get("model"),
             "effort": terminal_payload.get("effort"),
             "transport": terminal_payload.get("transport"),
+            "orchestration": terminal_payload.get("orchestration"),
             "duration_ms": terminal_payload.get("duration_ms"),
             "duration_ns": terminal_payload.get("duration_ns"),
             "model_duration_ns": terminal_payload.get("model_duration_ns"),
@@ -281,6 +329,16 @@ class HarnessAgent(BaseInstalledAgent):
             "warmup_usage": warmup_usage,
             "tool_work_duration_ns": terminal_payload.get("tool_work_duration_ns"),
             "tool_wall_duration_ns": terminal_payload.get("tool_wall_duration_ns"),
+            "injections_sent": terminal_payload.get("injections_sent"),
+            "injections_accepted": terminal_payload.get("injections_accepted"),
+            "injections_deferred": terminal_payload.get("injections_deferred"),
+            "continuations_queued": terminal_payload.get("continuations_queued"),
+            "injection_ack_wait_ns": terminal_payload.get("injection_ack_wait_ns"),
+            "hosted_multi_agent_calls": terminal_payload.get(
+                "hosted_multi_agent_calls"
+            ),
+            "agent_messages": terminal_payload.get("agent_messages"),
+            "compactions": terminal_payload.get("compactions"),
             "reasoning_output_tokens": usage.get("reasoning_output_tokens"),
             "cache_write_input_tokens": usage.get("cache_write_input_tokens"),
             "last_response_id": terminal_payload.get("last_response_id"),

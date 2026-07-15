@@ -1,64 +1,80 @@
 mod output;
 mod process;
 
-use std::path::Path;
+use std::{path::PathBuf, time::Duration};
 
 use serde::Serialize;
 
-#[derive(Serialize)]
-pub(crate) struct ShellExecution {
-    pub(crate) max_output_length: u64,
-    pub(crate) output: Vec<ShellCommandOutput>,
+pub(crate) struct ExecCommand {
+    script: String,
+    workdir: Option<String>,
+    login: Option<bool>,
+    timeout_ms: Option<i64>,
+    max_output_tokens: Option<i64>,
+}
+
+impl ExecCommand {
+    pub(crate) const fn new(
+        script: String,
+        workdir: Option<String>,
+        login: Option<bool>,
+        timeout_ms: Option<i64>,
+        max_output_tokens: Option<i64>,
+    ) -> Self {
+        Self {
+            script,
+            workdir,
+            login,
+            timeout_ms,
+            max_output_tokens,
+        }
+    }
 }
 
 #[derive(Serialize)]
-pub(crate) struct ShellCommandOutput {
-    pub(crate) stdout: String,
-    pub(crate) stderr: String,
-    pub(crate) outcome: ShellOutcome,
+pub(crate) struct ExecCommandResult {
+    wall_time_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    output: String,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ShellOutcome {
+struct ShellCommandOutput {
+    stdout: String,
+    stderr: String,
+    outcome: ShellOutcome,
+}
+
+enum ShellOutcome {
     Exit { exit_code: i32 },
     Timeout,
 }
 
-pub(crate) async fn execute_action(
-    commands: Vec<String>,
-    timeout_ms: Option<i64>,
-    max_output_length: Option<i64>,
-    workspace: &str,
-) -> ShellExecution {
-    let command_timeout = process::effective_timeout(timeout_ms);
-    let output_limit = output::effective_limit(max_output_length);
+pub(crate) async fn execute(command: ExecCommand, workspace: &str) -> ExecCommandResult {
+    let started_at = std::time::Instant::now();
+    let command_timeout = process::effective_timeout(command.timeout_ms);
+    let output_limit = output::effective_token_limit(command.max_output_tokens);
     let (environment, secrets) = process::sanitized_environment();
-    let mut remaining_output = output_limit;
-    let mut output = Vec::with_capacity(commands.len());
-
-    for script in commands {
-        let command_output = process::execute(
-            &script,
-            Path::new(workspace),
-            command_timeout,
-            remaining_output,
-            &environment,
-            &secrets,
-        )
-        .await;
-        let timed_out = matches!(&command_output.outcome, ShellOutcome::Timeout);
-        remaining_output = remaining_output.saturating_sub(command_output.character_count());
-        output.push(command_output);
-        if timed_out {
-            break;
-        }
-    }
-
-    ShellExecution {
-        max_output_length: u64::try_from(output_limit).unwrap_or(u64::MAX),
-        output,
-    }
+    let requested_workdir = command
+        .workdir
+        .filter(|workdir| !workdir.is_empty())
+        .map_or_else(|| PathBuf::from(workspace), PathBuf::from);
+    let workdir = if requested_workdir.is_absolute() {
+        requested_workdir
+    } else {
+        PathBuf::from(workspace).join(requested_workdir)
+    };
+    let output = process::execute(
+        &command.script,
+        &workdir,
+        command.login.unwrap_or(true),
+        command_timeout,
+        output_limit,
+        &environment,
+        &secrets,
+    )
+    .await;
+    output.into_result(started_at.elapsed())
 }
 
 impl ShellCommandOutput {
@@ -70,10 +86,28 @@ impl ShellCommandOutput {
         }
     }
 
-    fn character_count(&self) -> usize {
-        self.stdout
-            .chars()
-            .count()
-            .saturating_add(self.stderr.chars().count())
+    fn into_result(self, wall_time: Duration) -> ExecCommandResult {
+        let mut output = self.stdout;
+        if !self.stderr.is_empty() {
+            if !output.is_empty() && !output.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push_str(&self.stderr);
+        }
+        let exit_code = match self.outcome {
+            ShellOutcome::Exit { exit_code } => Some(exit_code),
+            ShellOutcome::Timeout => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str("Command timed out.");
+                None
+            }
+        };
+        ExecCommandResult {
+            wall_time_seconds: wall_time.as_secs_f64(),
+            exit_code,
+            output,
+        }
     }
 }

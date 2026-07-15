@@ -42,6 +42,10 @@ enum Command {
         /// Rendered-token threshold for server-managed compaction.
         #[arg(long, env = "OPENAI_COMPACT_THRESHOLD", default_value_t = 350_000)]
         compact_threshold: u64,
+
+        /// Enable hosted Multi-agent for explicit delegation or hard parallel work.
+        #[arg(long, env = "OPENAI_MULTI_AGENT", default_value_t = false)]
+        multi_agent: bool,
     },
 }
 
@@ -55,6 +59,7 @@ async fn main() -> Result<()> {
             websocket_url,
             max_model_calls,
             compact_threshold,
+            multi_agent,
         } => {
             ensure!(!model.trim().is_empty(), "model must not be empty");
             ensure!(
@@ -76,6 +81,7 @@ async fn main() -> Result<()> {
                 websocket_url,
                 max_model_calls,
                 compact_threshold,
+                multi_agent,
             };
             harness::run(io::stdin().lock(), io::stdout().lock(), config).await?;
         }

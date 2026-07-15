@@ -94,11 +94,12 @@ Status: first real model/tool vertical slice complete.
    do not send the HTTP `stream` field. Warm stable request state with
    `generate: false`, continue incrementally with `previous_response_id`, and
    preserve every raw inbound and outbound API event.
-3. Expose the Responses native local `shell` tool exclusively through hosted
-   Programmatic Tool Calling with `allowed_callers: ["programmatic"]`. Rust
-   executes `shell_call` actions and returns typed `shell_call_output` items.
-   Do not expose a direct-call fallback, imitate Codex's internal
-   `exec_command` function schema, or run generated JavaScript locally.
+3. Use the Codex-trained `exec_command` function shape for local shell work.
+   In the default single-agent profile, expose it exclusively through hosted
+   Programmatic Tool Calling with `allowed_callers: ["programmatic"]`; Rust
+   executes typed `function_call` items and returns typed
+   `function_call_output` items with the original PTC caller. OpenAI runs the
+   generated JavaScript; Rust never does.
 4. Treat one generated JavaScript program as a bounded mechanical phase. Use
    `Promise.all` for independent reads, sequence dependent work and mutations,
    reduce intermediate results in hosted JavaScript, retry transient work at
@@ -125,18 +126,23 @@ Status: first real model/tool vertical slice complete.
    `reasoning.mode: "standard"` for the interactive tool loop and make effort a
    CLI/eval setting: low for the fast smoke loop, max only when the measured
    quality gain warrants its latency and cost.
-10. Enable hosted Responses Multi-agent rather than implementing local
-    subagents. Start with the recommended three concurrent subagents and use
-    them only for concrete independent workstreams. OpenAI owns spawning,
-    messaging, waiting, interruption, contexts, scheduling, and result
-    delivery; the Rust client executes only developer-defined local tool calls.
-11. Keep PTC and Multi-agent as separate orchestration planes. PTC handles
-    predictable mechanical control flow; Multi-agent handles semantic
-    delegation. Hosted collaboration actions are never executed locally or
-    made callable from PTC.
-12. In Multi-agent WebSocket turns, execute each local call and send its output
-    with `response.inject` as soon as it is ready so the waiting agent can
-    resume. Preserve agent attribution and injection acknowledgement in JSONL.
+10. Keep hosted Responses Multi-agent opt-in with `--multi-agent`; selecting it
+    is appropriate when the user explicitly asks for delegation or a genuinely
+    difficult task has independent workstreams. Do not spawn for routine,
+    short, or sequential work. Start with three concurrent subagents. OpenAI
+    owns spawning, messaging, waiting, interruption, contexts, scheduling, and
+    result delivery.
+11. Keep PTC and Multi-agent as separate request profiles. PTC is the default
+    for predictable mechanical control flow. The current live API rejects
+    `response.inject` for PTC-nested calls (`caller.type = "program"`) while a
+    Multi-agent response is active, so the Multi-agent profile exposes the same
+    `exec_command` function to direct callers and omits PTC. Do not hide this
+    compatibility boundary behind retries or a local orchestration fallback.
+12. In Multi-agent WebSocket turns, execute each direct local call and send its
+    output with `response.inject` as soon as it is ready so the waiting agent
+    can resume. In PTC turns, continue the stored response with the typed output
+    and `previous_response_id`. Preserve caller and agent attribution plus
+    injection acknowledgement in JSONL.
 13. Multi-agent does not support `reasoning.summary`. Preserve exposed root and
     agent messages, encrypted content, and raw events honestly; never claim to
     have captured hidden chain of thought. If a later single-agent mutation
@@ -156,7 +162,7 @@ verifier were not modified.
 
 ## Milestone 1.1: runtime cleanup
 
-Status: planned. Complete this before eval-driven tuning. Reduce production
+Status: complete. Reduce production
 surface area while preserving the working OpenAI/Harbor vertical slice; avoid
 new framework layers whose main effect is moving code around.
 
@@ -176,10 +182,10 @@ new framework layers whose main effect is moving code around.
    values for one-off static tool schemas where dedicated serde types only add
    lines. Do not add event buses, channels, collector traits, or shared mutable
    statistics.
-5. Replace the custom Codex-shaped `exec_command` function with the Responses
-   native local `shell` contract. Implement the native action/output shape
-   exactly and delete the custom function schema, including its ignored
-   `yield_time_ms` and unsupported `tty` fields.
+5. Keep a deliberately one-shot subset of Codex's `exec_command` function:
+   `cmd`, `workdir`, `login`, `timeout_ms`, and `max_output_tokens`, with a
+   structured output schema. Do not advertise PTY sessions, `write_stdin`,
+   approval fields, or yield behavior until the runtime implements them.
 6. Collapse redundant model-stream state and processing: consume completed
    output once, remove unread response state and unused error variants, move
    owned function calls into concurrent execution instead of cloning them, and
@@ -187,8 +193,8 @@ new framework layers whose main effect is moving code around.
    represented as tool outcomes.
 7. Replace post-hoc command-output truncation with bounded collection while the
    subprocess runs. Preserve useful truncation metadata without retaining
-   unbounded stdout or stderr, and adopt Codex's process-group/parent-death
-   cleanup pattern so timeout or cancellation also cleans up descendants.
+   unbounded stdout or stderr, and adopt Codex's process-group cleanup pattern
+   so timeout or cancellation also cleans up descendants.
 8. Consolidate repeated defensive bookkeeping where the runtime already has a
    hard invariant: sample terminal duration once, avoid silent saturating
    counters, and eliminate validation repeated by constructed types.
@@ -203,29 +209,44 @@ event per accepted request, long command output remains memory-bounded,
 timed-out commands leave no descendant processes, and the cleanup produces a
 material net reduction in Rust LOC.
 
-## Milestone 1.2: combined hosted API compatibility gate
+## Milestone 1.2: hosted API compatibility matrix
+
+Status: complete.
 
 Before treating the hosted surface as the eval baseline, prove its combined
 event matrix with one real vertical smoke rather than separate mocks:
 
-1. Open the WebSocket with both the WebSocket and Responses Multi-agent beta
-   headers and warm the stable prompt/tool state with `generate: false`.
-2. Enable hosted PTC, native local shell, server compaction, explicit prompt
-   caching, stored response state, and hosted Multi-agent together.
-3. Give the root a bounded task that requires one subagent to use PTC and issue
-   a local shell call.
-4. Execute the shell action in Rust, inject its typed result into the active
-   response, and verify agent attribution plus PTC caller linkage survives.
-5. Use a deliberately low smoke-only threshold to force an encrypted compaction
-   item, then continue to one final root assistant message.
-6. Inspect raw JSONL, cache/usage metrics, injection acknowledgement, compaction
-   event ordering, and the final task result. Retain the Harbor trajectory; do
-   not create a fixture or local journal until a demonstrated regression needs
-   one.
+1. Open ordinary WebSockets without a beta header and Multi-agent WebSockets
+   with only `OpenAI-Beta: responses_multi_agent=v1`. Warm each exact stable
+   prompt/tool profile with `generate: false`, then chain from that response ID.
+2. Prove the default PTC profile with a hosted JavaScript program, one
+   programmatic `exec_command`, caller-preserving continuation, and one final
+   assistant message.
+3. Prove the opt-in Multi-agent profile with one named subagent, one direct
+   `exec_command`, an accepted live `response.inject`, agent attribution, and
+   one `/root` final answer.
+4. Retain the negative compatibility evidence that a PTC-nested output is
+   rejected as “not ready for an output” under Multi-agent, rather than adding
+   an arbitrary retry or claiming the combination works.
+5. Use a deliberately low smoke-only threshold to force automatic compaction,
+   then continue to one final root assistant message.
+6. Inspect raw JSONL, cache/usage metrics, continuation or injection timing,
+   compaction event ordering, and the final task result. Retain the Harbor
+   trajectory; do not create a fixture or local journal until a demonstrated
+   regression needs one.
 
-Gate: the combined live request completes without a compatibility fallback and
-without Python tool plumbing. Rust emits exactly one task terminal and all
-non-API wall time is measured.
+Gate: both supported profiles complete without Python tool plumbing, the
+unsupported composition is explicit, Rust emits exactly one task terminal, and
+all non-API wall time is measured.
+
+The live gate passed on both profiles. The PTC smoke used one hosted program,
+one caller-linked `exec_command`, one stored-response continuation, and a final
+message. The Multi-agent smoke spawned one named subagent, accepted one direct
+tool-output injection, and returned one `/root` final answer. At a smoke-only
+1,500-token threshold, the latter also emitted six generation-time compaction
+items and completed; 27.2 of 27.9 seconds were model/API time while the local
+shell used about 20 milliseconds. PTC-nested injection was tested separately
+and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 

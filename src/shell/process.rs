@@ -48,6 +48,7 @@ pub(super) fn effective_timeout(requested_ms: Option<i64>) -> Duration {
 pub(super) async fn execute(
     script: &str,
     workspace: &Path,
+    login: bool,
     command_timeout: Duration,
     output_limit: usize,
     environment: &[(OsString, OsString)],
@@ -55,7 +56,7 @@ pub(super) async fn execute(
 ) -> ShellCommandOutput {
     let mut command = Command::new("/bin/sh");
     command
-        .args(["-lc", script])
+        .args([if login { "-lc" } else { "-c" }, script])
         .current_dir(workspace)
         .env_clear()
         .envs(environment.iter().cloned())

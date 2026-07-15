@@ -1,8 +1,10 @@
 # harness
 
 A small Rust coding-agent harness built around Harbor and the OpenAI API.
-It currently runs `gpt-5.6-sol` over the Responses API WebSocket transport and
-exposes shell execution exclusively through Programmatic Tool Calling (PTC).
+It currently runs `gpt-5.6-sol` over the Responses API WebSocket transport.
+Programmatic Tool Calling (PTC) is the default orchestration profile; hosted
+Multi-agent is an explicit profile for requested delegation or hard parallel
+work.
 
 ```sh
 just bootstrap  # install pinned dependencies once
@@ -26,7 +28,13 @@ then converts its retained JSONL to ATIF. It never dispatches tool calls.
 OpenAI runs the model-generated JavaScript in its hosted PTC runtime. The Rust
 process executes only the nested `exec_command` calls returned by the API,
 preserves their caller linkage, and sends their structured results back over
-the same WebSocket. `exec_command` is not available as a direct function call.
+the same WebSocket continuation chain.
+
+`--multi-agent` switches to hosted Multi-agent with direct `exec_command`
+calls and live `response.inject`. The profiles are separate because the live
+API currently rejects injection of PTC-nested outputs during a Multi-agent
+response. Multi-agent remains opt-in and its developer prompt forbids spawning
+for routine or sequential work.
 
 For the local eval loop, Harbor builds each canonical task Dockerfile for the
 Docker daemon's native architecture, then adds one content-addressed layer with

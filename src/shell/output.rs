@@ -4,6 +4,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 const DEFAULT_MAX_OUTPUT_LENGTH: usize = 4_096;
 const MAX_OUTPUT_LENGTH: usize = 1024 * 1024;
+const CHARACTERS_PER_TOKEN: usize = 4;
 const READ_BUFFER_LENGTH: usize = 8 * 1024;
 const REDACTION: &str = "[REDACTED]";
 
@@ -33,9 +34,12 @@ impl CapturedOutput {
     }
 }
 
-pub(super) fn effective_limit(requested: Option<i64>) -> usize {
+pub(super) fn effective_token_limit(requested: Option<i64>) -> usize {
     requested.map_or(DEFAULT_MAX_OUTPUT_LENGTH, |value| {
-        usize::try_from(value).unwrap_or(0).min(MAX_OUTPUT_LENGTH)
+        usize::try_from(value)
+            .unwrap_or(0)
+            .saturating_mul(CHARACTERS_PER_TOKEN)
+            .min(MAX_OUTPUT_LENGTH)
     })
 }
 

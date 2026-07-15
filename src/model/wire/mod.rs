@@ -1,8 +1,11 @@
 mod request;
 mod response;
 
-pub(super) use request::{InputItem, RequestProfile, ResponseCreate, ShellCallOutput};
+pub(super) use request::{
+    FunctionCallOutput, InputItem, RequestProfile, ResponseCreate, ResponseInject,
+};
 pub(super) use response::{
-    Caller, CompletedResponse, OutputContent, OutputItem, ServerEvent, ShellAction, Usage,
+    Agent, Caller, CompletedResponse, ExecCommandArguments, MessagePhase, OutputContent,
+    OutputItem, ResponseInjectError, ResponseInjectErrorCode, ServerEvent, Usage,
     WarmupServerEvent,
 };

@@ -10,7 +10,6 @@ use std::{
 
 use clap::ValueEnum;
 use serde::Serialize;
-use serde_json::Value;
 
 use self::wire::Usage;
 use crate::{
@@ -20,6 +19,7 @@ use crate::{
 
 const TRANSPORT: &str = "responses_websocket_v2";
 const COST_STATUS: &str = "not_reported_by_responses_api";
+pub(super) const MAX_CONCURRENT_SUBAGENTS: u32 = 3;
 
 /// OpenAI-specific settings for the deliberately single-provider harness.
 pub struct ModelConfig {
@@ -29,6 +29,17 @@ pub struct ModelConfig {
     pub websocket_url: String,
     pub max_model_calls: u32,
     pub compact_threshold: u64,
+    pub multi_agent: bool,
+}
+
+impl ModelConfig {
+    pub(super) const fn orchestration(&self) -> &'static str {
+        if self.multi_agent {
+            "hosted_multi_agent"
+        } else {
+            "programmatic_tool_calling"
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, ValueEnum)]
@@ -86,24 +97,14 @@ struct RunStats {
     usage: UsageTotals,
     warmup_usage: UsageTotals,
     last_response_id: Option<String>,
-}
-
-struct ModelResponse {
-    id: String,
-    status: String,
-    text: String,
-    has_message: bool,
-    shell_calls: Vec<ShellCall>,
-    usage: Usage,
-    time_to_first_event_ns: u64,
-    time_to_first_output_ns: Option<u64>,
-}
-
-struct ShellCall {
-    call_id: String,
-    action: wire::ShellAction,
-    caller: wire::Caller,
-    created_by: Option<Value>,
+    injections_sent: u32,
+    injections_accepted: u32,
+    injections_deferred: u32,
+    continuations_queued: u32,
+    injection_ack_wait_ns: u64,
+    hosted_multi_agent_calls: u32,
+    agent_messages: u32,
+    compactions: u32,
 }
 
 pub(crate) async fn run<W: Write>(
@@ -144,6 +145,7 @@ fn terminal_payload<'a>(
         model: &config.model,
         effort: config.effort.as_str(),
         transport: TRANSPORT,
+        orchestration: config.orchestration(),
         model_calls: metrics.model_calls,
         tool_calls: metrics.tool_calls,
         duration_ms: duration_ms(elapsed),
@@ -155,6 +157,14 @@ fn terminal_payload<'a>(
         last_response_id: metrics.last_response_id.as_deref(),
         usage: &metrics.usage,
         warmup_usage: &metrics.warmup_usage,
+        injections_sent: metrics.injections_sent,
+        injections_accepted: metrics.injections_accepted,
+        injections_deferred: metrics.injections_deferred,
+        continuations_queued: metrics.continuations_queued,
+        injection_ack_wait_ns: metrics.injection_ack_wait_ns,
+        hosted_multi_agent_calls: metrics.hosted_multi_agent_calls,
+        agent_messages: metrics.agent_messages,
+        compactions: metrics.compactions,
         cost_usd: None,
         cost_status: COST_STATUS,
     }
@@ -166,11 +176,15 @@ struct RunStarted<'a> {
     model: &'a str,
     effort: &'static str,
     transport: &'static str,
+    orchestration: &'static str,
     websocket_url: &'a str,
     workspace: Option<&'a str>,
     instruction_bytes: usize,
     max_model_calls: u32,
     compact_threshold: u64,
+    multi_agent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_concurrent_subagents: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -189,6 +203,7 @@ struct TerminalPayload<'a> {
     model: &'a str,
     effort: &'static str,
     transport: &'static str,
+    orchestration: &'static str,
     model_calls: u32,
     tool_calls: u32,
     duration_ms: u64,
@@ -200,6 +215,14 @@ struct TerminalPayload<'a> {
     last_response_id: Option<&'a str>,
     usage: &'a UsageTotals,
     warmup_usage: &'a UsageTotals,
+    injections_sent: u32,
+    injections_accepted: u32,
+    injections_deferred: u32,
+    continuations_queued: u32,
+    injection_ack_wait_ns: u64,
+    hosted_multi_agent_calls: u32,
+    agent_messages: u32,
+    compactions: u32,
     cost_usd: Option<f64>,
     cost_status: &'static str,
 }

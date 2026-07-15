@@ -1,22 +1,16 @@
 use std::{io::Write, time::Instant};
 
-use futures_util::future::join_all;
 use serde::Serialize;
-use serde_json::Value;
 
 use super::{
-    AssistantMessage, ModelConfig, ModelResponse, RunError, RunStarted, RunStats, ShellCall,
+    AssistantMessage, MAX_CONCURRENT_SUBAGENTS, ModelConfig, RunError, RunStarted, RunStats,
     TRANSPORT, display_endpoint, elapsed_ns, resolve_workspace, terminal_payload,
-    wire::{
-        Caller, InputItem, RequestProfile, ResponseCreate, ShellCallOutput, Usage,
-        WarmupServerEvent,
-    },
+    wire::{InputItem, RequestProfile, ResponseCreate, Usage, WarmupServerEvent},
 };
 use crate::{
     AgentError, ResponsesError, Result,
     protocol::{EventWriter, Task},
     responses::ResponsesSocket,
-    shell,
 };
 
 #[derive(Serialize)]
@@ -76,7 +70,7 @@ struct ModelCallCompleted<'a> {
     duration_ns: u64,
     time_to_first_event_ns: u64,
     time_to_first_output_ns: Option<u64>,
-    shell_calls: usize,
+    tool_calls: usize,
     usage: &'a Usage,
 }
 
@@ -86,26 +80,6 @@ struct ModelCallFailed<'a> {
     model: &'a str,
     duration_ns: u64,
     error: &'a str,
-}
-
-#[derive(Serialize)]
-struct ToolCallEvent<'a> {
-    call_id: &'a str,
-    tool: &'a str,
-    arguments: &'a super::wire::ShellAction,
-    model_call_index: u32,
-    caller: &'a Caller,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    created_by: Option<&'a Value>,
-}
-
-#[derive(Serialize)]
-struct ToolResultEvent<'a> {
-    call_id: &'a str,
-    tool: &'a str,
-    status: &'static str,
-    duration_ns: u64,
-    result: &'a ShellCallOutput,
 }
 
 pub(super) struct ModelRun<'a, W> {
@@ -139,11 +113,17 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 model: &self.config.model,
                 effort: self.config.effort.as_str(),
                 transport: TRANSPORT,
+                orchestration: self.config.orchestration(),
                 websocket_url: display_endpoint(&self.config.websocket_url),
                 workspace: self.task.workspace.as_deref(),
                 instruction_bytes: self.task.instruction.len(),
                 max_model_calls: self.config.max_model_calls,
                 compact_threshold: self.config.compact_threshold,
+                multi_agent: self.config.multi_agent,
+                max_concurrent_subagents: self
+                    .config
+                    .multi_agent
+                    .then_some(MAX_CONCURRENT_SUBAGENTS),
             },
         )?;
 
@@ -175,10 +155,11 @@ impl<'a, W: Write> ModelRun<'a, W> {
         let workspace = resolve_workspace(self.task.workspace.as_deref())?;
         let mut socket = self.connect().await?;
         let profile = RequestProfile::new(self.config);
-        let initial_input = InputItem::for_task(self.task, &workspace);
-        let mut previous_response_id = self
+        let initial_input = InputItem::for_task(self.task, &workspace, self.config);
+        let warmup_response_id = self
             .perform_warmup(&mut socket, &initial_input, &profile)
             .await?;
+        let mut previous_response_id = Some(warmup_response_id);
         let mut input = Vec::new();
 
         for call_index in 1..=self.config.max_model_calls {
@@ -187,26 +168,22 @@ impl<'a, W: Write> ModelRun<'a, W> {
                     &mut socket,
                     call_index,
                     &input,
-                    &previous_response_id,
+                    previous_response_id.as_deref(),
                     &profile,
+                    &workspace,
                 )
                 .await?;
-            previous_response_id = response.id.clone();
-            if response.shell_calls.is_empty() {
-                input.clear();
-                if response.has_message {
-                    return Ok(if response.text.trim().is_empty() {
-                        "The model completed without emitting assistant text.".to_owned()
-                    } else {
-                        response.text
-                    });
-                }
-                continue;
+            previous_response_id = Some(response.id);
+            input = response.next_input;
+            if input.is_empty()
+                && let Some(message) = response.final_message
+            {
+                return Ok(if message.trim().is_empty() {
+                    "The model completed without emitting assistant text.".to_owned()
+                } else {
+                    message
+                });
             }
-
-            input = self
-                .execute_shell_calls(response.shell_calls, &workspace, call_index)
-                .await?;
         }
 
         Err(AgentError::ModelCallLimit {
@@ -303,8 +280,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 websocket_url: display_endpoint(&self.config.websocket_url),
             },
         )?;
-        let (socket, metadata) =
-            ResponsesSocket::connect(&self.config.websocket_url, &self.config.api_key).await?;
+        let (socket, metadata) = ResponsesSocket::connect(
+            &self.config.websocket_url,
+            &self.config.api_key,
+            self.config.multi_agent,
+        )
+        .await?;
         self.events.emit(
             "model.connection.completed",
             ConnectionCompleted {
@@ -324,10 +305,16 @@ impl<'a, W: Write> ModelRun<'a, W> {
         socket: &mut ResponsesSocket,
         call_index: u32,
         input: &[InputItem],
-        previous_response_id: &str,
+        previous_response_id: Option<&str>,
         profile: &RequestProfile,
-    ) -> Result<ModelResponse> {
-        let request = ResponseCreate::generated(self.config, input, previous_response_id, profile);
+        workspace: &str,
+    ) -> Result<super::stream::TurnResult> {
+        let request = previous_response_id.map_or_else(
+            || ResponseCreate::initial(self.config, input, profile),
+            |previous_response_id| {
+                ResponseCreate::continued(self.config, input, previous_response_id, profile)
+            },
+        );
         let started_at = Instant::now();
         self.stats.model_calls += 1;
         self.events.emit(
@@ -336,7 +323,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 call_index,
                 model: &self.config.model,
                 effort: self.config.effort.as_str(),
-                previous_response_id: Some(previous_response_id),
+                previous_response_id,
             },
         )?;
         self.events.emit(
@@ -351,7 +338,16 @@ impl<'a, W: Write> ModelRun<'a, W> {
         )?;
         let response = match async {
             socket.send(&request).await?;
-            super::stream::receive(socket, self.events, call_index, started_at).await
+            super::stream::receive(
+                socket,
+                self.events,
+                &mut self.stats,
+                workspace,
+                call_index,
+                started_at,
+                self.config.multi_agent,
+            )
+            .await
         }
         .await
         {
@@ -386,70 +382,10 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 duration_ns,
                 time_to_first_event_ns: response.time_to_first_event_ns,
                 time_to_first_output_ns: response.time_to_first_output_ns,
-                shell_calls: response.shell_calls.len(),
+                tool_calls: response.tool_calls,
                 usage: &response.usage,
             },
         )?;
         Ok(response)
-    }
-
-    async fn execute_shell_calls(
-        &mut self,
-        shell_calls: Vec<ShellCall>,
-        workspace: &str,
-        call_index: u32,
-    ) -> Result<Vec<InputItem>> {
-        for shell_call in &shell_calls {
-            self.stats.tool_calls += 1;
-            self.events.emit(
-                "tool.call",
-                ToolCallEvent {
-                    call_id: &shell_call.call_id,
-                    tool: "shell",
-                    arguments: &shell_call.action,
-                    model_call_index: call_index,
-                    caller: &shell_call.caller,
-                    created_by: shell_call.created_by.as_ref(),
-                },
-            )?;
-        }
-
-        let batch_started_at = Instant::now();
-        let completed = join_all(shell_calls.into_iter().map(|shell_call| async move {
-            let started_at = Instant::now();
-            let execution = shell::execute_action(
-                shell_call.action.commands.clone(),
-                shell_call.action.timeout_ms,
-                shell_call.action.max_output_length,
-                workspace,
-            )
-            .await;
-            (shell_call, execution, elapsed_ns(started_at))
-        }))
-        .await;
-        self.stats.tool_wall_duration_ns += elapsed_ns(batch_started_at);
-
-        let mut outputs = Vec::with_capacity(completed.len());
-        for (shell_call, execution, duration_ns) in completed {
-            self.stats.tool_work_duration_ns += duration_ns;
-            let output = ShellCallOutput::new(
-                shell_call.call_id,
-                execution.max_output_length,
-                execution.output,
-                shell_call.caller,
-            );
-            self.events.emit(
-                "tool.result",
-                ToolResultEvent {
-                    call_id: output.call_id(),
-                    tool: "shell",
-                    status: "completed",
-                    duration_ns,
-                    result: &output,
-                },
-            )?;
-            outputs.push(output.into());
-        }
-        Ok(outputs)
     }
 }

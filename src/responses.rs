@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{
-        Message,
+        Error as WebSocketError, Message,
         client::IntoClientRequest,
         http::{HeaderValue, header},
     },
@@ -19,7 +19,7 @@ use crate::{ResponsesError, Result};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+const RESPONSES_BETA: &str = "responses_multi_agent=v1";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -38,6 +38,7 @@ impl ResponsesSocket {
     pub(crate) async fn connect(
         endpoint: &str,
         api_key: &str,
+        multi_agent: bool,
     ) -> Result<(Self, ConnectionMetadata)> {
         ensure_crypto_provider();
         let mut request = endpoint
@@ -48,10 +49,11 @@ impl ResponsesSocket {
         request
             .headers_mut()
             .insert(header::AUTHORIZATION, authorization);
-        request.headers_mut().insert(
-            "OpenAI-Beta",
-            HeaderValue::from_static(RESPONSES_WEBSOCKET_BETA),
-        );
+        if multi_agent {
+            request
+                .headers_mut()
+                .insert("OpenAI-Beta", HeaderValue::from_static(RESPONSES_BETA));
+        }
         request.headers_mut().insert(
             "x-responsesapi-include-timing-metrics",
             HeaderValue::from_static("true"),
@@ -66,7 +68,7 @@ impl ResponsesSocket {
             .map_err(|_| ResponsesError::HandshakeTimeout {
                 seconds: CONNECT_TIMEOUT.as_secs(),
             })?
-            .map_err(ResponsesError::Handshake)?;
+            .map_err(map_handshake_error)?;
         let metadata = ConnectionMetadata {
             status: response.status().as_u16(),
             request_id: header_string(response.headers(), "x-request-id"),
@@ -130,6 +132,18 @@ impl ResponsesSocket {
             }
         }
     }
+}
+
+fn map_handshake_error(error: WebSocketError) -> ResponsesError {
+    let WebSocketError::Http(response) = error else {
+        return ResponsesError::Handshake(error);
+    };
+    let status = response.status().as_u16();
+    let body = response.body().as_deref().map_or_else(
+        || "empty response body".to_owned(),
+        |body| String::from_utf8_lossy(body).into_owned(),
+    );
+    ResponsesError::HandshakeRejected { status, body }
 }
 
 fn ensure_crypto_provider() {
