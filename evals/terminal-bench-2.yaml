@@ -17,13 +17,12 @@ datasets:
     ref: latest
     task_names:
       - terminal-bench/fix-git
+      - terminal-bench/openssl-selfsigned-cert
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
   kwargs:
-    cached_dockerfile: evals/fix-git.Dockerfile
+    verifier_dockerfile: evals/pytest/Dockerfile
 
 verifier:
   import_path: harbor_adapter.verifier:PytestVerifier
-  kwargs:
-    test_file: test_outputs.py

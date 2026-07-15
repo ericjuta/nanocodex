@@ -28,10 +28,11 @@ process executes only the nested `exec_command` calls returned by the API,
 preserves their caller linkage, and sends their structured results back over
 the same WebSocket. `exec_command` is not available as a direct function call.
 
-For the local `fix-git` loop, Harbor builds a content-addressed native task
-image with the pinned verifier dependencies already installed. The downloaded
-benchmark task and its assertion file remain unchanged; only its dependency-
-installing shell launcher is replaced by a direct `pytest` invocation.
+For the local eval loop, Harbor builds each canonical task Dockerfile for the
+Docker daemon's native architecture, then adds one content-addressed layer with
+the pinned verifier dependencies. Downloaded benchmark tasks and assertion
+files remain unchanged; only their dependency-installing shell launchers are
+replaced by a direct `pytest` invocation.
 
 ## Build profiles
 
@@ -45,11 +46,9 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The current `fix-git` eval is solved by the real model/tool loop; its
-downloaded task and canonical verifier remain unchanged. The first PTC-only
-run recovered the lost commit from Git's reflog, merged it, and earned reward
-`1.0`. A second post-refactor regression also earned `1.0` in 35 seconds of
-Harbor runtime.
+and tasks. The current slice contains `fix-git` and
+`openssl-selfsigned-cert`; both are solved by the real model/tool loop while
+their downloaded tasks and canonical verifier assertions remain unchanged.
 
 Every trial retains `input.jsonl`, `events.jsonl`, `stderr.log`, and
 `trajectory.json` under `.harness/harbor/jobs`. Harbor receives aggregate token

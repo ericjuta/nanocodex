@@ -1,7 +1,7 @@
 """Fast local verifier adapters that preserve benchmark assertions."""
 
 import shlex
-from typing import Any, override
+from typing import override
 
 from harbor.models.trial.paths import EnvironmentPaths
 from harbor.models.verifier.result import VerifierResult
@@ -11,10 +11,6 @@ from harbor.verifier.verifier import Verifier
 
 class PytestVerifier(Verifier):
     """Upload canonical tests, then run preinstalled pytest directly."""
-
-    def __init__(self, *args: Any, test_file: str, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._test_file = test_file
 
     @override
     async def verify(self) -> VerifierResult:
@@ -29,13 +25,12 @@ class PytestVerifier(Verifier):
                 target_dir=str(environment_paths.tests_dir),
             )
 
-        test_path = environment_paths.tests_dir / self._test_file
         command = "\n".join(
             (
                 "status=0",
                 "python -m pytest "
                 f"--ctrf {environment_paths.verifier_dir}/ctrf.json "
-                f"{shlex.quote(str(test_path))} -rA "
+                f"{shlex.quote(str(environment_paths.tests_dir))} -rA "
                 f"> {environment_paths.verifier_dir}/test-stdout.txt 2>&1 "
                 "|| status=$?",
                 f'if [ "$status" -eq 0 ]; then echo 1; else echo 0; fi '
