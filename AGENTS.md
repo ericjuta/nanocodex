@@ -1,75 +1,54 @@
 # Development instructions
 
-## Current objective
+## Workflow
 
-Follow `PLAN.md` in order. The active milestone is a fast CLI-driven Harbor
-loop for one real Terminal-Bench task. Do not introduce OpenAI execution, JJ,
-checkpointing, graders, a journal, or a TUI before that milestone passes.
+- Follow `PLAN.md` in order and build vertical CLI slices.
+- Prefer `just run` and a real `just eval` over mocks or speculative layers.
+- Inspect the JSONL stream, Harbor result, trajectory, and verifier output.
+- Measure cold bootstrap separately from warm source-edit iteration.
+- Add focused unit tests only for nontrivial deterministic behavior or a
+  demonstrated regression; end-to-end Harbor trials are the milestone gates.
 
-## Development posture
+## Runtime boundary
 
-- Work vertical slices from the CLI inward.
-- Prefer a real `cargo run` and Harbor trial over mocks or speculative internal
-  abstractions.
-- Eyeball the complete JSONL stream and inspect Harbor's generated artifacts.
-- Time the actual commands while optimizing the loop; separate cold bootstrap
-  costs from warm iteration costs.
-- Add unit tests later and selectively: for nontrivial deterministic logic,
-  demonstrated regressions, or edge cases that the E2E path cannot cover
-  cheaply. Do not create test scaffolding or coverage targets by default.
-- Keep changes small enough that their effect can be observed in the next CLI
-  run.
+- `just run` is native `cargo run`; it must not require Harbor or Docker.
+- `just eval` builds a static Linux artifact for the Docker daemon's native
+  architecture. Do not force amd64 on Apple Silicon.
+- Harbor owns task containers and verifiers. The Rust executable is uploaded
+  as an InstalledAgent and runs inside `/app`.
+- Python may upload/run the process and derive ATIF. Model decisions, API calls,
+  tools, and mutations belong in Rust; never add a per-tool Python bridge.
+- Do not modify benchmark tasks or compile Rust inside their images.
+- Eval selection belongs in `evals/*.yaml`, not the Justfile.
+- Local artifacts default to Cargo `dev`; honor `HARNESS_BUILD_PROFILE` and use
+  `profiling` for optimized builds with debug symbols.
 
-## Harbor boundary
+## JSONL contract
 
-- The Rust harness runs locally through `cargo run` during development.
-- Terminal-Bench tasks and all mutating tools run in Harbor's task environment.
-- The Python external-agent adapter must remain thin: process lifecycle, JSONL
-  transport, `BaseEnvironment` tool dispatch, log capture, and ATIF conversion.
-- Do not compile Rust in a task image, upload a Linux binary in the local loop,
-  or invalidate the task image when harness source changes.
-- Invoke the pinned `.venv/bin/harbor` directly in the warm loop rather than
-  paying `uv run` startup on every trial.
-- Use one exact cached task and `--no-force-build` for the probe. Use a fresh
-  Harbor trial and the real verifier for the gate.
-
-## JSONL invariants
-
-- Stdout from the Rust process is valid JSONL only.
-- Diagnostics, build output, and panic context go to stderr.
-- Flush every event immediately.
-- Preserve the exact input/output streams before deriving ATIF or summaries.
-- Every event carries protocol version, request ID, monotonic sequence, type,
-  and payload.
-- Emit exactly one terminal event for every accepted request.
-- Never print secrets or the contents of `.env`.
+- Stdout is flushed JSONL only; diagnostics go to stderr.
+- Every event has protocol version, request ID, monotonic sequence, type, and
+  object payload.
+- Emit exactly one terminal event for each accepted request.
+- Preserve exact input/output streams before deriving ATIF.
+- Never print secrets or `.env` contents.
 
 ## Rust practices
 
-Follow the style used in the Alloy ecosystem:
+- Follow Alloy-style Rust: small typed components and explicit data flow.
+- Keep wire types at protocol boundaries and use domain types internally.
+- Return errors with context; avoid `unwrap`, `expect`, and silent fallback in
+  runtime paths.
+- Keep cancellation and process cleanup explicit.
+- Run rustfmt and Clippy with warnings denied before handoff.
+- Add dependencies only for a concrete need in the current vertical slice.
 
-- Prefer small typed modules and explicit data flow over framework layers.
-- Use strong domain types where values can be confused; keep wire types at the
-  protocol boundary.
-- Return structured errors with useful context. Avoid `unwrap`, `expect`, and
-  silent fallback in runtime paths.
-- Keep async cancellation and process cleanup explicit.
-- Avoid unnecessary allocation and cloning in streaming paths, but optimize
-  only after measurement.
-- Keep public APIs documented and implementations readable; comments should
-  explain invariants or surprising decisions.
-- Run rustfmt and Clippy before a milestone handoff. Treat warnings in our code
-  as errors once the crate exists.
-- Prefer established crates already in the dependency graph. New dependencies
-  need a concrete benefit to the current vertical slice.
+## Scope
 
-## Scope guardrails
-
-- Harbor result files and ATIF are the eval record. Do not add a parallel
-  journal or artifact database.
-- API-visible reasoning summaries may be recorded; never label them as hidden
-  chain of thought.
-- No approval system: tasks run in the designated YOLO eval container.
-- No provider abstraction or backwards compatibility unless the plan changes.
-- Preserve unrelated dirty work and never commit `.env`, local Harbor jobs,
-  task caches, or build artifacts.
+- Harbor results and ATIF are the eval record; do not create another journal or
+  artifact database.
+- Record only API-visible reasoning summaries, never purported hidden chain of
+  thought.
+- Tasks run YOLO inside their eval container; there is no approval subsystem.
+- Do not add provider portability, backwards compatibility, a TUI, JJ, graders,
+  or local subagent orchestration before their planned milestone.
+- Preserve unrelated work. Never commit `.env`, caches, jobs, or build output.

@@ -1,0 +1,25 @@
+# Edit this file—not the Justfile—to select datasets, tasks, and attempts.
+# Let Harbor generate a unique job name so every invocation is a fresh eval.
+jobs_dir: .harness/harbor/jobs
+
+agents:
+  - import_path: harbor_adapter.agent:HarnessAgent
+    kwargs:
+      # Temporary known-positive control until the OpenAI loop replaces it.
+      mode: fix-git-cheat
+
+datasets:
+  - name: terminal-bench/terminal-bench-2
+    ref: latest
+    task_names:
+      - terminal-bench/fix-git
+
+environment:
+  import_path: harbor_adapter.environment:FastDockerEnvironment
+  kwargs:
+    cached_dockerfile: evals/fix-git.Dockerfile
+
+verifier:
+  import_path: harbor_adapter.verifier:PytestVerifier
+  kwargs:
+    test_file: test_outputs.py

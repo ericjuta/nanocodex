@@ -1,5 +1,1 @@
-"""Harbor integration for the local Rust harness."""
-
-from .agent import HarnessAgent
-
-__all__ = ["HarnessAgent"]
+"""Harbor integration for the Rust harness."""

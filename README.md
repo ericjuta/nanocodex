@@ -1,52 +1,49 @@
 # harness
 
-A Harbor-first Rust coding-agent harness optimized for the current OpenAI API.
-The active implementation is the Phase 0 JSONL CLI loop described in
-[`PLAN.md`](PLAN.md).
+A small Rust coding-agent harness built around Harbor and the OpenAI API.
+The current milestone proves the local JSONL process and Harbor InstalledAgent
+boundary without calling a model yet.
 
 ```sh
-just bootstrap
-just run
+just bootstrap  # install pinned dependencies once
+just run        # native cargo run; no Python, Docker, or Harbor
+just eval       # fresh Terminal-Bench trial with canonical assertions
+just view       # inspect retained Harbor jobs
 ```
 
-The development loop has three speeds:
+`just eval` performs this path:
 
-| Command | What it proves | Expected Phase 0 result |
-| --- | --- | --- |
-| `just run` | Rust CLI and JSONL transport only; no Harbor or Docker | Three JSONL lifecycle events in well under a second |
-| `just harbor-probe` | Real Harbor task container and external-agent adapter | Job completes without errors; Harbor shows zero *scored* trials because the verifier is skipped |
-| `just harbor-eval` | Full Terminal-Bench task, adapter, and pre-baked verifier | One completed trial, zero infrastructure errors, reward `0` |
-
-Phase 0 has no model and makes no task changes, so reward `0`, zero tokens, and
-zero cost are expected. At this stage, `just harbor-eval` proves the complete
-evaluation plumbing works; it does not yet prove that the harness can solve the
-task. Phase 1 replaces that stub with the OpenAI tool loop.
-
-Bootstrap downloads the exactly pinned Terminal-Bench `fix-git` canary. To
-inspect the most recent evals in Harbor's web viewer, run:
-
-```sh
-just harbor-view
+```text
+native BuildKit compile -> static Linux binary
+                       -> Harbor task container
+                       -> /installed-agent/harness
+                       -> Rust executes tools in /app
+                       -> Harbor verifier
 ```
 
-Use `just harbor-view probe` to inspect probe jobs instead.
+The Python `BaseInstalledAgent` shim only uploads and starts the executable,
+then converts its retained JSONL to ATIF. It never dispatches tool calls.
 
-The local eval image reconstructs the pinned canary environment on the host's
-native container architecture and bakes the canonical verifier's pinned Python
-dependencies once, while retaining its byte-identical `test_outputs.py`. This
-avoids CPU emulation and installing `curl`, `uv`, and pytest inside every
-trial. Run
-`just harbor-eval-canonical` to check against the untouched downloaded task;
-that slower control includes the benchmark author's dependency bootstrap.
+For the local `fix-git` loop, Harbor builds a content-addressed native task
+image with the pinned verifier dependencies already installed. The downloaded
+benchmark task and its assertion file remain unchanged; only its dependency-
+installing shell launcher is replaced by a direct `pytest` invocation.
 
-Set `HARBOR_CANARY_TASK` in `.env` only when deliberately overriding the task
-used by `harbor-probe` and `harbor-eval-canonical`. The fast `harbor-eval`
-stays tied to the pinned `fix-git` canary because its verifier image is built
-specifically for that task.
+## Build profiles
 
-The Harbor adapter is an external agent: it starts `cargo run` on the host and
-leaves the Terminal-Bench task and verifier inside Harbor's environment.
+Local artifacts use Cargo's `dev` profile by default. Set this in `.env` for an
+optimized build with full debug symbols:
 
-Phase 0 deliberately makes no model or tool calls, so `just harbor-eval`
-records reward zero. Each trial retains `input.jsonl`, `events.jsonl`,
-`stderr.log`, and a validated `trajectory.json` under `.harness/harbor/jobs`.
+```env
+HARNESS_BUILD_PROFILE=profiling
+```
+
+## Eval selection
+
+[`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
+and tasks. The current `fix-git` mode deliberately copies the two verifier
+fixtures through a Rust shell call. Reward `1` therefore validates plumbing,
+not autonomous task solving.
+
+Every trial retains `input.jsonl`, `events.jsonl`, `stderr.log`, and
+`trajectory.json` under `.harness/harbor/jobs`.
