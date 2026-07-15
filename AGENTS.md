@@ -6,8 +6,11 @@
 - Prefer `just run` and a real `just eval` over mocks or speculative layers.
 - Inspect the JSONL stream, Harbor result, trajectory, and verifier output.
 - Measure cold bootstrap separately from warm source-edit iteration.
-- Add focused unit tests only for nontrivial deterministic behavior or a
-  demonstrated regression; end-to-end Harbor trials are the milestone gates.
+- End-to-end Harbor trials are the milestone gates. Do not add tests merely for
+  coverage or during cleanup; add a focused deterministic test only when the
+  plan calls for one or a demonstrated regression justifies it.
+- Prefer deleting obsolete paths and data flow over introducing abstractions.
+  A cleanup should produce a material net reduction in production LOC.
 
 ## Codex reference implementation
 
@@ -20,6 +23,8 @@
 - Treat Codex as a reference, not a requirement to copy its abstractions.
   Preserve this repository's `PLAN.md`, runtime boundary, milestone order, and
   deliberately narrower scope when the designs differ.
+- Copy relevant invariants and operational behavior, not Codex compatibility
+  surface. Expose only tool fields and lifecycle behavior implemented here.
 
 ## Runtime boundary
 
@@ -42,15 +47,36 @@
   object payload.
 - Emit exactly one terminal event for each accepted request.
 - Preserve exact input/output streams before deriving ATIF.
+- Contractual events are emitted explicitly through the JSONL protocol.
+  Tracing is for stderr diagnostics and must not become the protocol transport.
+- Use typed serde messages for repeated protocol shapes. Compact `json!` values
+  are appropriate for one-off static request or tool schemas when dedicated
+  types would only duplicate the JSON structure.
 - Never print secrets or `.env` contents.
 
 ## Rust practices
 
 - Follow Alloy-style Rust: small typed components and explicit data flow.
-- Keep wire types at protocol boundaries and use domain types internally.
+- Construct required configuration into owning types near `main`; do not retain
+  required values as `Option` or repeatedly validate them after construction.
+- Put stateful asynchronous lifecycle operations on owning structs and `impl`
+  blocks. Reserve free functions for stateless transformations and utilities.
+- Let the model run own its client session, event writer, task context, timing,
+  and statistics. Avoid threading mutable statistics or long context argument
+  lists through the call graph.
+- Keep repeated wire types at protocol boundaries and domain types internally.
+  Avoid types for one-use static JSON whose only purpose is increasing ceremony.
+- Prefer moving owned tool and protocol values over cloning them to satisfy an
+  unnecessarily borrowed interface.
 - Return errors with context; avoid `unwrap`, `expect`, and silent fallback in
   runtime paths.
-- Keep cancellation and process cleanup explicit.
+- Keep subprocess output memory-bounded while it is produced; post-exit
+  truncation is not a memory bound.
+- Keep cancellation and process cleanup explicit. Timeout or cancellation must
+  terminate the subprocess group and descendants, following the relevant Codex
+  implementation where applicable.
+- Keep `eyre` for top-level application error reporting; use focused typed
+  errors where callers need to distinguish runtime failures.
 - Run rustfmt and Clippy with warnings denied before handoff.
 - Add dependencies only for a concrete need in the current vertical slice.
 
@@ -63,4 +89,8 @@
 - Tasks run YOLO inside their eval container; there is no approval subsystem.
 - Do not add provider portability, backwards compatibility, a TUI, JJ, graders,
   or local subagent orchestration before their planned milestone.
+- Model execution is the only runtime mode. Do not restore milestone positive
+  controls, compatibility modes, or duplicate shell implementations.
+- Do not add event buses, collector traits, shared mutable run state, or generic
+  client/provider layers without a concrete current consumer.
 - Preserve unrelated work. Never commit `.env`, caches, jobs, or build output.
