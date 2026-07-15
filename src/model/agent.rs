@@ -5,21 +5,16 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    AssistantMessage, FunctionCall, ModelConfig, ModelResponse, RunError, RunStarted, RunStats,
+    AssistantMessage, ModelConfig, ModelResponse, RunError, RunStarted, RunStats, ShellCall,
     TRANSPORT, display_endpoint, elapsed_ns, resolve_workspace, terminal_payload,
-    wire::{Caller, InputItem, Usage},
+    wire::{Caller, InputItem, ResponseCreate, ShellCallOutput, Usage},
 };
 use crate::{
     AgentError, Result,
     protocol::{EventWriter, Task},
     responses::ResponsesSocket,
-    shell::{self, ExecCommandArgs},
+    shell,
 };
-
-struct ToolOutcome {
-    status: &'static str,
-    result: shell::ExecCommandResult,
-}
 
 #[derive(Serialize)]
 struct ConnectionStarted<'a> {
@@ -61,7 +56,7 @@ struct ModelCallCompleted<'a> {
     duration_ns: u64,
     time_to_first_event_ns: u64,
     time_to_first_output_ns: Option<u64>,
-    function_calls: usize,
+    shell_calls: usize,
     usage: &'a Usage,
 }
 
@@ -77,9 +72,11 @@ struct ModelCallFailed<'a> {
 struct ToolCallEvent<'a> {
     call_id: &'a str,
     tool: &'a str,
-    arguments: &'a Value,
+    arguments: &'a super::wire::ShellAction,
     model_call_index: u32,
     caller: &'a Caller,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_by: Option<&'a Value>,
 }
 
 #[derive(Serialize)]
@@ -88,7 +85,7 @@ struct ToolResultEvent<'a> {
     tool: &'a str,
     status: &'static str,
     duration_ns: u64,
-    result: &'a shell::ExecCommandResult,
+    result: &'a ShellCallOutput,
 }
 
 pub(super) struct ModelRun<'a, W> {
@@ -156,7 +153,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
     async fn execute_task(&mut self) -> Result<String> {
         let workspace = resolve_workspace(self.task.workspace.as_deref())?;
         let mut socket = self.connect().await?;
-        let mut input = super::wire::initial_input(self.task, &workspace);
+        let mut input = InputItem::initial_task(self.task, &workspace);
         let mut previous_response_id: Option<String> = None;
 
         for call_index in 1..=self.config.max_model_calls {
@@ -169,7 +166,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 )
                 .await?;
             previous_response_id = Some(response.id.clone());
-            if response.function_calls.is_empty() {
+            if response.shell_calls.is_empty() {
                 input.clear();
                 if response.has_message {
                     return Ok(if response.text.trim().is_empty() {
@@ -182,7 +179,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
             }
 
             input = self
-                .execute_function_calls(response.function_calls, &workspace, call_index)
+                .execute_shell_calls(response.shell_calls, &workspace, call_index)
                 .await?;
         }
 
@@ -224,7 +221,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         input: &[InputItem],
         previous_response_id: Option<&str>,
     ) -> Result<ModelResponse> {
-        let request = super::wire::response_create(self.config, input, previous_response_id);
+        let request = ResponseCreate::new(self.config, input, previous_response_id);
         let started_at = Instant::now();
         self.stats.model_calls += 1;
         self.events.emit(
@@ -281,91 +278,70 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 duration_ns,
                 time_to_first_event_ns: response.time_to_first_event_ns,
                 time_to_first_output_ns: response.time_to_first_output_ns,
-                function_calls: response.function_calls.len(),
+                shell_calls: response.shell_calls.len(),
                 usage: &response.usage,
             },
         )?;
         Ok(response)
     }
 
-    async fn execute_function_calls(
+    async fn execute_shell_calls(
         &mut self,
-        function_calls: Vec<FunctionCall>,
+        shell_calls: Vec<ShellCall>,
         workspace: &str,
         call_index: u32,
     ) -> Result<Vec<InputItem>> {
-        for function_call in &function_calls {
-            let event_arguments = serde_json::from_str::<Value>(&function_call.arguments)
-                .unwrap_or_else(|_| Value::String(function_call.arguments.clone()));
+        for shell_call in &shell_calls {
             self.stats.tool_calls += 1;
             self.events.emit(
                 "tool.call",
                 ToolCallEvent {
-                    call_id: &function_call.call_id,
-                    tool: &function_call.name,
-                    arguments: &event_arguments,
+                    call_id: &shell_call.call_id,
+                    tool: "shell",
+                    arguments: &shell_call.action,
                     model_call_index: call_index,
-                    caller: &function_call.caller,
+                    caller: &shell_call.caller,
+                    created_by: shell_call.created_by.as_ref(),
                 },
             )?;
         }
 
-        let completed = join_all(function_calls.into_iter().map(|function_call| async move {
-            let parsed_arguments =
-                serde_json::from_str::<ExecCommandArgs>(&function_call.arguments);
+        let batch_started_at = Instant::now();
+        let completed = join_all(shell_calls.into_iter().map(|shell_call| async move {
             let started_at = Instant::now();
-            let outcome = execute_tool(&function_call.name, parsed_arguments, workspace).await;
-            (function_call, outcome, elapsed_ns(started_at))
+            let execution = shell::execute_action(
+                shell_call.action.commands.clone(),
+                shell_call.action.timeout_ms,
+                shell_call.action.max_output_length,
+                workspace,
+            )
+            .await;
+            (shell_call, execution, elapsed_ns(started_at))
         }))
         .await;
+        self.stats.tool_wall_duration_ns += elapsed_ns(batch_started_at);
 
         let mut outputs = Vec::with_capacity(completed.len());
-        for (function_call, outcome, duration_ns) in completed {
-            self.stats.tool_duration_ns += duration_ns;
+        for (shell_call, execution, duration_ns) in completed {
+            self.stats.tool_work_duration_ns += duration_ns;
+            let output = ShellCallOutput::new(
+                shell_call.call_id,
+                execution.max_output_length,
+                execution.output,
+                shell_call.caller,
+            );
             self.events.emit(
                 "tool.result",
                 ToolResultEvent {
-                    call_id: &function_call.call_id,
-                    tool: &function_call.name,
-                    status: outcome.status,
+                    call_id: output.call_id(),
+                    tool: "shell",
+                    status: "completed",
                     duration_ns,
-                    result: &outcome.result,
+                    result: &output,
                 },
             )?;
-            outputs.push(super::wire::function_call_output(
-                function_call.call_id,
-                serde_json::to_string(&outcome.result).map_err(AgentError::EncodeToolResult)?,
-                function_call.caller,
-            ));
+            outputs.push(output.into());
         }
         Ok(outputs)
-    }
-}
-
-async fn execute_tool(
-    name: &str,
-    arguments: std::result::Result<ExecCommandArgs, serde_json::Error>,
-    workspace: &str,
-) -> ToolOutcome {
-    if name != "exec_command" {
-        return tool_error(format!("unknown tool: {name}"));
-    }
-    let args = match arguments {
-        Ok(arguments) => arguments,
-        Err(error) => return tool_error(format!("invalid JSON arguments: {error}")),
-    };
-    let result = shell::execute_command(args, workspace).await;
-    let status = if result.succeeded() {
-        "completed"
-    } else {
-        "failed"
-    };
-    ToolOutcome { status, result }
-}
-
-fn tool_error(message: String) -> ToolOutcome {
-    ToolOutcome {
-        status: "error",
-        result: shell::ExecCommandResult::tool_error(message),
     }
 }

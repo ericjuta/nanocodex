@@ -10,6 +10,7 @@ use std::{
 
 use clap::ValueEnum;
 use serde::Serialize;
+use serde_json::Value;
 
 use self::wire::Usage;
 use crate::{
@@ -78,7 +79,8 @@ struct RunStats {
     model_calls: u32,
     tool_calls: u32,
     model_duration_ns: u64,
-    tool_duration_ns: u64,
+    tool_work_duration_ns: u64,
+    tool_wall_duration_ns: u64,
     usage: UsageTotals,
     last_response_id: Option<String>,
 }
@@ -88,17 +90,17 @@ struct ModelResponse {
     status: String,
     text: String,
     has_message: bool,
-    function_calls: Vec<FunctionCall>,
+    shell_calls: Vec<ShellCall>,
     usage: Usage,
     time_to_first_event_ns: u64,
     time_to_first_output_ns: Option<u64>,
 }
 
-struct FunctionCall {
+struct ShellCall {
     call_id: String,
-    name: String,
-    arguments: String,
+    action: wire::ShellAction,
     caller: wire::Caller,
+    created_by: Option<Value>,
 }
 
 pub(crate) async fn run<W: Write>(
@@ -144,7 +146,8 @@ fn terminal_payload<'a>(
         duration_ms: duration_ms(elapsed),
         duration_ns: duration_ns(elapsed),
         model_duration_ns: metrics.model_duration_ns,
-        tool_duration_ns: metrics.tool_duration_ns,
+        tool_work_duration_ns: metrics.tool_work_duration_ns,
+        tool_wall_duration_ns: metrics.tool_wall_duration_ns,
         last_response_id: metrics.last_response_id.as_deref(),
         usage: &metrics.usage,
         cost_usd: None,
@@ -185,7 +188,8 @@ struct TerminalPayload<'a> {
     duration_ms: u64,
     duration_ns: u64,
     model_duration_ns: u64,
-    tool_duration_ns: u64,
+    tool_work_duration_ns: u64,
+    tool_wall_duration_ns: u64,
     last_response_id: Option<&'a str>,
     usage: &'a UsageTotals,
     cost_usd: Option<f64>,

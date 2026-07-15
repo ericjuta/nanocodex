@@ -83,9 +83,6 @@ pub enum AgentError {
         detail: &'static str,
         event: Box<Value>,
     },
-
-    #[error("failed to encode a tool result")]
-    EncodeToolResult(#[source] serde_json::Error),
 }
 
 /// Error returned by the harness library boundary.

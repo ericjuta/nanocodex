@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    FunctionCall, ModelResponse, TRANSPORT, elapsed_ns,
+    ModelResponse, ShellCall, TRANSPORT, elapsed_ns,
     wire::{CompletedResponse, OutputContent, OutputItem, ServerEvent},
 };
 use crate::{ResponsesError, Result, protocol::EventWriter, responses::ResponsesSocket};
@@ -15,7 +15,7 @@ struct ResponseAccumulator {
     streamed_text: String,
     completed_text: Option<String>,
     has_message: bool,
-    function_calls: Vec<FunctionCall>,
+    shell_calls: Vec<ShellCall>,
 }
 
 #[derive(Serialize)]
@@ -56,7 +56,7 @@ pub(super) async fn receive<W: Write>(
             },
         )?;
         let event = decode_event(&raw_event)?;
-        if event.is_output_delta() {
+        if event.is_output() {
             first_output_ns.get_or_insert(elapsed);
         }
 
@@ -96,7 +96,7 @@ pub(super) async fn receive<W: Write>(
                 }
                 .into());
             }
-            ServerEvent::FunctionCallArgumentsDelta | ServerEvent::Other => {}
+            ServerEvent::Other => {}
         }
     }
 }
@@ -121,7 +121,7 @@ impl ResponseAccumulator {
             status: response.status,
             text,
             has_message: self.has_message,
-            function_calls: self.function_calls,
+            shell_calls: self.shell_calls,
             usage: response.usage,
             time_to_first_event_ns: first_event_ns,
             time_to_first_output_ns: first_output_ns,
@@ -130,22 +130,22 @@ impl ResponseAccumulator {
 
     fn add_output_item(&mut self, item: OutputItem) {
         match item {
-            OutputItem::FunctionCall {
+            OutputItem::ShellCall {
                 call_id,
-                name,
-                arguments,
+                action,
                 caller,
+                created_by,
             } => {
                 if !self
-                    .function_calls
+                    .shell_calls
                     .iter()
-                    .any(|function_call| function_call.call_id == call_id)
+                    .any(|shell_call| shell_call.call_id == call_id)
                 {
-                    self.function_calls.push(FunctionCall {
+                    self.shell_calls.push(ShellCall {
                         call_id,
-                        name,
-                        arguments,
+                        action,
                         caller,
+                        created_by,
                     });
                 }
             }

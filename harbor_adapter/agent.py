@@ -202,8 +202,11 @@ class HarnessAgent(BaseInstalledAgent):
                             "model_duration_ns": terminal_payload.get(
                                 "model_duration_ns"
                             ),
-                            "tool_duration_ns": terminal_payload.get(
-                                "tool_duration_ns"
+                            "tool_work_duration_ns": terminal_payload.get(
+                                "tool_work_duration_ns"
+                            ),
+                            "tool_wall_duration_ns": terminal_payload.get(
+                                "tool_wall_duration_ns"
                             ),
                         },
                     )
@@ -228,7 +231,12 @@ class HarnessAgent(BaseInstalledAgent):
                     "tool_calls": tool_calls,
                     "duration_ns": terminal_payload.get("duration_ns"),
                     "model_duration_ns": terminal_payload.get("model_duration_ns"),
-                    "tool_duration_ns": terminal_payload.get("tool_duration_ns"),
+                    "tool_work_duration_ns": terminal_payload.get(
+                        "tool_work_duration_ns"
+                    ),
+                    "tool_wall_duration_ns": terminal_payload.get(
+                        "tool_wall_duration_ns"
+                    ),
                     "cache_write_input_tokens": usage.get(
                         "cache_write_input_tokens"
                     ),
@@ -257,7 +265,8 @@ class HarnessAgent(BaseInstalledAgent):
             "duration_ms": terminal_payload.get("duration_ms"),
             "duration_ns": terminal_payload.get("duration_ns"),
             "model_duration_ns": terminal_payload.get("model_duration_ns"),
-            "tool_duration_ns": terminal_payload.get("tool_duration_ns"),
+            "tool_work_duration_ns": terminal_payload.get("tool_work_duration_ns"),
+            "tool_wall_duration_ns": terminal_payload.get("tool_wall_duration_ns"),
             "reasoning_output_tokens": usage.get("reasoning_output_tokens"),
             "cache_write_input_tokens": usage.get("cache_write_input_tokens"),
             "last_response_id": terminal_payload.get("last_response_id"),
