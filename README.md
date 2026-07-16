@@ -115,6 +115,10 @@ the latter's unchanged low-effort run passed both canonical assertions after
 its supplied wordlist search dominated 425.20 seconds of tool time. The next
 full gate follows one more green admission unless a shared behavior change
 triggers it earlier.
+The pinned FEAL Linear Cryptanalysis candidate is excluded after its required
+unchanged trial returned a typed Responses API `cyber_policy` error on model
+call four and Harbor classified it as `AgentSafetyRefusalError`; it was not
+retried or rephrased and is not counted in the active slice.
 Browser automation, computer-use, GUI interaction, and image/video perception
 are outside this milestone; the pinned Caffe/CIFAR-10 training task is deferred
 under that boundary without a model run, as is the pinned Windows 3.11

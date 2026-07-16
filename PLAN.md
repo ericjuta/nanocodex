@@ -1533,6 +1533,27 @@ both file-existence and exact-content assertions in 0.01 seconds. No shared
 prompt, runtime, environment, or verifier change was inferred from the long
 solution search.
 
+`feal-linear-cryptanalysis` at pinned digest
+`sha256:37b3af0f80e6ac42aba08d46dc4600cbd9a1ff0136c10710e6e6269e726fdfc7`
+is retained as a cyber-safety exclusion rather than an active task. Cold image
+preparation used 62 seconds of Harbor time and 64.95 complete command seconds.
+The required unchanged low-effort trial then received a typed Responses API
+`cyber_policy` error during model call four, after three completed model/tool
+phases. Harbor classified the run as `AgentSafetyRefusalError`; the complete
+command used 89.74 seconds and the trial used 84.17 seconds.
+
+Before the refusal, Rust used 79.17 seconds, including 77.76 model seconds and
+3.81 seconds across three PTC shell phases. The run consumed 12,206 input,
+4,278 cached-input, and 2,490 output tokens, including 945 reasoning tokens;
+warmup used another 1,602 input tokens. Environment and agent setup used 1.34
+and 0.70 seconds, and the canonical verifier subsequently failed its one
+assertion because the interrupted agent had not produced `plaintexts.txt`.
+Raw JSONL contained exactly one `run.failed`, its terminal payload matched ATIF
+exactly, and stderr retained the classifier diagnostic. There was no Harbor
+retry, reconnect, compaction, injection, hosted subagent, or agent message.
+The request was not retried, rephrased, encoded, fragmented, or disguised; the
+task was removed from the stable suite and the ladder continues.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936
