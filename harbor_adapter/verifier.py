@@ -10,7 +10,7 @@ from harbor.verifier.verifier import Verifier
 
 
 class PytestVerifier(Verifier):
-    """Upload canonical tests, then run preinstalled pytest directly."""
+    """Upload canonical tests and support files, then run preinstalled pytest."""
 
     @override
     async def verify(self) -> VerifierResult:
@@ -28,6 +28,12 @@ class PytestVerifier(Verifier):
         command = "\n".join(
             (
                 "status=0",
+                "for source in /tests/*; do "
+                'case "$source" in '
+                "/tests/test.sh|/tests/test_outputs.py) continue ;; "
+                "esac; "
+                '[ -e "$source" ] && cp -R "$source" /app/; '
+                "done",
                 "python -m pytest "
                 f"--ctrf {environment_paths.verifier_dir}/ctrf.json "
                 f"{shlex.quote(str(environment_paths.tests_dir))} -rA "

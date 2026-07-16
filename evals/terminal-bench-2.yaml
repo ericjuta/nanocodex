@@ -18,6 +18,7 @@ datasets:
     task_names:
       - terminal-bench/fix-git
       - terminal-bench/openssl-selfsigned-cert
+      - terminal-bench/cancel-async-tasks
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
