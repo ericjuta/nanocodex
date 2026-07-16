@@ -254,7 +254,7 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. All twenty-seven active public tasks have green
+Status: in progress. All twenty-eight active public tasks have green
 low-effort PTC samples with the current `openai-coding-v13` prompt. The latest
 27-task full-suite attempt passed 26/27; the latest all-green checkpoint is the
 registry-resolved 26-task gate described below. The table records
@@ -289,6 +289,7 @@ representative warm samples:
 | `schemelike-metacircular-eval` | 1.0 | 156.46s | 88.85s | 88.19s | 16.15s | 6/5 | 107,509/29,224/4,455 |
 | `distribution-search` | 1.0 | 45.20s | 41.09s | 40.04s | 2.13s | 5/4 | 14,210/8,342/2,328 |
 | `largest-eigenval` | 1.0 | 69.44s | 64.85s | 64.09s | 7.57s | 7/6 | 23,668/8,556/3,038 |
+| `constraints-scheduling` | 1.0 | 30.93s | 26.49s | 25.72s | 0.13s | 3/2 | 10,483/5,490/1,787 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--1.05 seconds per task, and Rust
@@ -955,6 +956,24 @@ seconds, and 131,330 input tokens. Its retained low-effort history is therefore
 8 green and 3 red samples. The task remains active because its deterministic
 verifier is measuring real optimization variance; removing it or adding a
 task-specific warrior hint would hide that signal.
+
+`constraints-scheduling` at pinned digest
+`sha256:757c2b9672df2db1ca879878e6c13dcad20222381694a29920eb452276a69d90`
+needed only a YAML admission. Its first install-only Harbor job took 31.28
+seconds, including 30.35 seconds of environment setup. The first low-effort
+sample passed all three canonical tests covering structure,
+conflicts/business hours, earliest-time/tie-breaks, and Carol's buffer in
+30.93 seconds. Environment and agent setup used 1.29 and 0.53 seconds; Rust
+used 26.49 seconds, including 25.72 generated-model seconds and 0.13 seconds
+across two local tool phases. Three model calls consumed 10,483 input, 5,490
+cached-input, and 1,787 output tokens; canonical verification used 0.89
+seconds. The canonical launcher requests Python 3.13, while this task image and
+the cached verifier fast path use Python 3.12.3. Its assertions use only stdlib
+behavior with no known 3.12/3.13 sensitivity, so the task is admitted, but
+version-sensitive candidates remain deferred until the fast path can preserve
+interpreter selection without adding repeated warm installation.
+This is the first focused admission after the 27-task full-suite attempt, so
+the next batch gate remains due after two more clean task admissions.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
