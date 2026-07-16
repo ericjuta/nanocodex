@@ -256,10 +256,8 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 Status: in progress. All thirty-three active public tasks have green low-effort
 PTC samples with the current `openai-coding-v13` prompt. The latest full-suite
-gate passed all 30/30 then-active tasks with zero exceptions or retries; Build
-pMARS, Prove Plus Comm, and Custom Memory Heap Crash are the three focused
-admissions since that gate. Their next full-suite batch gate is now due. The
-table records representative warm samples:
+gate passed all 33/33 tasks with zero exceptions or retries. The table records
+representative warm samples:
 
 | task | reward | trial | Rust | generated turns | tool wall | rounds/tools | input/cache/output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1084,6 +1082,30 @@ inspection, compile, execution, and Valgrind tool phases. Eleven model calls
 consumed 82,173 input, 14,260 cached-input, and 3,394 output tokens. The scored
 path was API-dominated once the canonical task image was cached; this third
 focused admission triggers the 33-task full-suite gate.
+
+That 33-task gate passed 33/33 with zero exceptions and zero retries in 10
+minutes 59.04 seconds. The complete `just eval` command took 663.80 seconds,
+only 4.76 seconds beyond Harbor's job wall for the cached native artifact
+build, configuration, and launch. Four-way concurrency compressed 2,084.81
+aggregate generated-model seconds and 444.55 aggregate tool-wall seconds into
+the job wall; tool time is contained within generated-turn time. Rust totaled
+2,107.79 seconds, including 13.55 seconds of warmup and 9.38 seconds of
+WebSocket setup, leaving 0.06 aggregate seconds of other in-process harness
+work. Environment startup, agent upload/setup, and canonical verification
+totaled 43.14, 17.42, and 162.82 task-seconds; agent execution outside the Rust
+process totaled 15.61 seconds across all trials.
+
+The gate used 1,143,115 input, 384,442 cached-input, 8,633 cache-write, and
+87,682 output tokens across 195 model calls and 162 tool calls; 18,348 output
+tokens were reasoning tokens. Warmup probes used another 57,075 input tokens.
+Model calls averaged 10.69 seconds with 6.67-second median, 36.16-second p95,
+and 60.24-second maximum; time to first output averaged 2.02 seconds with a
+5.42-second p95. Tool calls averaged 2.74 seconds with 0.15-second median,
+20.15-second p95, and 46.03-second maximum. No compaction, hosted subagent,
+API-reported cost, exception, or retry occurred. The three new tasks all passed
+independently again: Build pMARS in 76.68 seconds, Prove Plus Comm in 25.91
+seconds, and Custom Memory Heap Crash in 76.24 seconds. Core Wars also remained
+green without a task-specific prompt or runtime change.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model

@@ -85,12 +85,11 @@ HARNESS_BUILD_PROFILE=profiling
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
 and tasks. The current development slice contains thirty-three public shell/code
 tasks with green low-effort v13 samples. The latest full-suite gate passed all
-30/30 then-active tasks with zero exceptions or retries; Build pMARS, Prove
-Plus Comm, and Custom Memory Heap Crash form the next three-task admission
-batch, whose full-suite gate is due. Constraints Scheduling, Write Compressor,
-and Tune MJCF formed the preceding batch. Browser automation, computer-use,
-GUI interaction, and image/video perception are outside this milestone.
-Downloaded tasks and canonical verifier assertions remain unchanged.
+33/33 with zero exceptions or retries, including independent samples of Build
+pMARS, Prove Plus Comm, and Custom Memory Heap Crash. Browser automation,
+computer-use, GUI interaction, and image/video perception are outside this
+milestone. Downloaded tasks and canonical verifier assertions remain
+unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
 before model work, and a task that repeatedly requires benchmark-specific
