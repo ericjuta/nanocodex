@@ -254,13 +254,13 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. All thirty-four active public tasks have green low-effort
+Status: in progress. All thirty-five active public tasks have green low-effort
 PTC samples with the current `openai-coding-v13` prompt. The latest required
 34-task full-suite gate scored 33/34 with zero exceptions or retries; the only
 miss, Core Wars, is now an evidence-backed variance exclusion, so all 33 tasks
-that remain from that gate were green. Circuit Fib/Sqrt then passed as the first
-focused admission in the next three-task batch. The table records representative
-warm samples:
+that remain from that gate were green. Circuit Fib/Sqrt and Build POV-Ray then
+passed as the first two focused admissions in the next three-task batch. The
+table records representative warm samples:
 
 | task | reward | trial | Rust | generated turns | tool wall | rounds/tools | input/cache/output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -298,6 +298,7 @@ warm samples:
 | `prove-plus-comm` | 1.0 | 14.98s | 10.88s | 9.95s | 0.34s | 3/2 | 5,866/4,466/566 |
 | `custom-memory-heap-crash` | 1.0 | 99.40s | 91.74s | 91.01s | 32.71s | 11/10 | 82,173/14,260/3,394 |
 | `circuit-fibsqrt` | 1.0 | 108.20s | 103.24s | 102.20s | 35.70s | 5/4 | 25,256/12,438/3,744 |
+| `build-pov-ray` | 1.0 | 129.63s | 117.79s | 117.00s | 29.78s | 18/17 | 291,544/49,408/4,370 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--1.31 seconds per task, and Rust
@@ -1305,6 +1306,29 @@ stderr: Fix Git passed 2/2 checks in 40.02 Rust seconds, OpenSSL passed 6/6 in
 seconds. The latter proves its existing verifier against the system stack's
 NumPy 2.3.1 update. These focused results establish the shared cache fix; the
 required full `just eval` remains the suite-level regression gate.
+
+`build-pov-ray` at pinned digest
+`sha256:b64f3fd6f47dc8848fdd6ce990fbedce9577d97ea4f7fd1c489c42338229d078`
+is the second admission in this batch. Its initial task/verifier image
+preparation took 60.01 seconds in Harbor and 62.91 seconds for the command,
+including 59.20 seconds of environment construction. After the shared setup
+fix above, the first valid low-effort sample downloaded the original source and
+documentation archives, patched the 1990s C for a modern compiler, installed
+the AArch64 binary, and preserved the supplied scene unchanged.
+
+The accepted warm trial took 129.63 seconds: environment startup used 1.29
+seconds, agent setup 0.54 seconds, execution 118.37 seconds, and canonical
+verification 7.70 seconds. Rust used 117.79 seconds, including 117.00 seconds
+in generated model turns and 29.78 seconds across seventeen source-discovery,
+patch, compile, render, and cleanup tool phases. Eighteen model calls used
+291,544 input, 49,408 cached-input, and 4,370 output tokens; warmup used another
+1,598 input tokens. The unchanged verifier passed all three checks: the
+rendered scene reached SSIM `0.8731`, the binary identified as POV-Ray 2.2, and
+the required source tree remained present. JSONL and ATIF agreed, the terminal
+was `run.completed`, and there was no exception, retry, reconnect, compaction,
+hosted subagent, API-reported cost, setup warning, or agent stderr. No further
+runtime change was needed. One more green admission will complete the batch and
+trigger the next full active-suite gate.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model

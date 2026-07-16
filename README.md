@@ -87,18 +87,18 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The current stable development slice contains thirty-four public
+and tasks. The current stable development slice contains thirty-five public
 shell/code tasks. The required post-reconnect 34-task gate scored 33/34 in 11
 minutes 19.37 seconds with zero exceptions or retries; all tasks retained from
 that gate passed, including Tune MJCF and QEMU. Core Wars was the sole miss,
 and an immediate unchanged focused retry missed a different opponent. Across
 one green and two red low-effort samples it is retained as a variance
 experiment but excluded from the stable gate rather than receiving a
-benchmark-specific prompt hint. Circuit Fib/Sqrt subsequently passed 3/3
-canonical checks as the first focused admission in the next batch. Browser
-automation, computer-use, GUI interaction, and image/video perception are
-outside this milestone. Downloaded tasks and canonical verifier assertions
-remain unchanged.
+benchmark-specific prompt hint. Circuit Fib/Sqrt and Build POV-Ray subsequently
+passed 3/3 canonical checks apiece as the first two focused admissions in the
+next batch. Browser automation, computer-use, GUI interaction, and image/video
+perception are outside this milestone. Downloaded tasks and canonical verifier
+assertions remain unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
 before model work, and a task that repeatedly requires benchmark-specific
