@@ -36,6 +36,7 @@ datasets:
       - terminal-bench/log-summary-date-ranges
       - terminal-bench/cobol-modernization
       - terminal-bench/sqlite-with-gcov
+      - terminal-bench/llm-inference-batching-scheduler
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
