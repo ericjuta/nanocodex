@@ -93,7 +93,7 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The configured development slice contains thirty-eight public
+and tasks. The configured development slice contains thirty-seven public
 shell/code tasks. The first 35-task gate after admitting Circuit Fib/Sqrt and
 Build POV-Ray completed every trial without an exception or retry in 16
 minutes 41.92 seconds and scored 34/35. Its only miss was a verifier-cache
@@ -131,6 +131,11 @@ wrote `GritLM/GritLM-7B`, and passed both assertions. The green retry used
 seconds, and 413.33 nested tool seconds across 26/25 model/tool rounds. One
 idle-socket reconnect resumed the stored response chain successfully. No
 shared prompt, runtime, task, or verifier change was added for the recovery.
+Two subsequent current samples instead selected the live leaderboard's
+`Qwen/Qwen3-Embedding-8B`, missing the benchmark's August-2025 snapshot. MTEB
+Leaderboard is therefore retained as a time-sensitive variance experiment
+outside the stable slice rather than receiving a benchmark-specific answer
+hint.
 The next candidate, Regex Chess, is excluded from the stable slice after two
 valid canonical runs passed only the output-size assertion and failed all
 three held-out games. The unchanged retry reduced the solution substantially

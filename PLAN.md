@@ -254,7 +254,7 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. Thirty-eight public tasks are active with green low-effort
+Status: in progress. Thirty-seven public tasks are active with green low-effort
 PTC samples under the current `openai-coding-v13` prompt. The first required
 35-task gate completed every trial without an exception or retry and scored
 34/35; its only miss exposed verifier-package contamination rather than a
@@ -268,8 +268,10 @@ the sole POV-Ray variance miss passed an unchanged focused retry. MTEB
 Leaderboard is the first green admission in the following batch after an
 unchanged retry recovered its historical-snapshot solution path. Build POV-Ray
 is now a retained variance experiment after two later consecutive current
-samples repeated the source-authenticity miss. The table records representative
-warm samples:
+samples repeated the source-authenticity miss. MTEB Leaderboard is likewise a
+retained variance experiment after two later samples selected the current
+leader instead of the benchmark's historical snapshot. The table records
+representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
 spent 68.00 of its 135.45 trial seconds reinstalling an already pinned TeX
@@ -1684,6 +1686,27 @@ exactly one `run.completed`; the final assistant result matched ATIF, stderr was
 empty, and there was no compaction, injection, hosted subagent, agent message,
 cache write, or API-reported cost. The first miss and unchanged recovery are
 retained as solution-path and latency variance evidence.
+
+The valid MTEB trial completed before the externally interrupted suite gate
+selected the live leaderboard's `Qwen/Qwen3-Embedding-8B`, so it passed only
+the output-file assertion. It used 68.89 trial seconds and 60.64 Rust seconds,
+including 60.00 model seconds and 13.32 nested tool seconds across 14/13
+model/tool rounds. It consumed 59,313 input, 18,538 cached-input, and 3,354
+output tokens, including 703 reasoning tokens. The stream had exactly one
+terminal event, empty stderr, and no exception, retry, or reconnect.
+
+The required unchanged focused retry again wrote
+`Qwen/Qwen3-Embedding-8B` instead of the expected August-2025
+`GritLM/GritLM-7B`, passing 1/2 assertions. Harbor used 236.95 seconds and the
+complete command used 241.30 seconds. Rust used 230.63 seconds, including
+229.90 model seconds and 171.56 tool seconds across 18/17 rounds. It consumed
+121,263 input, 34,048 cached-input, and 3,668 output tokens, including 622
+reasoning tokens. Its JSONL was monotonic with exactly one `run.completed`,
+empty stderr, and no exception, retry, reconnect, compaction, injection,
+hosted subagent, agent message, cache write, or API-reported cost. Two
+consecutive current misses now outweigh the earlier one-sample recovery, so
+MTEB Leaderboard is retained as a time-sensitive variance experiment outside
+the stable slice without a benchmark-specific answer hint.
 
 `regex-chess` at pinned digest
 `sha256:b91cc4650c743c5b1a569864529335bcb7c3a1aaeb1a6920c37cda369cead9b7`
