@@ -254,7 +254,7 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. Thirty-eight public tasks are active with green low-effort
+Status: in progress. Thirty-nine public tasks are active with green low-effort
 PTC samples under the current `openai-coding-v13` prompt. The first required
 35-task gate completed every trial without an exception or retry and scored
 34/35; its only miss exposed verifier-package contamination rather than a
@@ -264,7 +264,9 @@ exception or retry. `overfull-hbox` and `compile-compcert` are green;
 `tune-mjcf` is now a retained variance experiment after two consecutive current
 speed misses. CompCert, Crack 7z Hash, and RStan to PyStan complete the next
 three-task batch. Its 38-task gate scored 37/38 with no exception or retry, and
-the sole POV-Ray variance miss passed an unchanged focused retry. The table
+the sole POV-Ray variance miss passed an unchanged focused retry. MTEB
+Leaderboard is the first green admission in the following batch after an
+unchanged retry recovered its historical-snapshot solution path. The table
 records representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
@@ -318,6 +320,7 @@ anchors remained green at 2/2 and 6/6, with 1.16- and 0.99-second verifiers.
 | `compile-compcert` | 1.0 | 960.91s | 953.13s | 952.26s | 855.66s | 15/14 | 312,242/55,370/3,427 |
 | `crack-7z-hash` | 1.0 | 732.33s | 725.20s | 724.02s | 425.20s | 22/21 | 121,990/38,728/5,253 |
 | `rstan-to-pystan` | 1.0 | 440.08s | 432.45s | 431.56s | 347.50s | 20/19 | 320,065/55,332/5,082 |
+| `mteb-leaderboard` | 1.0 | 511.57s | 501.15s | 500.26s | 413.33s | 26/25 | 404,746/69,008/5,056 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--1.31 seconds per task, and Rust
@@ -1622,6 +1625,43 @@ seconds and 34.34 tool seconds across 19/18 rounds, consuming 264,613 input,
 25,668 cached-input, and 5,350 output tokens. Its raw/ATIF terminal payloads
 matched and stderr was empty. No benchmark-specific hint or shared change was
 added from this recovered solution-path variance.
+
+`mteb-leaderboard` at pinned digest
+`sha256:244bc0c349b5d84b1545620f121056033022caeabea35f7f324a90b84593a43f`
+is the first green admission in the next batch. Cold preparation of its pinned
+MTEB machine-learning image used 7 minutes 13 seconds of Harbor time and
+436.66 complete command seconds. The first unchanged low-effort trial scored
+1/2 assertions in 75.58 Harbor seconds: it correctly created `result.txt`, but
+selected the May 2025 SOTA from the legacy Scandinavian Embedding Benchmark
+instead of the requested MTEB `Mean (Task)` snapshot. There was no runtime,
+adapter, or verifier failure, so no shared or task-specific change was made.
+
+The required unchanged retry reconstructed the August 2025 MTEB results and
+wrote `GritLM/GritLM-7B`, passing 2/2 assertions with reward 1.0. Harbor used
+511.71 seconds, the trial used 511.57 seconds, and the complete
+`just eval-task` command used 518.69 seconds. Environment startup used 1.41
+seconds, agent setup 0.53 seconds, agent execution 501.73 seconds, canonical
+verification 0.89 seconds, and remaining pre-verifier plus teardown gaps 6.91
+seconds.
+
+Rust used 501.15 seconds, including 500.26 seconds across 26 generated-model
+turns and 413.33 seconds across 25 PTC shell phases. Historical-results checkout
+and computation dominated the task tools at 120.01 and 141.28 seconds; this was
+task-container work rather than harness build or Harbor setup. Model calls
+averaged 19.24 seconds with 5.12-second p50, 56.67-second p95, and 145.32-second
+maximum; mean times to first event and first output were 0.18 and 1.53 seconds.
+Tools averaged 16.53 seconds with 0.88-second p50, 51.72-second p95, and
+141.28-second maximum.
+
+The green run consumed 404,746 input, 69,008 cached-input, and 5,056 output
+tokens, including 840 reasoning tokens; warmup used another 1,536 input tokens.
+A server-closed idle socket after a long tool phase caused one measured
+reconnect, which resumed the stored response chain successfully. Harbor
+recorded no exception or retry. Raw JSONL retained its one-line input and
+exactly one `run.completed`; the final assistant result matched ATIF, stderr was
+empty, and there was no compaction, injection, hosted subagent, agent message,
+cache write, or API-reported cost. The first miss and unchanged recovery are
+retained as solution-path and latency variance evidence.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
