@@ -42,6 +42,7 @@ datasets:
       - terminal-bench/winning-avg-corewars
       - terminal-bench/sparql-university
       - terminal-bench/pypi-server
+      - terminal-bench/schemelike-metacircular-eval
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
