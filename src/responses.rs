@@ -97,7 +97,10 @@ impl ResponsesSocket {
         ))
     }
 
-    pub(crate) async fn send<T: Serialize>(&self, value: &T) -> Result<()> {
+    pub(crate) async fn send<T: Serialize>(
+        &self,
+        value: &T,
+    ) -> std::result::Result<(), ResponsesError> {
         let payload = serde_json::to_string(value).map_err(ResponsesError::EncodeRequest)?;
         timeout(SEND_TIMEOUT, self.pump.send(Message::Text(payload.into())))
             .await

@@ -70,6 +70,15 @@ pub enum ResponsesError {
     Api { event: Box<Value> },
 }
 
+impl ResponsesError {
+    pub(crate) const fn is_reconnectable_send(&self) -> bool {
+        matches!(
+            self,
+            Self::Send(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed)
+        )
+    }
+}
+
 /// Failures in the model/tool orchestration layer.
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {

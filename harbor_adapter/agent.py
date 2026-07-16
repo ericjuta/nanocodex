@@ -252,6 +252,15 @@ class HarnessAgent(BaseInstalledAgent):
                             "reasoning_output_tokens": usage.get(
                                 "reasoning_output_tokens"
                             ),
+                            "connection_attempts": terminal_payload.get(
+                                "connection_attempts"
+                            ),
+                            "websocket_reconnects": terminal_payload.get(
+                                "websocket_reconnects"
+                            ),
+                            "connection_duration_ns": terminal_payload.get(
+                                "connection_duration_ns"
+                            ),
                             "model_duration_ns": terminal_payload.get(
                                 "model_duration_ns"
                             ),
@@ -309,6 +318,15 @@ class HarnessAgent(BaseInstalledAgent):
                     "model_calls": model_calls,
                     "tool_calls": tool_calls,
                     "duration_ns": terminal_payload.get("duration_ns"),
+                    "connection_attempts": terminal_payload.get(
+                        "connection_attempts"
+                    ),
+                    "websocket_reconnects": terminal_payload.get(
+                        "websocket_reconnects"
+                    ),
+                    "connection_duration_ns": terminal_payload.get(
+                        "connection_duration_ns"
+                    ),
                     "model_duration_ns": terminal_payload.get("model_duration_ns"),
                     "warmup_duration_ns": terminal_payload.get("warmup_duration_ns"),
                     "warmup_usage": warmup_usage,
@@ -364,6 +382,11 @@ class HarnessAgent(BaseInstalledAgent):
             "orchestration": terminal_payload.get("orchestration"),
             "duration_ms": terminal_payload.get("duration_ms"),
             "duration_ns": terminal_payload.get("duration_ns"),
+            "connection_attempts": terminal_payload.get("connection_attempts"),
+            "websocket_reconnects": terminal_payload.get("websocket_reconnects"),
+            "connection_duration_ns": terminal_payload.get(
+                "connection_duration_ns"
+            ),
             "model_duration_ns": terminal_payload.get("model_duration_ns"),
             "warmup_duration_ns": terminal_payload.get("warmup_duration_ns"),
             "warmup_usage": warmup_usage,

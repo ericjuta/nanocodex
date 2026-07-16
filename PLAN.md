@@ -1169,6 +1169,47 @@ Fresh scored anchors passed from those images: Fix Git passed 2/2 tests in
 49.95 seconds and OpenSSL passed 6/6 in 36.13 seconds, both at reward 1.0 with
 clean verifier logs and no exceptions, retries, or agent stderr.
 
+The first 34-task gate then completed in 15 minutes 23.71 seconds with 33
+reward-1 trials, one reward-0 trial, one agent exception, and zero Harbor
+retries. It used 1,378,131 input, 429,826 cached-input, and 100,431 output
+tokens. Tune MJCF was the sole canonical miss: its unchanged verifier passed
+the reference-integrity and output-existence checks, but the selected model
+ended at a 0.0012515 state difference versus the required `1e-5` and a 62.85%
+runtime ratio versus the required 60%. That 336.61-second trial used 10/9
+model/tool rounds, 63,347 input, 19,568 cached-input, and 6,700 output tokens.
+This is retained as model trajectory variance rather than hidden by a task hint
+or verifier change.
+
+QEMU's canonical telnet/kernel assertion still passed in that gate, but Harbor
+correctly reported an agent exception. After a 127.34-second local VM tool
+phase, the server had normally closed the idle WebSocket; the next stored
+continuation failed before transmission with Tungstenite
+`ConnectionClosed`, so Rust emitted `run.failed` even though the workspace was
+valid. The runtime now retries only that unambiguous pre-stream boundary (and
+`AlreadyClosed`): it opens one new WebSocket and resends the exact
+`store: true` request with its existing `previous_response_id`. It does not
+retry arbitrary I/O failures, mid-stream reads, or Multi-agent injections.
+This follows the Responses WebSocket reconnect contract and the comparable
+closed-connection path in Codex's `core/src/client.rs` and
+`codex-api/src/endpoint/responses_websocket.rs` without importing Codex's HTTP
+fallback or provider machinery.
+
+A deterministic two-connection test closes the first socket while a local
+tool is running, then proves that the second request retains both the stored
+response ID and tool output. Connection attempts, successful reconnects, and
+connection wall time are now present in terminal JSONL and Harbor/ATIF
+metadata. The fresh real QEMU trial passed its canonical check with a normal
+`run.completed`, zero exceptions, retries, or stderr, and no reconnect needed
+in that particular sample. Its 245-second Harbor trial spent 237.09 seconds in
+Rust, 236.51 seconds in generated-model turns, and 169.48 seconds in five
+legitimate VM setup/readiness tool phases; six model calls used 15,293 input,
+9,768 cached-input, and 3,357 output tokens. Fresh runtime anchors also stayed
+green: Fix Git passed 2/2 in 43 seconds with 37.94 seconds in Rust, while
+OpenSSL passed 6/6 in 39 seconds with 35.04 seconds in Rust. Both had a single
+WebSocket connection, zero exceptions, and empty agent stderr. A subsequent
+reward-1 Fix Git projection run confirmed all three connection metrics in both
+Harbor result metadata and ATIF final/step metrics.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936

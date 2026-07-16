@@ -469,7 +469,7 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
                 event: &request,
             },
         )?;
-        self.socket.send(&request).await
+        self.socket.send(&request).await.map_err(Into::into)
     }
 
     fn handle_injection_created(&mut self, response_id: &str) -> Result<()> {

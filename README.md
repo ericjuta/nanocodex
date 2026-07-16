@@ -30,7 +30,11 @@ OpenAI runs the model-generated JavaScript in its hosted PTC runtime. The Rust
 process executes only the nested `exec_command` calls returned by the API,
 preserves their caller linkage, and sends their structured results back over
 the same WebSocket continuation chain. A dedicated socket pump services API
-keepalives while the response consumer is waiting on local tools.
+keepalives while the response consumer is waiting on local tools. If the
+server normally closes that idle socket before the next `response.create`,
+Rust reconnects once and resends the same stored continuation; connection
+attempts, reconnects, and connection wall time remain visible in JSONL and
+Harbor/ATIF.
 
 The adapter removes `OPENAI_API_KEY` from Harbor's per-exec environment before
 launching Docker. It uploads a mode-`0400` transient file for the agent user,
@@ -86,11 +90,14 @@ HARNESS_BUILD_PROFILE=profiling
 and tasks. The current development slice contains thirty-four public shell/code
 tasks. The latest completed full-suite gate passed the first 33/33 with zero
 exceptions or retries, including independent samples of Build pMARS, Prove
-Plus Comm, and Custom Memory Heap Crash. QEMU Startup is independently green at
-low effort against its canonical telnet/kernel verifier and is awaiting the
-34-task full-suite gate. Browser automation, computer-use, GUI interaction, and
-image/video perception are outside this milestone. Downloaded tasks and
-canonical verifier assertions remain unchanged.
+Plus Comm, and Custom Memory Heap Crash. The first 34-task gate produced 33
+reward-1 trials: Tune MJCF narrowly missed its unchanged correctness and speed
+thresholds, while QEMU's verifier passed but exposed a stale-WebSocket agent
+exit. QEMU is independently green again after the generic reconnect fix; the
+unchanged 34-task gate is awaiting its required rerun. Browser automation,
+computer-use, GUI interaction, and image/video perception are outside this
+milestone. Downloaded tasks and canonical verifier assertions remain
+unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
 before model work, and a task that repeatedly requires benchmark-specific

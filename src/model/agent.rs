@@ -17,16 +17,43 @@ use crate::{
 struct ConnectionStarted<'a> {
     transport: &'static str,
     websocket_url: &'a str,
+    attempt: u32,
+    purpose: ConnectionPurpose,
 }
 
 #[derive(Serialize)]
 struct ConnectionCompleted<'a> {
     transport: &'static str,
+    attempt: u32,
+    purpose: ConnectionPurpose,
     duration_ns: u64,
     http_status: u16,
     request_id: Option<&'a str>,
     server_model: Option<&'a str>,
     server_reasoning_included: bool,
+}
+
+#[derive(Serialize)]
+struct ConnectionFailed<'a> {
+    transport: &'static str,
+    attempt: u32,
+    purpose: ConnectionPurpose,
+    duration_ns: u64,
+    error: &'a str,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConnectionPurpose {
+    Initial,
+    Reconnect,
+}
+
+#[derive(Serialize)]
+struct ConnectionRetry<'a> {
+    call_index: u32,
+    previous_response_id: Option<&'a str>,
+    reason: &'a str,
 }
 
 #[derive(Serialize)]
@@ -153,7 +180,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
 
     async fn execute_task(&mut self) -> Result<String> {
         let workspace = resolve_workspace(self.task.workspace.as_deref())?;
-        let mut socket = self.connect().await?;
+        let mut socket = self.connect(ConnectionPurpose::Initial).await?;
         let profile = RequestProfile::new(self.config);
         let initial_input = InputItem::for_task(self.task, &workspace, self.config);
         let warmup_response_id = self
@@ -271,26 +298,54 @@ impl<'a, W: Write> ModelRun<'a, W> {
         }
     }
 
-    async fn connect(&mut self) -> Result<ResponsesSocket> {
+    async fn connect(&mut self, purpose: ConnectionPurpose) -> Result<ResponsesSocket> {
         let started_at = Instant::now();
+        self.stats.connection_attempts += 1;
+        let attempt = self.stats.connection_attempts;
         self.events.emit(
             "model.connection.started",
             ConnectionStarted {
                 transport: TRANSPORT,
                 websocket_url: display_endpoint(&self.config.websocket_url),
+                attempt,
+                purpose,
             },
         )?;
-        let (socket, metadata) = ResponsesSocket::connect(
+        let connection = ResponsesSocket::connect(
             &self.config.websocket_url,
             &self.config.api_key,
             self.config.multi_agent,
         )
-        .await?;
+        .await;
+        let duration_ns = elapsed_ns(started_at);
+        self.stats.connection_duration_ns += duration_ns;
+        let (socket, metadata) = match connection {
+            Ok(connection) => connection,
+            Err(error) => {
+                let message = error.to_string();
+                self.events.emit(
+                    "model.connection.failed",
+                    ConnectionFailed {
+                        transport: TRANSPORT,
+                        attempt,
+                        purpose,
+                        duration_ns,
+                        error: &message,
+                    },
+                )?;
+                return Err(error);
+            }
+        };
+        if matches!(purpose, ConnectionPurpose::Reconnect) {
+            self.stats.websocket_reconnects += 1;
+        }
         self.events.emit(
             "model.connection.completed",
             ConnectionCompleted {
                 transport: TRANSPORT,
-                duration_ns: elapsed_ns(started_at),
+                attempt,
+                purpose,
+                duration_ns,
                 http_status: metadata.status,
                 request_id: metadata.request_id.as_deref(),
                 server_model: metadata.server_model.as_deref(),
@@ -298,6 +353,33 @@ impl<'a, W: Write> ModelRun<'a, W> {
             },
         )?;
         Ok(socket)
+    }
+
+    async fn send_model_request<T: Serialize>(
+        &mut self,
+        socket: &mut ResponsesSocket,
+        request: &T,
+        call_index: u32,
+        previous_response_id: Option<&str>,
+    ) -> Result<()> {
+        match socket.send(request).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_reconnectable_send() => {
+                let reason = error.to_string();
+                self.events.emit(
+                    "model.connection.retrying",
+                    ConnectionRetry {
+                        call_index,
+                        previous_response_id,
+                        reason: &reason,
+                    },
+                )?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+
+        *socket = self.connect(ConnectionPurpose::Reconnect).await?;
+        socket.send(request).await.map_err(Into::into)
     }
 
     async fn perform_model_call(
@@ -337,7 +419,8 @@ impl<'a, W: Write> ModelRun<'a, W> {
             },
         )?;
         let response = match async {
-            socket.send(&request).await?;
+            self.send_model_request(socket, &request, call_index, previous_response_id)
+                .await?;
             super::stream::receive(
                 socket,
                 self.events,
@@ -389,3 +472,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+#[path = "agent_tests.rs"]
+mod tests;
