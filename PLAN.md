@@ -401,6 +401,13 @@ computer-use, image/video perception, and other modality-dependent tasks are
 deferred until those tool surfaces are intentional milestones; they are not
 counted as failures of the shell-only loop.
 
+`caffe-cifar-10` at pinned digest
+`sha256:d41ec2d7249c3142f0db4f80b04a41c7e8fad1688c78ba3f5e09a7d6671d2697`
+is deferred under that boundary. Its requested output is a Caffe image
+classifier trained on CIFAR-10 for exactly 500 CPU iterations and scored over
+another 100 test iterations. That is an image-perception/training workload,
+not a missing shell or code capability, so no model trial was launched.
+
 `vulnerable-secret` is retained as an excluded cyber-safety experiment. One
 low-effort v11 attempt completed normally in 32.30 seconds and passed all three
 canonical assertions after inspecting and decoding the stripped AArch64
