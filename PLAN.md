@@ -272,7 +272,9 @@ samples repeated the source-authenticity miss. MTEB Leaderboard is likewise a
 retained variance experiment after two later samples selected the current
 leader instead of the benchmark's historical snapshot. The required
 post-adapter 37-task gate passes 37/37 tasks and all 145 canonical assertions.
-The table records representative warm samples:
+PyTorch Model Recovery is retained outside the stable slice after two current
+samples reproduced the same implicit forward-signature miss. The table records
+representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
 spent 68.00 of its 135.45 trial seconds reinstalling an already pinned TeX
@@ -1808,6 +1810,27 @@ input, 4,466 cached-input, and 1,735 output tokens. Both streams had monotonic
 JSONL, one assistant message and matching terminal event, matching ATIF, empty
 stderr, and no exception, error event, retry, reconnect, compaction, injection,
 hosted subagent, cache write, or API-reported cost.
+
+The two valid PyTorch samples both passed preservation, artifact, strict-load,
+and state-dict checks but failed the fifth canonical assertion. Each inferred a
+single-input `forward(src)` and self-verified against that interface, while the
+reference architecture invokes the recovered encoder-decoder as
+`forward(src, tgt)`. The first valid run used 94.73 trial seconds and 100.49
+complete command seconds. Rust used 86.34 seconds, including 85.85 model
+seconds and 34.62 tool seconds across 5/4 rounds; it consumed 21,612 input,
+10,390 cached-input, and 3,796 output tokens, including 778 reasoning tokens.
+
+The required unchanged retry reproduced the same 4/5 result in 96.71 trial
+seconds and 101.95 complete command seconds. Rust used 88.72 seconds, including
+88.13 model seconds and 45.24 tool seconds across 5/4 rounds; it consumed
+18,055 input, 10,390 cached-input, and 3,386 output tokens, including 772
+reasoning tokens. Both streams were monotonic with one assistant message and
+matching `run.completed`, exact ATIF correspondence, empty stderr, and no
+exception, retry, error event, reconnect, compaction, injection, hosted
+subagent, cache write, or API-reported cost. State-dict tensor shapes do not
+encode the public forward signature, and adding that hidden signature to the
+shared prompt would be benchmark-specific. The task is therefore retained as
+an excluded model-recovery experiment; the stable suite remains at 37 tasks.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model

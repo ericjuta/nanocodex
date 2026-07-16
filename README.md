@@ -165,6 +165,14 @@ Torch 2.7.1, so the adapter now admits that exact dependency shape without
 changing the task or verifier. The untouched verifier then ran normally, and
 focused Fix Git and OpenSSL regressions remained green at 2/2 and 6/6.
 
+Two valid unchanged PyTorch samples then passed 4/5 canonical assertions but
+made the same solution-path error: both exported `forward(src)`, while the
+reference encoder-decoder invokes `forward(src, tgt)`. Both preserved the
+weights file, emitted a loadable TorchScript artifact, matched all non-output
+parameters, and had clean runtime streams. Because state-dict shapes do not
+encode that public signature, the task is retained outside the stable suite
+rather than adding a benchmark-specific signature hint to the shared prompt.
+
 The pinned FEAL Linear Cryptanalysis candidate is excluded after its required
 unchanged trial returned a typed Responses API `cyber_policy` error on model
 call four and Harbor classified it as `AgentSafetyRefusalError`; it was not
