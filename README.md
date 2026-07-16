@@ -93,11 +93,12 @@ exceptions or retries, including independent samples of Build pMARS, Prove
 Plus Comm, and Custom Memory Heap Crash. The first 34-task gate produced 33
 reward-1 trials: Tune MJCF narrowly missed its unchanged correctness and speed
 thresholds, while QEMU's verifier passed but exposed a stale-WebSocket agent
-exit. QEMU is independently green again after the generic reconnect fix; the
-unchanged 34-task gate is awaiting its required rerun. Browser automation,
-computer-use, GUI interaction, and image/video perception are outside this
-milestone. Downloaded tasks and canonical verifier assertions remain
-unchanged.
+exit. QEMU is independently green again after the generic reconnect fix, and
+an unchanged focused Tune MJCF retry passed all four checks at 48% of reference
+runtime. Both outcomes remain recorded as variance; the unchanged 34-task gate
+is awaiting its required rerun. Browser automation, computer-use, GUI
+interaction, and image/video perception are outside this milestone. Downloaded
+tasks and canonical verifier assertions remain unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
 before model work, and a task that repeatedly requires benchmark-specific

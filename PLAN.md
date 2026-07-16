@@ -1180,6 +1180,18 @@ model/tool rounds, 63,347 input, 19,568 cached-input, and 6,700 output tokens.
 This is retained as model trajectory variance rather than hidden by a task hint
 or verifier change.
 
+The immediate unchanged focused retry confirmed that classification. It passed
+all four canonical checks with no exception or stderr: the verifier measured a
+0.48 runtime ratio and an all-close final state, while the model's 100-seed
+probe found a worst maximum absolute difference of `3.72e-6`. The 262.53-second
+Harbor trial used 1.31 seconds for environment startup, 0.51 seconds for agent
+setup, 244.47 seconds in Rust, and 12.84 seconds for the unchanged verifier.
+Fourteen model calls and thirteen tool phases used 99,643 input, 29,368
+cached-input, and 6,005 output tokens; 148.66 seconds was measured local
+simulation/tool wall. The red and green samples are both retained, so the
+full-suite rerun remains the gate rather than treating either trajectory alone
+as the benchmark's stable outcome.
+
 QEMU's canonical telnet/kernel assertion still passed in that gate, but Harbor
 correctly reported an agent exception. After a 127.34-second local VM tool
 phase, the server had normally closed the idle WebSocket; the next stored
