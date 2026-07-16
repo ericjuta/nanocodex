@@ -26,7 +26,6 @@ datasets:
       - terminal-bench/build-cython-ext
       - terminal-bench/fix-code-vulnerability
       - terminal-bench/git-multibranch
-      - terminal-bench/filter-js-from-html
       - terminal-bench/git-leak-recovery
 
 environment:

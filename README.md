@@ -74,10 +74,10 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The current development slice contains ten public tasks: nine have
-green samples from the real model/tool loop, and `filter-js-from-html` is the
-retained red case. Downloaded tasks and canonical verifier assertions remain
-unchanged.
+and tasks. The current development slice contains nine public shell/code tasks,
+all with green samples from the real model/tool loop. Browser automation,
+computer-use, and other modality-dependent tasks are outside this milestone.
+Downloaded tasks and canonical verifier assertions remain unchanged.
 
 Every trial retains `input.jsonl`, `events.jsonl`, `stderr.log`, and
 `trajectory.json` under `.harness/harbor/jobs`. Harbor receives aggregate token
