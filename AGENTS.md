@@ -14,6 +14,12 @@
 
 ## Codex reference implementation
 
+- Do not invoke the OpenAI docs skill, fetch the Codex manual, use the OpenAI
+  Docs MCP server, or browse the web for Codex/OpenAI behavior unless the user
+  explicitly asks. Use the local Codex checkout and retained runtime/eval
+  traces as the default sources in this repository. This repository rule
+  overrides automatic skill-trigger matching, including when a request would
+  otherwise match the `openai-docs` skill description.
 - For agent architecture and implementation decisions, first inspect how the
   locally cloned OpenAI Codex repository handles the comparable concern. The
   expected checkout is `~/github/openai/codex`, with Rust code under
