@@ -83,7 +83,7 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The current development slice contains twenty-one public shell/code
+and tasks. The current development slice contains twenty-two public shell/code
 tasks, all with green samples from the real model/tool loop. Browser
 automation, computer-use, GUI interaction, and image/video perception are
 outside this milestone. Downloaded tasks and canonical verifier assertions
@@ -92,6 +92,9 @@ remain unchanged.
 Candidate admission is evidence-driven. Cold task preparation is measured
 before model work, and a task that repeatedly requires benchmark-specific
 prompt hints is deferred rather than adding that hint to the shared harness.
+New verifier dependencies are appended as isolated image layers so prior apt
+and Python layers remain reusable; the Primer3 layer for `dna-insert`, for
+example, was paid once during preparation and added no warm-trial installation.
 The retained Raman-fitting experiment, for example, scored 0.0 in three
 canonical low-effort runs; its generic units prompt increased work without
 producing the required fit, so both the prompt change and task admission were
