@@ -146,6 +146,19 @@ different checkout. The Justfile now exports its own directory as
 `PYTHONPATH`, making every recipe load the adapter from the worktree being
 evaluated. Focused Fix Git and OpenSSL anchors then passed 2/2 and 6/6
 canonical assertions with no exception, retry, reconnect, or stderr output.
+
+The required post-adapter `just eval` gate then passed all 37 active tasks and
+all 145 canonical assertions in 22 minutes 51.58 seconds of Harbor wall; the
+complete command took 22 minutes 57.08 seconds. Rust used 4,459.23 aggregate
+seconds, of which 4,425.93 seconds were generated-model turns and 2,757.15
+seconds were nested task tools. The suite used 241 model calls and 204 tool
+calls, consuming 1,636,949 input, 484,984 cached-input, 4,784 cache-write, and
+105,318 output tokens. All streams had one matching final assistant message
+and terminal event, empty stderr, and no exception, error event, reconnect,
+compaction, injection, hosted subagent, or API-reported cost. CompCert's
+1,362.35-second Rust execution determined the suite tail; aggregate environment
+and agent setup averaged only 2.70 seconds per trial.
+
 The pinned FEAL Linear Cryptanalysis candidate is excluded after its required
 unchanged trial returned a typed Responses API `cyber_policy` error on model
 call four and Harbor classified it as `AgentSafetyRefusalError`; it was not

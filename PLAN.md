@@ -270,8 +270,9 @@ unchanged retry recovered its historical-snapshot solution path. Build POV-Ray
 is now a retained variance experiment after two later consecutive current
 samples repeated the source-authenticity miss. MTEB Leaderboard is likewise a
 retained variance experiment after two later samples selected the current
-leader instead of the benchmark's historical snapshot. The table records
-representative warm samples:
+leader instead of the benchmark's historical snapshot. The required
+post-adapter 37-task gate passes 37/37 tasks and all 145 canonical assertions.
+The table records representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
 spent 68.00 of its 135.45 trial seconds reinstalling an already pinned TeX
@@ -1753,6 +1754,39 @@ no exception, retry, reconnect, compaction, injection, hosted subagent, agent
 message, cache write, or API-reported cost. A full active-suite gate is required
 before another candidate is admitted because adapter resolution is shared
 evaluation infrastructure.
+
+That required literal `just eval` gate is green at Harbor job
+`.harness/harbor/jobs/2026-07-16__12-49-26`. All 37 configured tasks earned
+reward 1.0, all 145 canonical assertions passed, and the job recorded no trial
+error, exception, or Harbor retry. Harbor wall was 1,371.58 seconds and the
+complete command used 1,377.08 seconds. Four concurrent workers compressed
+4,921.10 aggregate trial-seconds into that wall. Aggregate environment setup
+used 66.26 seconds, agent setup 33.72 seconds, agent execution 4,500.75
+seconds, canonical verification 220.23 seconds, and pre-verifier plus teardown
+gaps 100.14 seconds.
+
+Rust used 4,459.23 aggregate seconds: 4,425.93 in generated-model turns,
+2,757.15 nested in PTC shell tools, 14.16 connecting, 19.07 warming up, and
+0.07 in other in-process work. The 241 model calls had 5.26-second p50,
+50.97-second p95, and 457.02-second maximum latency; the 204 tool calls had
+0.16-second p50, 60.86-second p95, and 454.72-second maximum latency. CompCert
+set the suite tail: its Rust process used 1,362.35 seconds, including 1,306.18
+seconds in task-container tools. The current bottleneck is therefore task and
+model work rather than the 2.70 aggregate seconds of environment-plus-agent
+setup per trial.
+
+The gate consumed 1,636,949 input, 484,984 cached-input, 4,784 cache-write,
+and 105,318 output tokens, including 23,191 reasoning tokens; warmups used
+another 63,430 input tokens. Every trial retained a one-line input, monotonic
+JSONL, exactly one final assistant message and `run.completed`, matching ATIF
+input/message/terminal payloads, a canonical CTRF result, and an artifact
+manifest. All stderr files were empty, all tool call IDs had one matching
+result, and there was no error event, reconnect, compaction, injection, hosted
+subagent, or API-reported cost. The only nonzero CTRF `retries` fields are the
+three parameterized `largest-eigenval` groups: the plugin collapses each nine-
+case group into one record plus eight additional cases; canonical stdout
+confirms 27 direct passes rather than trial or assertion reruns. The shared
+adapter gate is satisfied, so the ladder may admit its next candidate.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
