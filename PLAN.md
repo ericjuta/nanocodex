@@ -1286,6 +1286,26 @@ No shared harness change was needed, so the next full `just eval` remains due
 after two further admissions complete this three-task batch, or earlier if a
 shared runtime or environment change is required.
 
+The first `build-pov-ray` attempt demonstrated the next generic verifier-cache
+gap. The agent completed normally and produced a plausible render, but the
+canonical assertions never started: the shared adapter rejected the exact
+`apt-get install -y curl imagemagick` and pinned Pillow/NumPy/scikit-image
+`uvx` command shapes. That setup-only reward 0 is retained and is not counted
+as a model result. The reusable verifier image now installs the scientific
+image stack in one append-only layer and recognizes only those exact canonical
+commands; the benchmark task and assertions remain untouched.
+
+Rebuilding the focused POV-Ray overlay took 11.90 seconds in Harbor and 14.23
+seconds for the complete install-only command. The complete 35-overlay
+`just prepare-evals` then passed 35/35 with zero exception or retry in 142.89
+seconds of Harbor wall and 144.43 seconds for the command, with no model calls.
+Focused scored regressions remained green with no setup warning or agent
+stderr: Fix Git passed 2/2 checks in 40.02 Rust seconds, OpenSSL passed 6/6 in
+32.76 seconds, and NumPy-dependent Distribution Search passed 4/4 in 40.47
+seconds. The latter proves its existing verifier against the system stack's
+NumPy 2.3.1 update. These focused results establish the shared cache fix; the
+required full `just eval` remains the suite-level regression gate.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936

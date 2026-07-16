@@ -47,3 +47,11 @@ RUN if python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then \
         uv pip install --system --break-system-packages --no-cache \
             numpy==2.3.0; \
     fi
+# POV-Ray's canonical image comparison adds this exact scientific-image stack.
+# Keep it in a final layer so all earlier verifier dependency layers stay cached.
+RUN if python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then \
+        uv pip install --system --break-system-packages --no-cache \
+            pillow==11.1.0 \
+            numpy==2.3.1 \
+            scikit-image==0.25.0; \
+    fi
