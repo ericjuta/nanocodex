@@ -29,6 +29,8 @@ class PytestVerifier(Verifier):
         commands = [
             "status=0",
             f": > {test_stdout}",
+            "if [ -x /usr/bin/chromedriver ]; then "
+            "export SE_CHROMEDRIVER=/usr/bin/chromedriver; fi",
             "for source in /tests/*; do "
             'case "$source" in '
             "/tests/test.sh|/tests/test_outputs.py) continue ;; "
