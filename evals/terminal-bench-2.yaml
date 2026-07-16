@@ -41,6 +41,7 @@ datasets:
       - terminal-bench/merge-diff-arc-agi-task
       - terminal-bench/dna-insert
       - terminal-bench/dna-assembly
+      - terminal-bench/winning-avg-corewars
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
