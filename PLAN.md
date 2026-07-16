@@ -254,10 +254,11 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. All nine active public tasks have green low-effort PTC
+Status: in progress. All ten active public tasks have green low-effort PTC
 samples. The table records their last warm samples. `fix-git`, OpenSSL, the
 vulnerability task, the multibranch task, and `git-leak-recovery` use the
-current `openai-coding-v9` prompt; the other task digests have v7 samples:
+`openai-coding-v9` prompt; `db-wal-recovery` uses v10 and the other task
+digests have v7 samples:
 
 | task | reward | trial | Rust | generated turns | tool wall | rounds/tools | input/cache/output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -270,6 +271,7 @@ current `openai-coding-v9` prompt; the other task digests have v7 samples:
 | `fix-code-vulnerability` | 1.0 | 46.96s | 42.98s | 42.23s | 1.32s | 5/4 | 33,408/5,096/1,033 |
 | `git-multibranch` | 1.0 | 100.90s | 87.70s | 87.12s | 1.46s | 5/4 | 17,824/8,758/2,949 |
 | `git-leak-recovery` | 1.0 | 31.69s | 27.12s | 26.02s | 0.57s | 3/2 | 7,258/2,888/1,477 |
+| `db-wal-recovery` | 1.0 | 66.67s | 62.76s | 62.08s | 0.23s | 7/6 | 20,344/10,232/2,637 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--0.93 seconds per task, and Rust
@@ -363,6 +365,20 @@ Its warm trial spent 1.41 seconds on environment startup, 0.49 seconds on agent
 setup, 27.24 seconds on agent execution, and 0.84 seconds in the verifier.
 Within the 27.12-second Rust run, 26.02 seconds was model/API time, 0.38 seconds
 was the WebSocket warmup, and 0.57 seconds was local tool work.
+
+The first `db-wal-recovery` attempt opened SQLite before preserving the input
+WAL. SQLite consumed the unreadable working WAL, and the model then fabricated
+plausible replacement values after validating only record count and IDs. The
+v10 prompt adds Codex's generic prohibition on guessing plus a narrow forensic
+invariant: copy original inputs before tools that may consume them and validate
+requested values, not only output shape. On the retry, the second tool call
+copied both database files before the first normal SQLite open. The agent
+restored that copy, decoded the WAL, recovered the changed values, and passed
+all seven canonical assertions. The one-time image preparation took 49.33
+seconds outside the scored job; the warm trial used 1.50 seconds for environment
+startup, 0.51 seconds for agent setup, 62.90 seconds for agent execution, and
+0.54 seconds for verification. Of the 62.76-second Rust run, 62.08 seconds was
+model/API time and 0.23 seconds was local tool work.
 
 These public tasks are the development/tuning set: their instructions,
 verifiers, trajectories, and failure cases may be inspected while improving

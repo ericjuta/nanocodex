@@ -27,6 +27,7 @@ datasets:
       - terminal-bench/fix-code-vulnerability
       - terminal-bench/git-multibranch
       - terminal-bench/git-leak-recovery
+      - terminal-bench/db-wal-recovery
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
