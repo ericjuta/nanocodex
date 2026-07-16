@@ -254,9 +254,9 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. All eleven active public tasks have green low-effort PTC
+Status: in progress. All twelve active public tasks have green low-effort PTC
 samples. The table records their last warm samples. `fix-git`, OpenSSL, and
-both database recovery tasks use the current `openai-coding-v10` prompt. The
+both database recovery tasks plus Nginx use the current `openai-coding-v10` prompt. The
 vulnerability task, multibranch task, and `git-leak-recovery` use v9; the other
 task digests have v7 samples:
 
@@ -273,6 +273,7 @@ task digests have v7 samples:
 | `git-leak-recovery` | 1.0 | 31.69s | 27.12s | 26.02s | 0.57s | 3/2 | 7,258/2,888/1,477 |
 | `db-wal-recovery` | 1.0 | 66.67s | 62.76s | 62.08s | 0.23s | 7/6 | 20,344/10,232/2,637 |
 | `sqlite-db-truncate` | 1.0 | 38.65s | 34.78s | 34.15s | 0.33s | 5/4 | 12,410/7,894/2,321 |
+| `nginx-request-logging` | 1.0 | 50.17s | 44.30s | 43.51s | 5.93s | 4/3 | 11,003/6,580/1,914 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--0.93 seconds per task, and Rust
@@ -406,6 +407,16 @@ preparation took 24.45 seconds outside the scored job. The warm trial used 1.22
 seconds for environment startup, 0.60 seconds for agent setup, 34.89 seconds
 for agent execution, and 0.79 seconds for verification. The Rust run spent
 34.15 of 34.78 seconds in model/API calls and 0.33 seconds in local tools.
+
+`nginx-request-logging` passed all eight canonical checks on its first
+low-effort attempt, adding a real service lifecycle and HTTP/logging boundary.
+Its cold image preparation took 24.66 seconds outside scoring. The warm trial
+used 1.29 seconds for environment startup, 0.50 seconds for agent setup, 44.40
+seconds for agent execution, and 2.76 seconds for verification. Task-required
+tool work took 5.93 seconds: 3.56 seconds installed/configured/started Nginx and
+2.35 seconds stress-tested rate limiting. Rust still spent 43.51 of 44.30
+seconds inside API turns, which include the hosted program waiting on those
+nested local calls.
 
 These public tasks are the development/tuning set: their instructions,
 verifiers, trajectories, and failure cases may be inspected while improving
