@@ -1832,6 +1832,34 @@ encode the public forward signature, and adding that hidden signature to the
 shared prompt would be benchmark-specific. The task is therefore retained as
 an excluded model-recovery experiment; the stable suite remains at 37 tasks.
 
+Harbor's four-trial concurrency was its library default, not a container or
+agent limit. The current Docker VM exposes 10 CPUs and 29.4 GiB; the six
+heaviest configured task limits can request 26 GiB and 11 CPUs, while the
+eight heaviest can request 30 GiB before Harbor and Docker overhead. `just
+eval` therefore defaults to six workers and accepts
+`HARBOR_EVAL_CONCURRENCY` for deliberately lighter suites. CompCert was
+already in the first worker wave of the preceding gate and occupied its task
+container for the entire 31-minute critical path, so additional workers improve
+throughput for the other tasks but cannot shorten that gate below CompCert's
+own runtime.
+
+Parallel process launches also exposed Harbor's second-resolution default job
+name: two task retries started in the same second selected one directory, and
+the second process stopped before creating a trial. Launch recipes now add the
+task or operation and Bash process ID to the timestamp. The same-second proof
+created distinct jobs at
+`.harness/harbor/jobs/2026-07-16__14-17-35-fix-git-36015` and
+`.harness/harbor/jobs/2026-07-16__14-17-35-openssl-selfsigned-cert-36014`.
+Fix Git passed 2/2 in 38.28 trial and 46.29 command seconds; Rust used 21.75
+seconds, including 21.12 model and 0.74 tool seconds over 6/5 rounds, with
+23,350 input, 11,816 cached-input, and 1,458 output tokens, including 205
+reasoning tokens. OpenSSL passed 6/6 in 36.77 trial and 44.80 command seconds;
+Rust used 19.54 seconds, including 18.82 model and 1.03 tool seconds over 3/2
+rounds, with 7,636 input, 4,466 cached-input, and 1,582 output tokens, including
+185 reasoning tokens. Both jobs had zero exceptions or retries, monotonic JSONL,
+one terminal event, paired tool results, and empty stderr. `just check` also
+remained green.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936

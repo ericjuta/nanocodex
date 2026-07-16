@@ -1,5 +1,5 @@
 # Edit this file—not the Justfile—to select datasets, tasks, and attempts.
-# Let Harbor generate a unique job name so every invocation is a fresh eval.
+# The launcher supplies a collision-resistant job name for parallel invocations.
 jobs_dir: .harness/harbor/jobs
 
 agents:
