@@ -1860,6 +1860,39 @@ rounds, with 7,636 input, 4,466 cached-input, and 1,582 output tokens, including
 one terminal event, paired tool results, and empty stderr. `just check` also
 remained green.
 
+The required post-adapter full gate at
+`.harness/harbor/jobs/2026-07-16__13-34-58` completed all 37 trials with zero
+exceptions or Harbor retries, but scored 35/37 and passed 141/145 canonical
+assertions. Harbor used 1,908.55 seconds and the complete command used 1,913.61
+seconds. Four workers compressed 5,969.38 aggregate trial-seconds into that
+wall: environment setup used 65.98 seconds, agent setup 28.45, agent execution
+5,590.99, verification 203.22, and remaining gaps 80.74. Rust used 5,560.81
+aggregate seconds, including 5,532.06 model and 3,324.49 nested tool seconds
+over 278/241 rounds. The gate consumed 2,237,456 input, 616,718 cached-input,
+4,712 cache-write, and 124,867 output tokens, including 25,751 reasoning
+tokens; warmups used another 63,430 input tokens.
+
+RStan passed 5/6 but sampled `rho[1]` at 0.88365, just outside the canonical
+0.886 lower bound. Write Compressor passed 0/3 because that trajectory never
+created `data.comp`. Both agents otherwise had monotonic, paired JSONL, one
+`run.completed`, empty stderr, and no infrastructure exception. Unchanged
+focused retries recovered both tasks. Write Compressor passed 3/3 at
+`.harness/harbor/jobs/2026-07-16__14-09-31-write-compressor-15655` in 107.93
+trial and 116.35 command seconds. Rust used 82.49 seconds, including 81.98 model
+and 13.71 tool seconds over 4/3 rounds; usage was 22,058 input, 4,278
+cached-input, and 4,727 output tokens, including 1,417 reasoning tokens.
+
+RStan then passed 6/6 at
+`.harness/harbor/jobs/2026-07-16__14-07-40` in 793.65 trial and 801.54 command
+seconds. Rust used 730.57 seconds, including 729.88 model and 620.62 tool
+seconds over 25/24 rounds; usage was 516,753 input, 74,750 cached-input, and
+7,372 output tokens, including 1,039 reasoning tokens. Both retry jobs recorded
+zero exceptions or retries, monotonic JSONL, one assistant and terminal event,
+paired tool results, empty stderr, and no reconnect, compaction, injection,
+hosted agent, or API-reported cost. These recoveries identify trajectory and
+sampling variance rather than a deterministic regression; a new literal full
+suite gate is still required before admitting another candidate.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936
