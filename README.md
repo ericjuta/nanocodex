@@ -83,13 +83,13 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The current development slice contains twenty-eight public
+and tasks. The current development slice contains twenty-nine public
 shell/code tasks with green low-effort v13 samples. The latest 27-task
 full-suite attempt passed 26/27 because Core Wars repeated its earlier failing
 scores; the latest all-green checkpoint passed the preceding twenty-six tasks
-together. Constraints Scheduling is the first focused admission since that
-attempt. Browser automation, computer-use, GUI interaction, and image/video
-perception are outside this milestone.
+together. Constraints Scheduling and Write Compressor are the first two
+focused admissions since that attempt. Browser automation, computer-use, GUI
+interaction, and image/video perception are outside this milestone.
 Downloaded tasks and canonical verifier assertions remain unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
