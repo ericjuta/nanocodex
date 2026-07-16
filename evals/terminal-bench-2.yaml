@@ -35,6 +35,7 @@ datasets:
       - terminal-bench/large-scale-text-editing
       - terminal-bench/log-summary-date-ranges
       - terminal-bench/cobol-modernization
+      - terminal-bench/sqlite-with-gcov
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
