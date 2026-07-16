@@ -31,6 +31,7 @@ datasets:
       - terminal-bench/sqlite-db-truncate
       - terminal-bench/nginx-request-logging
       - terminal-bench/polyglot-c-py
+      - terminal-bench/polyglot-rust-c
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment

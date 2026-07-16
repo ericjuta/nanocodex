@@ -254,9 +254,9 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. All thirteen active public tasks have green low-effort PTC
+Status: in progress. All fourteen active public tasks have green low-effort PTC
 samples. The table records their last warm samples. `fix-git`, OpenSSL, and
-`polyglot-c-py` use the current `openai-coding-v11` prompt. Both database
+both polyglot tasks use the current `openai-coding-v11` prompt. Both database
 recovery tasks plus Nginx use v10. The vulnerability task, multibranch task,
 and `git-leak-recovery` use v9; the other task digests have v7 samples:
 
@@ -275,6 +275,7 @@ and `git-leak-recovery` use v9; the other task digests have v7 samples:
 | `sqlite-db-truncate` | 1.0 | 38.65s | 34.78s | 34.15s | 0.33s | 5/4 | 12,410/7,894/2,321 |
 | `nginx-request-logging` | 1.0 | 50.17s | 44.30s | 43.51s | 5.93s | 4/3 | 11,003/6,580/1,914 |
 | `polyglot-c-py` | 1.0 | 51.87s | 47.77s | 46.80s | 0.26s | 3/2 | 7,710/3,984/2,347 |
+| `polyglot-rust-c` | 1.0 | 64.73s | 60.82s | 60.21s | 0.55s | 2/1 | 4,947/1,346/3,032 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--0.93 seconds per task, and Rust
@@ -436,6 +437,16 @@ seconds end to end, with 39.81 of 40.71 Rust seconds in model/API calls and
 0.35 seconds in tools. OpenSSL took 41.87 seconds end to end, with 37.45 of
 37.98 Rust seconds in model/API calls and 0.35 seconds in tools. The cleanup
 invariant did not remove requested outputs or distort either workflow.
+
+The hard `polyglot-rust-c` task then passed on its first low-effort v11
+attempt. A single hosted program wrote the Rust/C++ lexical polyglot, compiled
+both forms, compared runtime outputs through Fibonacci(100), and removed both
+generated binaries before returning to the model. The canonical verifier saw
+only `main.rs` and passed. Cold preparation took 42.37 seconds outside scoring.
+The warm trial used 1.23 seconds for environment startup, 0.50 seconds for
+agent setup, 60.94 seconds for agent execution, and 0.84 seconds for
+verification. Rust spent 60.21 of 60.82 seconds in model/API calls and 0.55
+seconds in the sole local tool phase.
 
 These public tasks are the development/tuning set: their instructions,
 verifiers, trajectories, and failure cases may be inspected while improving
