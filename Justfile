@@ -7,6 +7,8 @@ agent_artifact_dir := ".harness/installed"
 agent_artifact := agent_artifact_dir + "/harness"
 default_eval := "evals/terminal-bench-2.yaml"
 default_jobs := ".harness/harbor/jobs"
+setup_jobs := ".harness/harbor/setup"
+prepare_concurrency := env_var_or_default("HARBOR_PREPARE_CONCURRENCY", "4")
 
 default: run
 
@@ -27,6 +29,18 @@ build-agent:
     @docker build --quiet --build-arg CARGO_PROFILE="{{build_profile}}" --file harbor_adapter/harness.Dockerfile --target artifact --output type=local,dest="{{agent_artifact_dir}}" .
     @test -x "{{agent_artifact}}"
 
+# Pay native task/verifier image construction once, outside measured eval jobs.
+# The no-op agent performs no model call, verification, or harness build.
+prepare-evals config=default_eval:
+    @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
+    @HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --agent nop --install-only --jobs-dir "{{setup_jobs}}" --n-concurrent "{{prepare_concurrency}}"
+
+# Prepare only the task being added to the benchmark ladder.
+prepare-task task config=default_eval:
+    @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
+    @dataset=$(HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --print-config | jq -er '.datasets | if length == 1 then .[0] | "\(.name)@\(.ref)" else error("expected exactly one dataset") end'); \
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --dataset "$dataset" --include-task-name "{{task}}" --agent nop --install-only --jobs-dir "{{setup_jobs}}" --n-concurrent 1
+
 # Run a Harbor-native job config. Rust executes inside each benchmark container.
 eval config=default_eval: build-agent
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
@@ -35,7 +49,8 @@ eval config=default_eval: build-agent
 # Run one registry task through the configured agent, environment, and verifier.
 eval-task task effort="low" multi_agent="false" config=default_eval: build-agent
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
-    @HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --task "{{task}}" --agent-kwarg "effort={{effort}}" --agent-kwarg "multi_agent={{multi_agent}}"
+    @dataset=$(HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --print-config | jq -er '.datasets | if length == 1 then .[0] | "\(.name)@\(.ref)" else error("expected exactly one dataset") end'); \
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --dataset "$dataset" --include-task-name "{{task}}" --agent-kwarg "effort={{effort}}" --agent-kwarg "multi_agent={{multi_agent}}"
 
 # Open all locally retained Harbor jobs unless another jobs directory is supplied.
 view jobs=default_jobs:

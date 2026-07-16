@@ -7,10 +7,11 @@ Multi-agent is an explicit profile for requested delegation or hard parallel
 work.
 
 ```sh
-just bootstrap  # install pinned dependencies once
-just run        # native low-effort PTC smoke; no Python, Docker, or Harbor
-just eval       # fresh model-driven Terminal-Bench trial
-just view       # inspect retained Harbor jobs
+just bootstrap      # install pinned host dependencies once
+just prepare-evals  # build/cache native task and verifier images; no model
+just run            # native low-effort PTC smoke; no Python, Docker, or Harbor
+just eval           # fresh model-driven Terminal-Bench trial
+just view           # inspect retained Harbor jobs
 ```
 
 `just eval` performs this path:
@@ -42,6 +43,25 @@ the pinned verifier dependencies. Downloaded benchmark tasks and assertion
 files remain unchanged; only their dependency-installing shell launchers are
 replaced by a direct `pytest` invocation.
 
+`just prepare-evals` pays those image-build costs outside measured eval jobs by
+running Harbor's install-only path with its no-op agent. When adding one task,
+`just prepare-task terminal-bench/<name>` prepares only that task. Preparation
+records go under `.harness/harbor/setup`; scored jobs remain under
+`.harness/harbor/jobs`.
+
+The eval YAML pins an immutable Terminal-Bench-2 dataset digest. `prepare-task`
+and `eval-task` filter that dataset rather than resolving a standalone task's
+moving `latest`, so a one-task run uses the same curated task revision as the
+full suite.
+
+Rust and adapter edits do not invalidate task images. `src/**` rebuilds only
+the final Cargo artifact layer, which Harbor uploads during agent setup.
+Task-image rebuilds occur only when a task's `environment/**`, native platform,
+or the deliberately pinned dataset digest changes. Editing
+`evals/pytest/Dockerfile` rebuilds the verifier overlay once per task. A warm
+environment phase should therefore be container startup rather than package
+installation.
+
 ## Build profiles
 
 Local artifacts use Cargo's `dev` profile by default. Set this in `.env` for an
@@ -54,9 +74,10 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The current slice contains `fix-git` and
-`openssl-selfsigned-cert`; both are solved by the real model/tool loop while
-their downloaded tasks and canonical verifier assertions remain unchanged.
+and tasks. The current development slice contains ten public tasks: nine have
+green samples from the real model/tool loop, and `filter-js-from-html` is the
+retained red case. Downloaded tasks and canonical verifier assertions remain
+unchanged.
 
 Every trial retains `input.jsonl`, `events.jsonl`, `stderr.log`, and
 `trajectory.json` under `.harness/harbor/jobs`. Harbor receives aggregate token

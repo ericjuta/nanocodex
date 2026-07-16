@@ -79,7 +79,11 @@ Measured on the development machine:
 
 The first run after task, platform, or eval-image changes also builds the
 content-addressed native image. Keep that cold setup cost separate from warm
-source-edit measurements.
+source-edit measurements. `just prepare-evals` performs this construction for
+the configured suite with Harbor's no-op install-only path, while `just
+prepare-task terminal-bench/<name>` prepares one newly added task. Neither path
+builds or runs the harness, calls a model, or invokes a verifier; their Harbor
+records live outside the scored jobs directory.
 
 ## Milestone 1: OpenAI execution
 
@@ -252,7 +256,7 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 Status: in progress. Nine public tasks now have green low-effort PTC samples.
 The first eight rows are their last warm samples on the `openai-coding-v7`
-stable prompt; `git-leak-recovery` is a cold sample on `openai-coding-v9`:
+stable prompt; `git-leak-recovery` is a warm sample on `openai-coding-v9`:
 
 | task | reward | trial | Rust | generated turns | tool wall | rounds/tools | input/cache/output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -264,7 +268,7 @@ stable prompt; `git-leak-recovery` is a cold sample on `openai-coding-v9`:
 | `build-cython-ext` | 1.0 | 160.79s | 154.45s | 153.80s | 67.27s | 21/20 | 240,833/43,306/4,797 |
 | `fix-code-vulnerability` | 1.0 | 34.05s | 29.90s | 29.23s | 1.50s | 6/5 | 33,896/5,815/1,324 |
 | `git-multibranch` | 1.0 | 65.40s | 54.22s | 53.51s | 4.57s | 6/5 | 23,667/10,501/3,209 |
-| `git-leak-recovery` | 1.0 | 60.38s | 32.09s | 30.84s | 0.26s | 4/3 | 9,871/5,436/1,764 |
+| `git-leak-recovery` | 1.0 | 31.69s | 27.12s | 26.02s | 0.57s | 3/2 | 7,258/2,888/1,477 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--0.93 seconds per task, and Rust
@@ -336,13 +340,13 @@ doubled medium agent time and usage without reward. Low-effort v9 regression
 runs kept `fix-git` and `openssl-selfsigned-cert` green at 51.44 and 42.03
 seconds of Harbor trial time, respectively.
 
-The first `git-leak-recovery` attempt passed all five canonical assertions: it
-recovered the secret, preserved good history, removed reachable and unreachable
-secret objects, and retained the expected repository contents. Its cold trial
-spent 25.88 seconds building task/verifier layers, 0.47 seconds on agent setup,
-32.22 seconds on agent execution, and 0.54 seconds in the verifier. Within the
-32.09-second Rust run, 30.84 seconds was model/API time, 0.57 seconds was the
-WebSocket warmup, and 0.26 seconds was local tool work.
+The dataset-curated `git-leak-recovery` attempt passed all five canonical
+assertions: it recovered the secret, preserved good history, removed reachable
+and unreachable secret objects, and retained the expected repository contents.
+Its warm trial spent 1.41 seconds on environment startup, 0.49 seconds on agent
+setup, 27.24 seconds on agent execution, and 0.84 seconds in the verifier.
+Within the 27.12-second Rust run, 26.02 seconds was model/API time, 0.38 seconds
+was the WebSocket warmup, and 0.57 seconds was local tool work.
 
 These public tasks are the development/tuning set: their instructions,
 verifiers, trajectories, and failure cases may be inspected while improving
@@ -367,7 +371,8 @@ output. Never modify a benchmark task or verifier to make the harness pass.
 
 For every new task:
 
-1. Run one attempt and inspect the JSONL, ATIF trajectory, verifier output, and
+1. Run `just prepare-task terminal-bench/<name>` once, then run one scored
+   attempt and inspect the JSONL, ATIF trajectory, verifier output, and
    task-container diff before changing the harness.
 2. Separate cold artifact/image work from the warm source-edit loop. Break wall
    time into local artifact build, Harbor setup/upload, task-container startup,
