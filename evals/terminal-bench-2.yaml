@@ -53,6 +53,7 @@ datasets:
       - terminal-bench/qemu-startup
       - terminal-bench/circuit-fibsqrt
       - terminal-bench/build-pov-ray
+      - terminal-bench/overfull-hbox
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment

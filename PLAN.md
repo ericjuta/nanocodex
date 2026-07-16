@@ -254,13 +254,14 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. All thirty-five active public tasks have green low-effort
+Status: in progress. All thirty-six active public tasks have green low-effort
 PTC samples with the current `openai-coding-v13` prompt. The first required
 35-task gate completed every trial without an exception or retry and scored
 34/35; its only miss exposed verifier-package contamination rather than a
 model failure. The verifier dependencies are now isolated, the affected
-focused regressions pass, and the corrected full gate passes 35/35 with zero
-exception or retry. The table records representative warm samples:
+focused regressions pass, and the corrected 35-task gate passes 35/35 with zero
+exception or retry. `overfull-hbox` is green in isolation; the 36-task gate is
+the next suite-level check. The table records representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
 spent 68.00 of its 135.45 trial seconds reinstalling an already pinned TeX
@@ -309,6 +310,7 @@ anchors remained green at 2/2 and 6/6, with 1.16- and 0.99-second verifiers.
 | `custom-memory-heap-crash` | 1.0 | 99.40s | 91.74s | 91.01s | 32.71s | 11/10 | 82,173/14,260/3,394 |
 | `circuit-fibsqrt` | 1.0 | 108.20s | 103.24s | 102.20s | 35.70s | 5/4 | 25,256/12,438/3,744 |
 | `build-pov-ray` | 1.0 | 139.58s | 128.75s | 128.17s | 26.10s | 21/20 | 349,918/47,542/4,894 |
+| `overfull-hbox` | 1.0 | 54.56s | 49.93s | 49.32s | 0.69s | 8/7 | 47,067/15,692/2,605 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--1.31 seconds per task, and Rust
@@ -1410,8 +1412,8 @@ verifier. Twenty-three model calls used 197,807 input, 44,250 cached-input, and
 9,014 output tokens. The canonical checks passed the unchanged reference,
 output existence, correctness, and speed assertions at a 0.51 time ratio and
 1.96x speedup. The corrected full sample also passed Cython 11/11, POV-Ray
-3/3 at SSIM `0.8731`, Distribution Search 4/4, and QEMU 1/1. One more green
-admission will complete this batch.
+3/3 at SSIM `0.8731`, Distribution Search 4/4, and QEMU 1/1. The focused green
+Overfull HBox admission completes this batch; its full 36-task gate remains.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
