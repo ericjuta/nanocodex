@@ -121,7 +121,7 @@ Status: first real model/tool vertical slice complete.
    interpret, reorder, or replace them with a local natural-language summary.
    Seed the quality-first profile near 350K tokens and evaluate a cost-sensitive
    profile just below GPT-5.6 Sol's 272K long-context pricing boundary.
-8. Use explicit GPT-5.6 prompt caching. Put exact stable developer instructions
+8. Use explicit GPT-5.6 prompt caching. Put exact stable base instructions
    and tools before dynamic task/environment content, place an explicit cache
    breakpoint at that boundary, and derive `prompt_cache_key` from the selected
    model, profile version, stable-prefix bytes, and tool-catalog bytes. Record

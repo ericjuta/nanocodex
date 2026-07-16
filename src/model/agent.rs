@@ -1,10 +1,12 @@
-use std::{io::Write, time::Instant};
+use std::{io::Write, path::Path, time::Instant};
 
 use serde::Serialize;
 
 use super::{
     ApiEvent, AssistantMessage, MAX_CONCURRENT_SUBAGENTS, ModelConfig, RunError, RunStarted,
-    RunStats, TRANSPORT, display_endpoint, elapsed_ns, resolve_workspace, terminal_payload,
+    RunStats, TRANSPORT,
+    agents_md::load_project_instructions,
+    display_endpoint, elapsed_ns, resolve_workspace, terminal_payload,
     wire::{InputItem, RequestProfile, ResponseCreate, Usage, WarmupServerEvent},
 };
 use crate::{
@@ -170,9 +172,11 @@ impl<'a, W: Write> ModelRun<'a, W> {
 
     async fn execute_task(&mut self) -> Result<String> {
         let workspace = resolve_workspace(self.task.workspace.as_deref())?;
+        let project_instructions = load_project_instructions(Path::new(&workspace))?;
         let mut socket = self.connect(ConnectionPurpose::Initial).await?;
         let profile = RequestProfile::new(self.config)?;
-        let initial_input = InputItem::for_task(self.task, &workspace);
+        let initial_input =
+            InputItem::for_task(self.task, &workspace, project_instructions.as_deref());
         let mut previous_response_id = self
             .perform_warmup(&mut socket, &initial_input, &profile)
             .await?;

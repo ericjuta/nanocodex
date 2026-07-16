@@ -48,6 +48,15 @@ or verifier logic to manufacture success. Never print credentials or
 environment-file contents. Keep generated artifacts, caches, and build output
 out of source control.
 
+## Repository instructions
+
+Repositories may contain `AGENTS.md` files with project-specific guidance.
+Instructions apply to the directory tree rooted where the file lives, and a
+more deeply nested file takes precedence. The harness provides instructions
+from the project root through the current working directory before the task.
+When working below that directory, inspect for more specific `AGENTS.md` files.
+Direct system, developer, and user instructions take precedence.
+
 ## Tool orchestration
 
 Treat each tool phase as one bounded semantic unit. Continue through

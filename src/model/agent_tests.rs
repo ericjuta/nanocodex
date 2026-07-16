@@ -23,6 +23,7 @@ async fn reconnects_before_resending_a_stored_continuation() -> Result<()> {
         let warmup = next_json(&mut first).await?;
         assert_eq!(warmup["generate"], false);
         assert_eq!(warmup["previous_response_id"], Value::Null);
+        assert_initial_prompt(&warmup);
         assert_eq!(warmup["tools"][0]["allowed_callers"][0], "programmatic");
         assert_eq!(warmup["tools"][1]["type"], "programmatic_tool_calling");
         send_json(
@@ -109,6 +110,35 @@ async fn reconnects_before_resending_a_stored_continuation() -> Result<()> {
     assert_eq!(terminal["payload"]["connection_attempts"], 2);
     assert_eq!(terminal["payload"]["websocket_reconnects"], 1);
     Ok(())
+}
+
+fn assert_initial_prompt(warmup: &Value) {
+    assert_eq!(warmup["instructions"], ModelConfig::system_prompt());
+    assert_eq!(warmup["input"].as_array().map(Vec::len), Some(2));
+    assert_eq!(warmup["input"][0]["role"], "user");
+    assert_eq!(
+        warmup["input"][0]["content"][0]["text"],
+        "# Project context"
+    );
+    assert_eq!(
+        warmup["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+        "explicit"
+    );
+    assert!(
+        warmup["input"][0]["content"][1]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("# AGENTS.md instructions"))
+    );
+    assert!(
+        warmup["input"][0]["content"][2]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("<environment_context>"))
+    );
+    assert_eq!(warmup["input"][1]["role"], "user");
+    assert_eq!(
+        warmup["input"][1]["content"][0]["text"],
+        "exercise reconnect handling"
+    );
 }
 
 #[tokio::test]

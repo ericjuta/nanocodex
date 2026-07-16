@@ -97,6 +97,13 @@ pub enum AgentError {
     #[error("task workspace path is not valid UTF-8: {path}")]
     WorkspaceNotUtf8 { path: PathBuf },
 
+    #[error("failed to read project instructions from {path}")]
+    ReadProjectInstructions {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     #[error("model call limit ({limit}) reached before the task completed")]
     ModelCallLimit { limit: u32 },
 

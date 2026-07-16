@@ -11,6 +11,7 @@ use crate::{
 };
 
 const CACHE_PROFILE_VERSION: &str = "openai-coding-v13";
+const PROJECT_CONTEXT_HEADER: &str = "# Project context";
 
 pub(in crate::model) struct RequestProfile {
     prompt_cache_key: String,
@@ -61,22 +62,28 @@ pub(in crate::model) struct MessageInput {
 }
 
 impl MessageInput {
-    fn developer() -> Self {
-        Self {
-            kind: "message",
-            role: "developer",
-            content: vec![InputText::stable(ModelConfig::system_prompt(), true)],
+    fn project_context(workspace: &str, project_instructions: Option<&str>) -> Self {
+        let mut content = vec![InputText::stable(PROJECT_CONTEXT_HEADER, true)];
+        if let Some(project_instructions) = project_instructions {
+            content.push(InputText::new(format!(
+                "# AGENTS.md instructions for {workspace}\n\n<INSTRUCTIONS>\n{project_instructions}\n</INSTRUCTIONS>"
+            )));
         }
-    }
-
-    fn user(task: &Task, workspace: &str) -> Self {
+        content.push(InputText::new(format!(
+            "<environment_context>\n<cwd>{workspace}</cwd>\n<shell>/bin/sh</shell>\n</environment_context>"
+        )));
         Self {
             kind: "message",
             role: "user",
-            content: vec![InputText::new(format!(
-                "{}\n\n<environment_context>\n<cwd>{workspace}</cwd>\n<shell>/bin/sh</shell>\n</environment_context>",
-                task.instruction
-            ))],
+            content,
+        }
+    }
+
+    fn user(task: &Task) -> Self {
+        Self {
+            kind: "message",
+            role: "user",
+            content: vec![InputText::new(task.instruction.clone())],
         }
     }
 }
@@ -123,10 +130,17 @@ impl From<FunctionCallOutput> for InputItem {
 }
 
 impl InputItem {
-    pub(in crate::model) fn for_task(task: &Task, workspace: &str) -> Vec<Self> {
+    pub(in crate::model) fn for_task(
+        task: &Task,
+        workspace: &str,
+        project_instructions: Option<&str>,
+    ) -> Vec<Self> {
         vec![
-            Self::Message(MessageInput::developer()),
-            Self::Message(MessageInput::user(task, workspace)),
+            Self::Message(MessageInput::project_context(
+                workspace,
+                project_instructions,
+            )),
+            Self::Message(MessageInput::user(task)),
         ]
     }
 }
@@ -136,6 +150,7 @@ pub(in crate::model) struct ResponseCreate<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     model: &'a str,
+    instructions: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'a str>,
     input: &'a [InputItem],
@@ -181,6 +196,7 @@ impl<'a> ResponseCreate<'a> {
         Self {
             kind: "response.create",
             model: &config.model,
+            instructions: ModelConfig::system_prompt(),
             previous_response_id,
             input,
             tools: profile.tools(),
