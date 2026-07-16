@@ -99,7 +99,12 @@ and Python layers remain reusable. The pinned RDFLib layer used by the active
 SPARQL task was paid once during preparation and adds no warm-trial
 installation. The active PyPI-server task needs only an exact cached verifier
 command shape and adds no image dependency. Distribution Search uses a pinned
-final NumPy layer paid during preparation and performs no warm-trial install.
+final NumPy layer paid during preparation and performs no warm-trial install;
+that layer is skipped on legacy task interpreters because NumPy 2.3 requires
+Python 3.11 and unrelated older-base verifiers do not request it. Debian images
+that package Python 3.9's `distutils` separately receive that package in the
+cached overlay so uv can inspect the interpreter. The compatibility path was
+regressed against Fix Git and OpenSSL without changing canonical tests.
 Largest Eigenvalue likewise uses an exact cached pip command and adds no image
 dependency. Tune MJCF uses an exact cached `mujoco==3.3.5` command shape and
 also adds no verifier-image dependency.

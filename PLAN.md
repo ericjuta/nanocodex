@@ -1107,6 +1107,23 @@ independently again: Build pMARS in 76.68 seconds, Prove Plus Comm in 25.91
 seconds, and Custom Memory Heap Crash in 76.24 seconds. Core Wars also remained
 green without a task-specific prompt or runtime change.
 
+Preparing the next Debian Bullseye candidate demonstrated two shared cached-
+verifier compatibility failures before any model call. The task image built
+successfully during the 116.03-second cold attempt, but uv could not inspect
+Bullseye's Python 3.9 without the separately packaged `distutils`; after that
+was installed conditionally, the common overlay still tried to install NumPy
+2.3 even though that unrelated dependency requires Python 3.11. The overlay now
+installs `python3-distutils` only where the distribution offers it and installs
+NumPy 2.3 only on a compatible interpreter. The unchanged task then prepared
+without an exception in a 9.81-second Harbor job (7.36 seconds of environment
+setup; 16.23 seconds for the complete command). Focused regression runs stayed
+green: Fix Git passed both canonical tests in a 35.80-second trial with 31.39
+seconds in Rust, 30.92 seconds in generated-model time, and 1.02 seconds of tool
+wall; OpenSSL passed all six canonical tests in 26.94 seconds with 22.69 seconds
+in Rust, 21.82 seconds in generated-model time, and 0.67 seconds of tool wall.
+Both had zero exceptions, retries, and agent stderr. This is a verifier-image
+portability fix, not a benchmark or assertion change.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936

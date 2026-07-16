@@ -25,7 +25,11 @@ RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
         openssh-client \
         python3 \
         python-is-python3 \
-        vim
+        vim && \
+    if apt-cache show python3-distutils >/dev/null 2>&1; then \
+        DEBIAN_FRONTEND=noninteractive \
+        apt-get install --yes --no-install-recommends python3-distutils; \
+    fi
 RUN uv pip install --system --break-system-packages --no-cache \
     pytest==8.4.1 \
     pytest-json-ctrf==0.3.5 \
@@ -36,5 +40,9 @@ RUN DEBIAN_FRONTEND=noninteractive \
     apt-get install --yes --no-install-recommends primer3
 RUN uv pip install --system --break-system-packages --no-cache \
     rdflib==7.1.4
-RUN uv pip install --system --break-system-packages --no-cache \
-    numpy==2.3.0
+# NumPy 2.3 requires Python 3.11. Older task images do not need it unless their
+# canonical verifier asks for it, and those verifier tasks use newer Python.
+RUN if python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then \
+        uv pip install --system --break-system-packages --no-cache \
+            numpy==2.3.0; \
+    fi
