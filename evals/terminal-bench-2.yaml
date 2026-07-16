@@ -28,6 +28,7 @@ datasets:
       - terminal-bench/git-multibranch
       - terminal-bench/git-leak-recovery
       - terminal-bench/db-wal-recovery
+      - terminal-bench/sqlite-db-truncate
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
