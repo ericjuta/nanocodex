@@ -254,7 +254,7 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. Thirty-seven public tasks are active with green low-effort
+Status: in progress. Thirty-eight public tasks are active with green low-effort
 PTC samples under the current `openai-coding-v13` prompt. The first required
 35-task gate completed every trial without an exception or retry and scored
 34/35; its only miss exposed verifier-package contamination rather than a
@@ -262,8 +262,8 @@ model failure. The verifier dependencies are now isolated, the affected
 focused regressions pass, and the corrected 35-task gate passes 35/35 with zero
 exception or retry. `overfull-hbox` and `compile-compcert` are green;
 `tune-mjcf` is now a retained variance experiment after two consecutive current
-speed misses. CompCert and Crack 7z Hash are the first two admissions in the
-next three-task batch. The table records
+speed misses. CompCert, Crack 7z Hash, and RStan to PyStan complete the next
+three-task batch; its required full-suite gate is pending. The table records
 representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
@@ -316,6 +316,7 @@ anchors remained green at 2/2 and 6/6, with 1.16- and 0.99-second verifiers.
 | `overfull-hbox` | 1.0 | 54.56s | 49.93s | 49.32s | 0.69s | 8/7 | 47,067/15,692/2,605 |
 | `compile-compcert` | 1.0 | 960.91s | 953.13s | 952.26s | 855.66s | 15/14 | 312,242/55,370/3,427 |
 | `crack-7z-hash` | 1.0 | 732.33s | 725.20s | 724.02s | 425.20s | 22/21 | 121,990/38,728/5,253 |
+| `rstan-to-pystan` | 1.0 | 440.08s | 432.45s | 431.56s | 347.50s | 20/19 | 320,065/55,332/5,082 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--1.31 seconds per task, and Rust
@@ -1553,6 +1554,35 @@ exactly, and stderr retained the classifier diagnostic. There was no Harbor
 retry, reconnect, compaction, injection, hosted subagent, or agent message.
 The request was not retried, rephrased, encoded, fragmented, or disguised; the
 task was removed from the stable suite and the ladder continues.
+
+`rstan-to-pystan` at pinned digest
+`sha256:c14ad3926606b96140a60b842cd875268879354512e7457ce9a6101a02d61c15`
+is the third green admission in the current batch. Cold task/verifier image
+preparation used 79 seconds of Harbor time and 82.49 complete command seconds.
+The first unchanged low-effort trial then installed exact PyStan 3.10.0,
+adapted its httpstan 4.13.0 source build for native AArch64, compiled the Stan
+Gaussian-process model, completed all 8,000 four-chain sampling iterations,
+and passed all six canonical assertions. The trial used 440.08 seconds and the
+complete `just eval-task` command used 445.20 seconds.
+
+Environment startup used 1.44 seconds, agent setup 0.52 seconds, agent
+execution 433.58 seconds, and canonical verification 0.64 seconds; remaining
+pre-verifier and teardown gaps used 3.78 seconds. Rust used 432.45 seconds,
+including 431.56 seconds across 20 generated-model turns and 347.50 seconds
+across 19 PTC shell phases. The combined script creation, Stan compilation,
+and sampling phase used 226.47 seconds; two native httpstan repair/build phases
+used 40.20 and 38.47 seconds. These task tool phases, not local harness work,
+dominated the trajectory.
+
+Model calls averaged 21.58 seconds with 5.00-second p50, 43.62-second p95, and
+243.33-second maximum; mean times to first event and first output were 0.12 and
+1.53 seconds. The run consumed 320,065 input, 55,332 cached-input, and 5,082
+output tokens, including 779 reasoning tokens; warmup used another 1,889 input
+tokens. Harbor recorded one completed trial, zero errors or retries, and no
+exception. Raw JSONL retained its one-line input and exactly one
+`run.completed`; the terminal payload matched ATIF exactly, stderr was empty,
+and there was no reconnect, compaction, injection, hosted subagent, agent
+message, or API-reported cost. No shared harness or prompt change was needed.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model

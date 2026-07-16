@@ -55,6 +55,7 @@ datasets:
       - terminal-bench/overfull-hbox
       - terminal-bench/compile-compcert
       - terminal-bench/crack-7z-hash
+      - terminal-bench/rstan-to-pystan
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
