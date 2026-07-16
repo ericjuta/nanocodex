@@ -1788,6 +1788,27 @@ case group into one record plus eight additional cases; canonical stdout
 confirms 27 direct passes rather than trial or assertion reruns. The shared
 adapter gate is satisfied, so the ladder may admit its next candidate.
 
+`pytorch-model-recovery` at pinned digest
+`sha256:3164b409d3d9706c2b9a78966f6a16775229f289f076559c1a60102db820ed95`
+exposed one more exact verifier dependency shape. Cold preparation used 96
+seconds of Harbor time and 99.08 complete command seconds: the 832 MB task
+image completed after about 38 seconds and the reusable 1.35 GB verifier
+overlay used the remainder. The first model run completed successfully, but
+the canonical verifier never launched because the cached `uvx` adapter did not
+recognize its exact `torch==2.7.1` request. The task image already installs and
+pins that version, so the adapter now admits only that exact command shape; no
+task, assertion, dependency version, or verifier logic changed.
+
+The corrected adapter reached the untouched five-assertion verifier on the
+next run. Focused regression anchors also remained green. Fix Git passed 2/2
+in 30.32 trial seconds with 25.43 Rust seconds over 7/6 model/tool rounds,
+using 28,007 input, 8,556 cached-input, and 1,693 output tokens. OpenSSL passed
+6/6 in 30.60 trial seconds with 25.89 Rust seconds over 3/2 rounds, using 7,652
+input, 4,466 cached-input, and 1,735 output tokens. Both streams had monotonic
+JSONL, one assistant message and matching terminal event, matching ATIF, empty
+stderr, and no exception, error event, retry, reconnect, compaction, injection,
+hosted subagent, cache write, or API-reported cost.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936

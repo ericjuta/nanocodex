@@ -92,6 +92,8 @@ class PytestVerifier(Verifier):
             '-w pytest-json-ctrf==0.3.5 pytest "*|'
             '"-p 3.13 -w pytest==8.4.1 -w numpy==2.3.0 '
             '-w pytest-json-ctrf==0.3.5 pytest "*|'
+            '"-p 3.13 -w pytest==8.4.1 -w torch==2.7.1 '
+            '-w pytest-json-ctrf==0.3.5 pytest "*|'
             '"-p 3.13 -w pytest==8.4.1 -w pillow==11.1.0 '
             '-w numpy==2.3.1 -w scikit-image==0.25.0 '
             '-w pytest-json-ctrf==0.3.5 pytest "*) '

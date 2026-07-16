@@ -159,6 +159,12 @@ compaction, injection, hosted subagent, or API-reported cost. CompCert's
 1,362.35-second Rust execution determined the suite tail; aggregate environment
 and agent setup averaged only 2.70 seconds per trial.
 
+The next PyTorch model-recovery candidate exposed an unrecognized canonical
+`uvx` command before its verifier could start. Its task image already pins
+Torch 2.7.1, so the adapter now admits that exact dependency shape without
+changing the task or verifier. The untouched verifier then ran normally, and
+focused Fix Git and OpenSSL regressions remained green at 2/2 and 6/6.
+
 The pinned FEAL Linear Cryptanalysis candidate is excluded after its required
 unchanged trial returned a typed Responses API `cyber_policy` error on model
 call four and Harbor classified it as `AgentSafetyRefusalError`; it was not
