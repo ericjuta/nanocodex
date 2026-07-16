@@ -263,8 +263,9 @@ focused regressions pass, and the corrected 35-task gate passes 35/35 with zero
 exception or retry. `overfull-hbox` and `compile-compcert` are green;
 `tune-mjcf` is now a retained variance experiment after two consecutive current
 speed misses. CompCert, Crack 7z Hash, and RStan to PyStan complete the next
-three-task batch; its required full-suite gate is pending. The table records
-representative warm samples:
+three-task batch. Its 38-task gate scored 37/38 with no exception or retry, and
+the sole POV-Ray variance miss passed an unchanged focused retry. The table
+records representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
 spent 68.00 of its 135.45 trial seconds reinstalling an already pinned TeX
@@ -1583,6 +1584,44 @@ exception. Raw JSONL retained its one-line input and exactly one
 `run.completed`; the terminal payload matched ATIF exactly, stderr was empty,
 and there was no reconnect, compaction, injection, hosted subagent, agent
 message, or API-reported cost. No shared harness or prompt change was needed.
+
+The required 38-task checkpoint completed all trials without a Harbor exception
+or retry in 17 minutes 51.62 seconds; the complete `just eval` command used
+1,077.84 seconds. It scored 37/38 and passed 147/148 canonical assertions. Four
+concurrent workers compressed 3,663.65 aggregate trial seconds into the suite
+wall. Aggregate environment setup used 64.41 seconds, agent setup 30.24
+seconds, agent execution 3,315.96 seconds, verification 182.94 seconds, and
+pre-verifier plus teardown gaps 69.85 seconds.
+
+Rust used 3,288.74 aggregate seconds: 3,260.49 in generated-model turns,
+1,465.27 nested in PTC tools, 14.80 connecting, 13.37 warming up, and 0.08 in
+other in-process work. The suite used 278 model calls and 240 tool calls.
+Model calls averaged 11.73 seconds with 4.40-second p50, 42.59-second p95, and
+224.65-second maximum; mean times to first event and first output were 0.12 and
+1.57 seconds. Tools averaged 6.11 seconds with 0.12-second p50, 32.90-second
+p95, and 221.65-second maximum.
+
+The gate consumed 2,015,775 input, 536,670 cached-input, 11,408 cache-write,
+and 113,507 output tokens, including 23,187 reasoning tokens; warmups used
+another 65,028 input tokens. Every task retained its input, raw JSONL, ATIF,
+reward, CTRF, and artifact manifest. All 38 streams had exactly one
+`run.completed`, every terminal payload matched ATIF exactly, every input was
+one line, and every stderr file was empty. There was no reconnect, compaction,
+injection, hosted subagent, agent message, exception, retry, or API-reported
+cost. The three new tasks remained green in the suite: CompCert used 337.30
+Rust seconds over 13/12 model/tool rounds, Crack 7z Hash used 358.68 seconds
+over 17/16, and RStan to PyStan used 446.00 seconds over 19/18.
+
+The sole miss was Build POV-Ray. Its binary reported version 2.2 and rendered
+the canonical scene at SSIM 0.8731, but the chosen source extraction omitted
+top-level authenticity files such as `file_id.diz`, so it passed 2/3
+assertions. The unchanged focused retry selected the complete source and
+documentation archives and passed 3/3 in 132.09 Harbor seconds; the complete
+command used 138.54 seconds. Rust used 120.49 seconds, including 119.78 model
+seconds and 34.34 tool seconds across 19/18 rounds, consuming 264,613 input,
+25,668 cached-input, and 5,350 output tokens. Its raw/ATIF terminal payloads
+matched and stderr was empty. No benchmark-specific hint or shared change was
+added from this recovered solution-path variance.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model

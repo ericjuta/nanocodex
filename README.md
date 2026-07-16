@@ -114,8 +114,11 @@ slice rather than receiving a benchmark-specific hint. CompCert 3.13.1, Crack
 unchanged run passed both canonical assertions after its supplied wordlist
 search dominated 425.20 seconds of tool time. RStan to PyStan installed exact
 PyStan 3.10.0, built the native AArch64 httpstan path, completed four-chain
-sampling, and passed all six assertions. The required 38-task full gate is the
-next checkpoint.
+sampling, and passed all six assertions. The required 38-task gate completed
+without an exception or retry in 17 minutes 51.62 seconds and scored 37/38.
+Its only miss built and rendered POV-Ray 2.2 correctly but omitted top-level
+source-authenticity files; an unchanged focused retry passed all three POV-Ray
+assertions. No benchmark-specific hint or shared harness change was added.
 The pinned FEAL Linear Cryptanalysis candidate is excluded after its required
 unchanged trial returned a typed Responses API `cyber_policy` error on model
 call four and Harbor classified it as `AgentSafetyRefusalError`; it was not
