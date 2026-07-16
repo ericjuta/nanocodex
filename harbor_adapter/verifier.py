@@ -44,6 +44,7 @@ class PytestVerifier(Verifier):
             'case "$*" in '
             '"update"|"install -y curl"|"install -y vim"|'
             '"install -y curl git"|'
+            '"install -y curl expect"|'
             '"install -y curl primer3"|'
             '"install -y expect curl"|'
             '"install -y curl expect git openssh-client") return 0 ;; '

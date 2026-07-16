@@ -1124,6 +1124,17 @@ in Rust, 21.82 seconds in generated-model time, and 0.67 seconds of tool wall.
 Both had zero exceptions, retries, and agent stderr. This is a verifier-image
 portability fix, not a benchmark or assertion change.
 
+The first downstream scored trial also showed that its unchanged launcher
+spells the cached package command `apt-get install -y curl expect`, while the
+adapter had recognized only the reverse package order. The packages were
+already present and the assertion happened to pass, but the nonzero setup
+command was visible in the verifier log, so that sample was not accepted as a
+clean admission. The allowlist now recognizes the exact canonical command.
+The repeated QEMU verifier ran without a setup warning, and another focused
+regression pass kept Fix Git at 2/2 tests in a 46.63-second trial and OpenSSL at
+6/6 in a 29.91-second trial. Both again had reward 1.0 with zero exceptions,
+retries, and agent stderr.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936
