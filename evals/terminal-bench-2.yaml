@@ -41,6 +41,7 @@ datasets:
       - terminal-bench/merge-diff-arc-agi-task
       - terminal-bench/winning-avg-corewars
       - terminal-bench/sparql-university
+      - terminal-bench/pypi-server
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
