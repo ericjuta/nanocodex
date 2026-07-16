@@ -23,14 +23,14 @@ impl CapturedOutput {
         }
     }
 
+    pub(super) fn empty() -> Self {
+        Self::new(0)
+    }
+
     pub(super) fn error(error: String) -> Self {
         let mut captured = Self::new(0);
         captured.error = Some(error);
         captured
-    }
-
-    pub(super) fn push_error(&mut self, error: &str) {
-        append_optional_diagnostic(&mut self.error, error);
     }
 }
 
