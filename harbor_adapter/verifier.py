@@ -8,6 +8,8 @@ from harbor.models.verifier.result import VerifierResult
 from harbor.utils.env import resolve_env_vars
 from harbor.verifier.verifier import Verifier
 
+_POV_VERIFIER_SITE_PACKAGES = "/opt/harness-verifier/pov"
+
 
 class PytestVerifier(Verifier):
     """Run the canonical verifier script with preinstalled dependencies."""
@@ -82,6 +84,7 @@ class PytestVerifier(Verifier):
             'command python -m pytest "$@"; '
             "}",
             "uvx() { "
+            "local verifier_pythonpath=; "
             'case "$*" in '
             '"-p 3.13 -w pytest==8.4.1 -w pytest-json-ctrf==0.3.5 pytest "*|'
             '"-p 3.13 -w pytest==8.4.1 -w pip==25.2 '
@@ -90,7 +93,8 @@ class PytestVerifier(Verifier):
             '-w pytest-json-ctrf==0.3.5 pytest "*|'
             '"-p 3.13 -w pytest==8.4.1 -w pillow==11.1.0 '
             '-w numpy==2.3.1 -w scikit-image==0.25.0 '
-            '-w pytest-json-ctrf==0.3.5 pytest "*|'
+            '-w pytest-json-ctrf==0.3.5 pytest "*) '
+            f'verifier_pythonpath={_POV_VERIFIER_SITE_PACKAGES} ;; '
             '"-p 3.13 -w pytest==8.4.1 -w mujoco==3.3.5 '
             '-w pytest-json-ctrf==0.3.5 pytest "*|'
             '"-p 3.13 -w pytest==8.4.1 -w rdflib==7.1.4 '
@@ -100,7 +104,11 @@ class PytestVerifier(Verifier):
             '*) echo "unsupported cached uvx command: $*" >&2; return 127 ;; '
             "esac; "
             'while [ "$#" -gt 0 ] && [ "$1" != pytest ]; do shift; done; '
-            'shift; command python -m pytest "$@"; '
+            "shift; "
+            'if [ -n "$verifier_pythonpath" ]; then '
+            'env PYTHONPATH="$verifier_pythonpath${PYTHONPATH:+:$PYTHONPATH}" '
+            'python -m pytest "$@"; '
+            'else command python -m pytest "$@"; fi; '
             "}",
             "export -f apt-get curl pip source pytest uvx",
             "cd /app",

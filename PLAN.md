@@ -255,11 +255,12 @@ and reproducibly rejected, which is why it is not a supported profile.
 ## Milestone 2: eval-driven tuning
 
 Status: in progress. All thirty-five active public tasks have green low-effort
-PTC samples with the current `openai-coding-v13` prompt. The latest required
-34-task full-suite gate scored 33/34 with zero exceptions or retries; the only
-miss, Core Wars, is now an evidence-backed variance exclusion, so all 33 tasks
-that remain from that gate were green. Circuit Fib/Sqrt and Build POV-Ray then
-passed as the first two focused admissions in the next three-task batch. The
+PTC samples with the current `openai-coding-v13` prompt. The first required
+35-task gate completed every trial without an exception or retry and scored
+34/35; its only miss exposed verifier-package contamination rather than a
+model failure. The verifier dependencies are now isolated and the affected
+Cython task, Build POV-Ray, and Distribution Search all pass focused
+regressions. A corrected 35-task gate is due before the next admission. The
 table records representative warm samples:
 
 | task | reward | trial | Rust | generated turns | tool wall | rounds/tools | input/cache/output |
@@ -269,7 +270,7 @@ table records representative warm samples:
 | `cancel-async-tasks` | 1.0 | 56.91s | 39.67s | 39.21s | 0.54s | 4/3 | 8,042/4,368/1,733 |
 | `headless-terminal` | 1.0 | 107.93s | 91.30s | 90.73s | 21.92s | 7/6 | 20,692/10,547/3,581 |
 | `regex-log` | 1.0 | 39.14s | 34.89s | 34.09s | 0.03s | 2/1 | 4,530/2,991/1,955 |
-| `build-cython-ext` | 1.0 | 183.96s | 178.03s | 177.59s | 79.77s | 12/11 | 158,073/34,169/4,328 |
+| `build-cython-ext` | 1.0 | 160.80s | 154.10s | 153.59s | 60.97s | 21/20 | 246,307/47,542/5,225 |
 | `fix-code-vulnerability` | 1.0 | 37.90s | 33.89s | 33.23s | 1.71s | 6/5 | 44,858/16,691/1,576 |
 | `git-multibranch` | 1.0 | 223.56s | 95.09s | 94.56s | 1.55s | 10/9 | 47,696/18,103/5,125 |
 | `git-leak-recovery` | 1.0 | 76.33s | 72.65s | 72.02s | 0.30s | 7/6 | 22,794/12,948/3,876 |
@@ -289,7 +290,7 @@ table records representative warm samples:
 | `sparql-university` | 1.0 | 38.76s | 34.70s | 34.17s | 0.42s | 4/3 | 16,983/8,817/1,956 |
 | `pypi-server` | 1.0 | 36.84s | 32.35s | 31.37s | 2.19s | 5/4 | 14,314/9,170/1,957 |
 | `schemelike-metacircular-eval` | 1.0 | 156.46s | 88.85s | 88.19s | 16.15s | 6/5 | 107,509/29,224/4,455 |
-| `distribution-search` | 1.0 | 45.20s | 41.09s | 40.04s | 2.13s | 5/4 | 14,210/8,342/2,328 |
+| `distribution-search` | 1.0 | 50.89s | 46.37s | 45.68s | 2.26s | 5/4 | 13,610/8,342/2,268 |
 | `largest-eigenval` | 1.0 | 69.44s | 64.85s | 64.09s | 7.57s | 7/6 | 23,668/8,556/3,038 |
 | `constraints-scheduling` | 1.0 | 30.93s | 26.49s | 25.72s | 0.13s | 3/2 | 10,483/5,490/1,787 |
 | `write-compressor` | 1.0 | 174.45s | 155.55s | 154.24s | 69.25s | 7/6 | 37,685/15,290/5,210 |
@@ -298,7 +299,7 @@ table records representative warm samples:
 | `prove-plus-comm` | 1.0 | 14.98s | 10.88s | 9.95s | 0.34s | 3/2 | 5,866/4,466/566 |
 | `custom-memory-heap-crash` | 1.0 | 99.40s | 91.74s | 91.01s | 32.71s | 11/10 | 82,173/14,260/3,394 |
 | `circuit-fibsqrt` | 1.0 | 108.20s | 103.24s | 102.20s | 35.70s | 5/4 | 25,256/12,438/3,744 |
-| `build-pov-ray` | 1.0 | 129.63s | 117.79s | 117.00s | 29.78s | 18/17 | 291,544/49,408/4,370 |
+| `build-pov-ray` | 1.0 | 139.58s | 128.75s | 128.17s | 26.10s | 21/20 | 349,918/47,542/4,894 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--1.31 seconds per task, and Rust
@@ -1292,9 +1293,8 @@ gap. The agent completed normally and produced a plausible render, but the
 canonical assertions never started: the shared adapter rejected the exact
 `apt-get install -y curl imagemagick` and pinned Pillow/NumPy/scikit-image
 `uvx` command shapes. That setup-only reward 0 is retained and is not counted
-as a model result. The reusable verifier image now installs the scientific
-image stack in one append-only layer and recognizes only those exact canonical
-commands; the benchmark task and assertions remain untouched.
+as a model result. The reusable verifier image recognizes only those exact
+canonical commands; the benchmark task and assertions remain untouched.
 
 Rebuilding the focused POV-Ray overlay took 11.90 seconds in Harbor and 14.23
 seconds for the complete install-only command. The complete 35-overlay
@@ -1303,9 +1303,9 @@ seconds of Harbor wall and 144.43 seconds for the command, with no model calls.
 Focused scored regressions remained green with no setup warning or agent
 stderr: Fix Git passed 2/2 checks in 40.02 Rust seconds, OpenSSL passed 6/6 in
 32.76 seconds, and NumPy-dependent Distribution Search passed 4/4 in 40.47
-seconds. The latter proves its existing verifier against the system stack's
-NumPy 2.3.1 update. These focused results establish the shared cache fix; the
-required full `just eval` remains the suite-level regression gate.
+seconds. These focused results established that the new command shapes and
+packages worked, while the full gate below caught that the first cache layout
+had changed an agent-visible package version.
 
 `build-pov-ray` at pinned digest
 `sha256:b64f3fd6f47dc8848fdd6ce990fbedce9577d97ea4f7fd1c489c42338229d078`
@@ -1327,8 +1327,49 @@ rendered scene reached SSIM `0.8731`, the binary identified as POV-Ray 2.2, and
 the required source tree remained present. JSONL and ATIF agreed, the terminal
 was `run.completed`, and there was no exception, retry, reconnect, compaction,
 hosted subagent, API-reported cost, setup warning, or agent stderr. No further
-runtime change was needed. One more green admission will complete the batch and
-trigger the next full active-suite gate.
+runtime change was needed.
+
+The required 35-task `just eval` after that shared verifier change completed
+all 35 trials with zero Harbor exceptions or retries in 16 minutes 41.92
+seconds, but scored 34/35. Every agent emitted `run.completed`, every stderr
+file was empty, and all 35 JSONL streams, ATIF trajectories, and CTRF records
+were present. The canonical aggregate was 136/137 passing tests. Four-way
+concurrency compressed 2,721.996 aggregate generated-model seconds and 841.51
+aggregate tool-wall seconds into the job wall; tool time is nested inside
+model time. Rust totaled 2,746.00 seconds, including 10.00 seconds of
+WebSocket setup and 13.94 seconds of warmup, leaving only 0.06 aggregate
+seconds of other in-process work. Environment startup, agent setup, agent
+execution, and verification totaled 48.40, 19.86, 2,764.54, and 180.26
+task-seconds. The run used 1,476,992 input, 455,038 cached-input, 7,131
+cache-write, and 106,830 output tokens across 219 model calls and 184 tool
+phases; 23,552 output tokens were reasoning tokens and warmup used another
+60,191 input tokens. No reconnect, compaction, hosted subagent, agent message,
+or API-reported cost occurred.
+
+`build-cython-ext` was the sole miss, and its evidence made the cause
+deterministic: 10/11 assertions passed, including all compiled-extension and
+behavior checks, while `test_numpy_version` found that the verifier layer had
+replaced the task's required NumPy 2.3.0 with verifier-only NumPy 2.3.1 before
+the agent started. The scientific image stack now installs under
+`/opt/harness-verifier/pov`, and only the exact POV-Ray `uvx` launcher receives
+that path through `PYTHONPATH`; the agent and all other verifiers keep their
+system interpreter unchanged.
+
+The corrected Cython overlay prepared in 13.39 seconds and its unchanged
+focused trial passed 11/11 assertions in 160.80 seconds. Rust used 154.10
+seconds, generated-model time was 153.59 seconds, and 20 local tool phases used
+60.97 seconds; 21 model calls consumed 246,307 input, 47,542 cached-input, and
+5,225 output tokens. The isolated POV overlay prepared in 10.80 seconds and
+then passed 3/3 assertions, including SSIM `0.8731`, in 139.58 seconds. Rust
+used 128.75 seconds, generated-model time was 128.17 seconds, and 20 tool
+phases used 26.10 seconds; 21 model calls consumed 349,918 input, 47,542
+cached-input, and 4,894 output tokens. Finally, Distribution Search's overlay
+prepared in 10.12 seconds and passed 4/4 assertions in 50.89 seconds, with
+46.37 Rust seconds, 45.68 generated-model seconds, 2.26 tool seconds, and
+13,610/8,342/2,268 input/cache/output tokens over 5/4 rounds. All three
+focused trials had empty stderr and zero exception, retry, reconnect,
+compaction, or hosted subagent. The corrected full `just eval` is now the
+suite-level gate; one more green admission will then complete this batch.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model

@@ -88,17 +88,18 @@ HARNESS_BUILD_PROFILE=profiling
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
 and tasks. The current stable development slice contains thirty-five public
-shell/code tasks. The required post-reconnect 34-task gate scored 33/34 in 11
-minutes 19.37 seconds with zero exceptions or retries; all tasks retained from
-that gate passed, including Tune MJCF and QEMU. Core Wars was the sole miss,
-and an immediate unchanged focused retry missed a different opponent. Across
-one green and two red low-effort samples it is retained as a variance
-experiment but excluded from the stable gate rather than receiving a
-benchmark-specific prompt hint. Circuit Fib/Sqrt and Build POV-Ray subsequently
-passed 3/3 canonical checks apiece as the first two focused admissions in the
-next batch. Browser automation, computer-use, GUI interaction, and image/video
-perception are outside this milestone. Downloaded tasks and canonical verifier
-assertions remain unchanged.
+shell/code tasks. The first 35-task gate after admitting Circuit Fib/Sqrt and
+Build POV-Ray completed every trial without an exception or retry in 16
+minutes 41.92 seconds and scored 34/35. Its only miss was a verifier-cache
+regression: POV-Ray's scientific stack had replaced the Cython task's required
+NumPy 2.3.0 with NumPy 2.3.1 before the agent started. The stack is now
+verifier-isolated, and unchanged focused Cython, POV-Ray, and Distribution
+Search runs pass 11/11, 3/3, and 4/4 canonical checks. The corrected 35-task
+gate is pending. Core Wars remains a separate variance experiment excluded
+from the stable gate rather than receiving a benchmark-specific prompt hint.
+Browser automation, computer-use, GUI interaction, and image/video perception
+are outside this milestone. Downloaded tasks and canonical verifier assertions
+remain unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
 before model work, and a task that repeatedly requires benchmark-specific
@@ -116,6 +117,10 @@ APT exposes a real installation candidate, so uv can inspect the interpreter
 without breaking newer distributions that retain obsolete package metadata.
 The compatibility path was prepared across all 34 task images and regressed
 against Fix Git and OpenSSL without changing canonical tests.
+POV-Ray's Pillow/NumPy/scikit-image verifier stack is cached under
+`/opt/harness-verifier/pov` instead of the system interpreter. The adapter adds
+that path only for the exact canonical POV-Ray `uvx` command, so verifier-only
+versions cannot mutate the agent's task environment.
 Largest Eigenvalue likewise uses an exact cached pip command and adds no image
 dependency. Tune MJCF uses an exact cached `mujoco==3.3.5` command shape and
 also adds no verifier-image dependency.

@@ -48,9 +48,10 @@ RUN if python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then \
             numpy==2.3.0; \
     fi
 # POV-Ray's canonical image comparison adds this exact scientific-image stack.
-# Keep it in a final layer so all earlier verifier dependency layers stay cached.
+# Keep verifier-only Python packages outside the system interpreter: tasks may
+# assert the versions already present in their agent environment.
 RUN if python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then \
-        uv pip install --system --break-system-packages --no-cache \
+        uv pip install --target /opt/harness-verifier/pov --no-cache \
             pillow==11.1.0 \
             numpy==2.3.1 \
             scikit-image==0.25.0; \
