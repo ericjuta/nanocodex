@@ -93,7 +93,7 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The configured development slice contains thirty-nine public
+and tasks. The configured development slice contains thirty-eight public
 shell/code tasks. The first 35-task gate after admitting Circuit Fib/Sqrt and
 Build POV-Ray completed every trial without an exception or retry in 16
 minutes 41.92 seconds and scored 34/35. Its only miss was a verifier-cache
@@ -119,6 +119,10 @@ without an exception or retry in 17 minutes 51.62 seconds and scored 37/38.
 Its only miss built and rendered POV-Ray 2.2 correctly but omitted top-level
 source-authenticity files; an unchanged focused retry passed all three POV-Ray
 assertions. No benchmark-specific hint or shared harness change was added.
+Two subsequent current samples again rendered the scene and reported version
+2.2 but omitted `file_id.diz` and the complete top-level source-authenticity
+set. Build POV-Ray is therefore retained as a variance experiment outside the
+stable slice rather than receiving a benchmark-specific archive hint.
 MTEB Leaderboard is the first admission in the next batch. Its first unchanged
 sample followed the legacy Scandinavian benchmark and missed the historical
 MTEB answer; an unchanged retry reconstructed the August 2025 result set,

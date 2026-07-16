@@ -254,7 +254,7 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. Thirty-nine public tasks are active with green low-effort
+Status: in progress. Thirty-eight public tasks are active with green low-effort
 PTC samples under the current `openai-coding-v13` prompt. The first required
 35-task gate completed every trial without an exception or retry and scored
 34/35; its only miss exposed verifier-package contamination rather than a
@@ -266,8 +266,10 @@ speed misses. CompCert, Crack 7z Hash, and RStan to PyStan complete the next
 three-task batch. Its 38-task gate scored 37/38 with no exception or retry, and
 the sole POV-Ray variance miss passed an unchanged focused retry. MTEB
 Leaderboard is the first green admission in the following batch after an
-unchanged retry recovered its historical-snapshot solution path. The table
-records representative warm samples:
+unchanged retry recovered its historical-snapshot solution path. Build POV-Ray
+is now a retained variance experiment after two later consecutive current
+samples repeated the source-authenticity miss. The table records representative
+warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
 spent 68.00 of its 135.45 trial seconds reinstalling an already pinned TeX
@@ -1626,6 +1628,26 @@ seconds and 34.34 tool seconds across 19/18 rounds, consuming 264,613 input,
 matched and stderr was empty. No benchmark-specific hint or shared change was
 added from this recovered solution-path variance.
 
+The next current suite attempt was externally interrupted by a concurrent
+stock-Codex Harbor invocation and is not counted as a full-suite result. Before
+that interruption, its valid POV-Ray trial again passed rendering and version
+checks at SSIM 0.8731 but omitted `file_id.diz`, passing 2/3 assertions. It used
+110.80 trial seconds and 96.86 Rust seconds, including 95.99 model seconds and
+38.51 nested tool seconds across 15/14 model/tool rounds. It consumed 280,134
+input, 53,322 cached-input, and 3,371 output tokens, including 626 reasoning
+tokens, with one terminal event, empty stderr, and no exception or reconnect.
+
+The required unchanged focused retry repeated the same 2/3 result. Harbor used
+134.45 seconds and the complete command used 140.54 seconds. Rust used 122.64
+seconds, including 122.05 model seconds and 30.89 tool seconds across 23/22
+rounds. It consumed 310,190 input, 51,418 cached-input, and 5,574 output tokens,
+including 872 reasoning tokens. The stream was monotonic with exactly one
+`run.completed`, empty stderr, and no exception, retry, reconnect, compaction,
+injection, hosted subagent, agent message, cache write, or API-reported cost.
+Two consecutive current misses now outweigh the earlier one-sample recovery,
+so Build POV-Ray is retained as a variance experiment outside the stable slice
+without a benchmark-specific archive hint.
+
 `mteb-leaderboard` at pinned digest
 `sha256:244bc0c349b5d84b1545620f121056033022caeabea35f7f324a90b84593a43f`
 is the first green admission in the next batch. Cold preparation of its pinned
@@ -1705,7 +1727,7 @@ command seconds. Rust used 20.34 seconds, including 18.85 model seconds and
 and 1,682 output tokens, including 251 reasoning tokens. Both streams retained
 one-line input, monotonic JSONL, exactly one `run.completed`, empty stderr, and
 no exception, retry, reconnect, compaction, injection, hosted subagent, agent
-message, cache write, or API-reported cost. A full 39-task gate is required
+message, cache write, or API-reported cost. A full active-suite gate is required
 before another candidate is admitted because adapter resolution is shared
 evaluation infrastructure.
 
