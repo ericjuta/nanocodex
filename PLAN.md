@@ -255,16 +255,16 @@ and reproducibly rejected, which is why it is not a supported profile.
 ## Milestone 2: eval-driven tuning
 
 Status: in progress. All sixteen active public tasks have green low-effort PTC
-samples. The table records their last warm samples. `fix-git`, OpenSSL, both
-polyglot tasks, large-scale text editing, and log summarization use the current
-`openai-coding-v11` prompt. Both database recovery tasks plus Nginx use v10.
-The vulnerability task, multibranch task, and `git-leak-recovery` use v9; the
-other task digests have v7 samples:
+samples. The table records their last warm samples. `fix-git`, OpenSSL, and
+`db-wal-recovery` use the current `openai-coding-v12` prompt. Both polyglot
+tasks, large-scale text editing, and log summarization use v11;
+`sqlite-db-truncate` and Nginx use v10. The vulnerability task, multibranch
+task, and `git-leak-recovery` use v9; the other task digests have v7 samples:
 
 | task | reward | trial | Rust | generated turns | tool wall | rounds/tools | input/cache/output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fix-git` | 1.0 | 45.08s | 40.71s | 39.81s | 0.35s | 8/7 | 31,259/14,108/1,600 |
-| `openssl-selfsigned-cert` | 1.0 | 41.87s | 37.98s | 37.45s | 0.35s | 3/2 | 7,403/4,306/1,952 |
+| `fix-git` | 1.0 | 32.68s | 28.74s | 28.15s | 0.26s | 6/5 | 24,088/11,571/1,495 |
+| `openssl-selfsigned-cert` | 1.0 | 34.98s | 31.05s | 30.62s | 0.58s | 3/2 | 7,565/4,368/1,694 |
 | `cancel-async-tasks` | 1.0 | 68.43s | 50.07s | 49.51s | 0.88s | 5/4 | 10,951/6,127/2,735 |
 | `headless-terminal` | 1.0 | 84.74s | 67.65s | 66.89s | 2.27s | 5/4 | 13,946/8,314/3,897 |
 | `regex-log` | 1.0 | 35.04s | 31.17s | 30.24s | 0.07s | 2/1 | 4,163/1,163/1,963 |
@@ -272,7 +272,7 @@ other task digests have v7 samples:
 | `fix-code-vulnerability` | 1.0 | 46.96s | 42.98s | 42.23s | 1.32s | 5/4 | 33,408/5,096/1,033 |
 | `git-multibranch` | 1.0 | 100.90s | 87.70s | 87.12s | 1.46s | 5/4 | 17,824/8,758/2,949 |
 | `git-leak-recovery` | 1.0 | 31.69s | 27.12s | 26.02s | 0.57s | 3/2 | 7,258/2,888/1,477 |
-| `db-wal-recovery` | 1.0 | 66.67s | 62.76s | 62.08s | 0.23s | 7/6 | 20,344/10,232/2,637 |
+| `db-wal-recovery` | 1.0 | 43.20s | 39.24s | 38.54s | 0.22s | 6/5 | 33,471/14,290/2,297 |
 | `sqlite-db-truncate` | 1.0 | 38.65s | 34.78s | 34.15s | 0.33s | 5/4 | 12,410/7,894/2,321 |
 | `nginx-request-logging` | 1.0 | 50.17s | 44.30s | 43.51s | 5.93s | 4/3 | 11,003/6,580/1,914 |
 | `polyglot-c-py` | 1.0 | 51.87s | 47.77s | 46.80s | 0.26s | 3/2 | 7,710/3,984/2,347 |
@@ -422,6 +422,21 @@ Low-effort v10 regressions also kept `fix-git` and
 seconds; Rust spent 47.54 of 48.35 seconds and 37.74 of 38.57 seconds in
 model/API calls, respectively. Tool work remained below 0.53 seconds in both,
 so the trials stayed API-bound.
+
+The first full-suite checkpoint re-exposed the WAL preservation failure under
+v11. Its initial compound probe exited when the optional `file` utility was
+absent; the next phase queried SQLite before making a copy, which consumed the
+WAL. The model recovered all IDs but substituted the base values for two
+updates, failing two of seven assertions. The v12 prompt makes preservation a
+first-tool-phase invariant before any file-type, database, archive, or
+application inspection, even if a preliminary probe fails.
+
+On the v12 retry, the first shell phase copied the complete workspace to both
+an immutable original and a disposable work tree before inspecting anything.
+All subsequent SQLite operations used copies, and all seven assertions passed.
+The warm trial took 43.20 seconds end to end; Rust spent 38.54 of 39.24 seconds
+in API turns and 0.22 seconds in tools. Low-effort v12 regressions also kept
+`fix-git` and OpenSSL green in 32.68 and 34.98 seconds, respectively.
 
 `sqlite-db-truncate` then passed on its first v10 attempt, independently
 exercising the recovery invariant. The first shell command copied the database
