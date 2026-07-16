@@ -1663,6 +1663,52 @@ empty, and there was no compaction, injection, hosted subagent, agent message,
 cache write, or API-reported cost. The first miss and unchanged recovery are
 retained as solution-path and latency variance evidence.
 
+`regex-chess` at pinned digest
+`sha256:b91cc4650c743c5b1a569864529335bcb7c3a1aaeb1a6920c37cda369cead9b7`
+is retained as an excluded hard software-engineering experiment. Cold
+preparation used 37 seconds of Harbor time and 39.85 complete command seconds.
+The first apparent scored attempt exposed an evaluation-provenance bug before
+the canonical verifier could run: the shared `.venv` is editable-installed
+against the primary checkout, so its Harbor console script imported that
+checkout's stale `harbor_adapter` instead of the clean goal worktree. The stale
+adapter rejected Regex Chess's exact `uvx` dependency command and produced no
+CTRF result. The Justfile now exports its own directory as `PYTHONPATH`, so
+every recipe deterministically imports the adapter belonging to the worktree
+that launched it.
+
+With the import corrected and the exact verifier environment temporarily
+available for diagnosis, two unchanged low-effort trials reached the canonical
+four-assertion verifier. Both scored 0.0: the size constraint passed, while all
+three held-out games failed. The first valid run used 235.58 Harbor seconds and
+243.23 complete command seconds; Rust used 216.07 seconds, including 215.29
+model seconds and 36.95 nested tool seconds across 18/17 model/tool rounds. It
+consumed 305,065 input, 49,408 cached-input, and 11,639 output tokens, including
+3,269 reasoning tokens. The unchanged retry used 133.65 trial seconds and
+139.07 complete command seconds; Rust used 122.94 seconds, including 122.09
+model seconds and 4.31 tool seconds across 6/5 rounds. It consumed 58,159
+input, 22,056 cached-input, and 6,661 output tokens, including 2,263 reasoning
+tokens. That second solution still emitted malformed compressed positions and
+missing legal moves. Neither valid trial had a Harbor exception or retry, so
+the repeated failure is solution quality rather than harness infrastructure.
+No benchmark-specific hint was added, and the temporary task-only verifier
+dependency was removed after exclusion; the canonical task and verifier were
+never modified.
+
+The generic import fix remained and passed both focused regression anchors.
+Fix Git passed 2/2 canonical assertions with reward 1.0 in 31.98 Harbor
+seconds. Rust used 25.36 seconds, including 24.28 model seconds and 0.46 tool
+seconds across 7/6 rounds, consuming 33,221 input, 14,266 cached-input, and
+1,868 output tokens, including 299 reasoning tokens. OpenSSL passed all six
+canonical assertions with reward 1.0 in 25.72 Harbor seconds and 36.16 complete
+command seconds. Rust used 20.34 seconds, including 18.85 model seconds and
+0.50 tool seconds across 3/2 rounds, consuming 7,224 input, 4,466 cached-input,
+and 1,682 output tokens, including 251 reasoning tokens. Both streams retained
+one-line input, monotonic JSONL, exactly one `run.completed`, empty stderr, and
+no exception, retry, reconnect, compaction, injection, hosted subagent, agent
+message, cache write, or API-reported cost. A full 39-task gate is required
+before another candidate is admitted because adapter resolution is shared
+evaluation infrastructure.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936
