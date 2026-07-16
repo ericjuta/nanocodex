@@ -1889,9 +1889,64 @@ seconds over 25/24 rounds; usage was 516,753 input, 74,750 cached-input, and
 7,372 output tokens, including 1,039 reasoning tokens. Both retry jobs recorded
 zero exceptions or retries, monotonic JSONL, one assistant and terminal event,
 paired tool results, empty stderr, and no reconnect, compaction, injection,
-hosted agent, or API-reported cost. These recoveries identify trajectory and
-sampling variance rather than a deterministic regression; a new literal full
-suite gate is still required before admitting another candidate.
+hosted agent, or API-reported cost. These recoveries identify solution-path
+variance rather than a harness regression.
+
+The next literal `just eval` exercised the new six-worker default at
+`.harness/harbor/jobs/2026-07-16__14-22-22-eval-42053`. Harbor visibly held six
+trials active while work remained, completed all 37 with zero exception or
+retry, and scored 35/37 with 143/145 canonical assertions. Harbor wall was
+1,492.77 seconds and the complete command used 1,499.86 seconds, leaving only
+7.09 seconds for the cached native artifact build, configuration, and launch.
+Six workers compressed 5,486.25 aggregate trial-seconds into the job wall:
+environment setup used 80.78 seconds, agent setup 41.43, agent execution
+5,066.99, verification 202.90, and remaining gaps 94.15.
+
+Rust used 5,030.67 aggregate seconds: 4,999.28 in generated model turns,
+3,104.09 nested in PTC tools, 12.34 connecting, 18.96 warming up, and about
+0.09 in other in-process work. Across 265 model calls, duration p50/p95/max was
+5.27/62.06/458.12 seconds; time to first event was 0.09/0.27/2.53 seconds and
+time to first output was 1.02/4.17/21.49 seconds. The 228 tool calls had
+0.25/76.96/452.05-second p50/p95/max duration. Usage was 2,097,715 input,
+594,492 cached-input, 9,659 cache-write, and 117,711 output tokens, including
+23,933 reasoning tokens; warmups used another 63,430 input tokens.
+
+Every trial retained a one-line input, canonical CTRF, artifact manifest,
+monotonic JSONL, one assistant message and `run.completed`, exact input/final
+message/terminal-metric ATIF correspondence, and paired tool results. All 37
+stderr files were empty. There was no reconnect, compaction, injection, hosted
+agent, agent message, exception, Harbor retry, or API-reported cost. The 24
+CTRF `retries` are the three nine-case `largest-eigenval` parameter groups,
+not rerun assertions or trials.
+
+CompCert again set the wall: its 1,492.50-second trial began in the first wave
+and Rust used 1,481.59 seconds, including 1,481.02 model and 1,406.32 nested
+tool seconds over 15/14 rounds. It consumed 323,826 input, 52,920 cached-input,
+and 5,589 output tokens, including 1,092 reasoning tokens. Every other trial
+finished in about 16 minutes; the remaining roughly nine-minute tail was only
+CompCert's in-container proof build. Raising concurrency therefore improved
+suite throughput but cannot remove this task's critical-path floor.
+
+The first miss, Polyglot Rust/C, built and validated the requested program but
+left an intermediate `rmain` binary, so its only assertion rejected the extra
+file. Its unchanged focused retry passed at
+`.harness/harbor/jobs/2026-07-16__14-35-00-polyglot-rust-c-57303` in 102.49
+trial and 105.99 command seconds. Rust used 94.64 seconds, including 91.20
+model and 3.53 tool seconds over 7/6 rounds; usage was 22,774 input, 8,556
+cached-input, and 6,934 output tokens, including 2,792 reasoning tokens. Its
+stream was monotonic and paired with one terminal event, empty stderr, and no
+exception or Harbor retry.
+
+The second miss, RStan, reproduced the earlier exact 0.88364998 `rho[1]`
+value. Comparing its trace with the green retry found a concrete semantic
+difference: the red solution asserted that PyStan lacked sampler-level
+thinning, ran every draw, and sliced the returned arrays, while the green
+solution used PyStan's `num_thin=2`. Post-hoc slicing changes Stan RNG
+consumption and is not equivalent to the R script's sampler-level `thin=2`.
+The repeated miss is therefore translation quality variance, not random
+verifier noise. No benchmark-specific prompt or verifier change was made. The
+literal suite remains a measured 35/37 rather than an all-green admission gate,
+so another candidate must not be admitted on this evidence alone.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
