@@ -1,25 +1,29 @@
 use std::{sync::Once, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::value::{RawValue, to_raw_value};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{
-        Error as WebSocketError, Message,
+        Error as WebSocketError, Message, Utf8Bytes,
         client::IntoClientRequest,
         http::{HeaderValue, header},
     },
 };
 
-use crate::{ResponsesError, Result};
+use crate::ResponsesError;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
-const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const EVENT_IDLE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(300)
+};
 const RESPONSES_BETA: &str = "responses_multi_agent=v1";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -35,6 +39,9 @@ pub(crate) struct ResponsesSocket {
     pump: SocketPump,
 }
 
+/// A request serialized once at the API boundary and ready for transport.
+pub(crate) struct EncodedRequest(Box<RawValue>);
+
 struct SocketPump {
     commands: mpsc::Sender<SocketCommand>,
     messages: mpsc::UnboundedReceiver<std::result::Result<Message, WebSocketError>>,
@@ -48,12 +55,24 @@ enum SocketCommand {
     },
 }
 
+impl EncodedRequest {
+    pub(crate) fn new<T: Serialize + ?Sized>(request: &T) -> Result<Self, ResponsesError> {
+        to_raw_value(request)
+            .map(Self)
+            .map_err(ResponsesError::EncodeRequest)
+    }
+
+    pub(crate) fn raw(&self) -> &RawValue {
+        &self.0
+    }
+}
+
 impl ResponsesSocket {
     pub(crate) async fn connect(
         endpoint: &str,
         api_key: &str,
         multi_agent: bool,
-    ) -> Result<(Self, ConnectionMetadata)> {
+    ) -> Result<(Self, ConnectionMetadata), ResponsesError> {
         ensure_crypto_provider();
         let mut request = endpoint
             .into_client_request()
@@ -97,12 +116,9 @@ impl ResponsesSocket {
         ))
     }
 
-    pub(crate) async fn send<T: Serialize>(
-        &self,
-        value: &T,
-    ) -> std::result::Result<(), ResponsesError> {
-        let payload = serde_json::to_string(value).map_err(ResponsesError::EncodeRequest)?;
-        timeout(SEND_TIMEOUT, self.pump.send(Message::Text(payload.into())))
+    pub(crate) async fn send(&self, request: &EncodedRequest) -> Result<(), ResponsesError> {
+        let message = Message::Text(request.raw().get().to_owned().into());
+        timeout(SEND_TIMEOUT, self.pump.send(message))
             .await
             .map_err(|_| ResponsesError::SendTimeout {
                 seconds: SEND_TIMEOUT.as_secs(),
@@ -111,38 +127,48 @@ impl ResponsesSocket {
         Ok(())
     }
 
-    pub(crate) async fn next_json(&mut self) -> Result<Value> {
+    pub(crate) async fn next_text_or_idle_timeout(&mut self) -> Result<Utf8Bytes, ResponsesError> {
+        timeout(EVENT_IDLE_TIMEOUT, self.next_text())
+            .await
+            .map_err(|_| ResponsesError::IdleTimeout {
+                seconds: EVENT_IDLE_TIMEOUT.as_secs(),
+            })?
+    }
+
+    pub(crate) async fn next_text(&mut self) -> Result<Utf8Bytes, ResponsesError> {
         loop {
-            let message = timeout(EVENT_IDLE_TIMEOUT, self.pump.next())
+            let message = self
+                .pump
+                .next()
                 .await
-                .map_err(|_| ResponsesError::IdleTimeout {
-                    seconds: EVENT_IDLE_TIMEOUT.as_secs(),
-                })?
                 .ok_or(ResponsesError::UnexpectedEnd)?
                 .map_err(ResponsesError::Receive)?;
 
             match message {
-                Message::Text(text) => {
-                    return serde_json::from_str(text.as_ref())
-                        .map_err(ResponsesError::InvalidJson)
-                        .map_err(Into::into);
-                }
-                Message::Binary(bytes) => {
-                    return serde_json::from_slice(bytes.as_ref())
-                        .map_err(ResponsesError::InvalidJson)
-                        .map_err(Into::into);
-                }
+                Message::Text(text) => return Ok(text),
+                Message::Binary(_) => return Err(ResponsesError::UnexpectedBinary),
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 Message::Close(frame) => {
                     let detail = frame.map_or_else(
                         || "without a reason".to_owned(),
                         |frame| format!("with code {}: {}", frame.code, frame.reason),
                     );
-                    return Err(ResponsesError::Closed { detail }.into());
+                    return Err(ResponsesError::Closed { detail });
                 }
             }
         }
     }
+}
+
+pub(crate) fn parse_raw_json(text: &str) -> Result<&RawValue, ResponsesError> {
+    serde_json::from_str(text).map_err(ResponsesError::InvalidJson)
+}
+
+pub(crate) fn decode_event<T: DeserializeOwned>(event: &RawValue) -> Result<T, ResponsesError> {
+    serde_json::from_str(event.get()).map_err(|source| ResponsesError::InvalidPayload {
+        source,
+        event: event.get().to_owned(),
+    })
 }
 
 impl SocketPump {
@@ -258,11 +284,10 @@ mod tests {
 
     use eyre::{Result, eyre};
     use futures_util::{SinkExt, StreamExt};
-    use serde_json::json;
     use tokio::{net::TcpListener, time::timeout};
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-    use super::ResponsesSocket;
+    use super::{ResponsesSocket, parse_raw_json};
 
     #[tokio::test]
     async fn answers_ping_while_response_consumer_is_idle() -> Result<()> {
@@ -282,6 +307,7 @@ mod tests {
             socket
                 .send(Message::Text(r#"{"type":"probe"}"#.into()))
                 .await?;
+            socket.send(Message::Binary(b"{}".to_vec().into())).await?;
             Result::<()>::Ok(())
         });
 
@@ -289,7 +315,12 @@ mod tests {
         let (mut socket, _) = ResponsesSocket::connect(&endpoint, "test-key", false).await?;
 
         server.await??;
-        assert_eq!(socket.next_json().await?, json!({ "type": "probe" }));
+        let text = socket.next_text().await?;
+        assert_eq!(parse_raw_json(text.as_str())?.get(), r#"{"type":"probe"}"#);
+        assert!(matches!(
+            socket.next_text().await,
+            Err(crate::ResponsesError::UnexpectedBinary)
+        ));
         Ok(())
     }
 }

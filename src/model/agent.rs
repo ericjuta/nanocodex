@@ -3,14 +3,14 @@ use std::{io::Write, time::Instant};
 use serde::Serialize;
 
 use super::{
-    AssistantMessage, MAX_CONCURRENT_SUBAGENTS, ModelConfig, RunError, RunStarted, RunStats,
-    TRANSPORT, display_endpoint, elapsed_ns, resolve_workspace, terminal_payload,
+    ApiEvent, AssistantMessage, MAX_CONCURRENT_SUBAGENTS, ModelConfig, RunError, RunStarted,
+    RunStats, TRANSPORT, display_endpoint, elapsed_ns, resolve_workspace, terminal_payload,
     wire::{InputItem, RequestProfile, ResponseCreate, Usage, WarmupServerEvent},
 };
 use crate::{
     AgentError, ResponsesError, Result,
     protocol::{EventWriter, Task},
-    responses::ResponsesSocket,
+    responses::{EncodedRequest, ResponsesSocket, decode_event, parse_raw_json},
 };
 
 #[derive(Serialize)]
@@ -52,7 +52,7 @@ enum ConnectionPurpose {
 #[derive(Serialize)]
 struct ConnectionRetry<'a> {
     call_index: u32,
-    previous_response_id: Option<&'a str>,
+    previous_response_id: &'a str,
     reason: &'a str,
 }
 
@@ -61,17 +61,7 @@ struct ModelCallStarted<'a> {
     call_index: u32,
     model: &'a str,
     effort: &'static str,
-    previous_response_id: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct OutboundApiEvent<'a, T: Serialize + ?Sized> {
-    direction: &'static str,
-    transport: &'static str,
-    phase: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_call_index: Option<u32>,
-    event: &'a T,
+    previous_response_id: &'a str,
 }
 
 #[derive(Serialize)]
@@ -181,12 +171,11 @@ impl<'a, W: Write> ModelRun<'a, W> {
     async fn execute_task(&mut self) -> Result<String> {
         let workspace = resolve_workspace(self.task.workspace.as_deref())?;
         let mut socket = self.connect(ConnectionPurpose::Initial).await?;
-        let profile = RequestProfile::new(self.config);
-        let initial_input = InputItem::for_task(self.task, &workspace, self.config);
-        let warmup_response_id = self
+        let profile = RequestProfile::new(self.config)?;
+        let initial_input = InputItem::for_task(self.task, &workspace);
+        let mut previous_response_id = self
             .perform_warmup(&mut socket, &initial_input, &profile)
             .await?;
-        let mut previous_response_id = Some(warmup_response_id);
         let mut input = Vec::new();
 
         for call_index in 1..=self.config.max_model_calls {
@@ -195,12 +184,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
                     &mut socket,
                     call_index,
                     &input,
-                    previous_response_id.as_deref(),
+                    &previous_response_id,
                     &profile,
                     &workspace,
                 )
                 .await?;
-            previous_response_id = Some(response.id);
+            previous_response_id = response.id;
             input = response.next_input;
             if input.is_empty() {
                 if let Some(message) = response.final_message {
@@ -225,7 +214,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         input: &[InputItem],
         profile: &RequestProfile,
     ) -> Result<String> {
-        let request = ResponseCreate::warmup(self.config, input, profile);
+        let request = EncodedRequest::new(&ResponseCreate::warmup(self.config, input, profile))?;
         let started_at = Instant::now();
         self.events.emit(
             "model.warmup.started",
@@ -237,34 +226,30 @@ impl<'a, W: Write> ModelRun<'a, W> {
         )?;
         self.events.emit(
             "api.event",
-            OutboundApiEvent {
+            ApiEvent {
                 direction: "outbound",
                 transport: TRANSPORT,
                 phase: "warmup",
                 model_call_index: None,
-                event: &request,
+                event: request.raw(),
             },
         )?;
         socket.send(&request).await?;
 
         loop {
-            let raw_event = socket.next_json().await?;
+            let text = socket.next_text_or_idle_timeout().await?;
+            let raw_event = parse_raw_json(text.as_str())?;
             self.events.emit(
                 "api.event",
-                OutboundApiEvent {
+                ApiEvent {
                     direction: "inbound",
                     transport: TRANSPORT,
                     phase: "warmup",
                     model_call_index: None,
-                    event: &raw_event,
+                    event: raw_event,
                 },
             )?;
-            let event = serde_json::from_value::<WarmupServerEvent>(raw_event.clone()).map_err(
-                |source| ResponsesError::InvalidPayload {
-                    source,
-                    event: Box::new(raw_event.clone()),
-                },
-            )?;
+            let event = decode_event::<WarmupServerEvent>(raw_event)?;
             match event {
                 WarmupServerEvent::Completed { response } => {
                     let duration_ns = elapsed_ns(started_at);
@@ -286,7 +271,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 | WarmupServerEvent::Failed
                 | WarmupServerEvent::Incomplete => {
                     return Err(ResponsesError::Api {
-                        event: Box::new(raw_event),
+                        event: raw_event.get().to_owned(),
                     }
                     .into());
                 }
@@ -333,7 +318,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                         error: &message,
                     },
                 )?;
-                return Err(error);
+                return Err(error.into());
             }
         };
         if matches!(purpose, ConnectionPurpose::Reconnect) {
@@ -355,12 +340,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
         Ok(socket)
     }
 
-    async fn send_model_request<T: Serialize>(
+    async fn send_model_request(
         &mut self,
         socket: &mut ResponsesSocket,
-        request: &T,
+        request: &EncodedRequest,
         call_index: u32,
-        previous_response_id: Option<&str>,
+        previous_response_id: &str,
     ) -> Result<()> {
         match socket.send(request).await {
             Ok(()) => return Ok(()),
@@ -387,16 +372,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
         socket: &mut ResponsesSocket,
         call_index: u32,
         input: &[InputItem],
-        previous_response_id: Option<&str>,
+        previous_response_id: &str,
         profile: &RequestProfile,
         workspace: &str,
     ) -> Result<super::stream::TurnResult> {
-        let request = previous_response_id.map_or_else(
-            || ResponseCreate::initial(self.config, input, profile),
-            |previous_response_id| {
-                ResponseCreate::continued(self.config, input, previous_response_id, profile)
-            },
-        );
+        let request = ResponseCreate::continued(self.config, input, previous_response_id, profile);
+        let request = EncodedRequest::new(&request)?;
         let started_at = Instant::now();
         self.stats.model_calls += 1;
         self.events.emit(
@@ -410,12 +391,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
         )?;
         self.events.emit(
             "api.event",
-            OutboundApiEvent {
+            ApiEvent {
                 direction: "outbound",
                 transport: TRANSPORT,
                 phase: "generation",
                 model_call_index: Some(call_index),
-                event: &request,
+                event: request.raw(),
             },
         )?;
         let response = match async {

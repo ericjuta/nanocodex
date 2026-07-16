@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::{
-    RunStats, TRANSPORT, elapsed_ns,
+    ApiEvent, RunStats, TRANSPORT, elapsed_ns,
     wire::{
         Agent, CompletedResponse, ExecCommandArguments, FunctionCallOutput, InputItem,
         MessagePhase, OutputContent, OutputItem, ResponseInject, ResponseInjectError,
@@ -19,7 +19,10 @@ use super::{
     },
 };
 use crate::{
-    AgentError, ResponsesError, Result, protocol::EventWriter, responses::ResponsesSocket, shell,
+    AgentError, ResponsesError, Result,
+    protocol::EventWriter,
+    responses::{EncodedRequest, ResponsesSocket, decode_event, parse_raw_json},
+    shell,
 };
 
 const ROOT_AGENT: &str = "/root";
@@ -65,24 +68,6 @@ struct ResponseDriver<'a, W> {
     live_injection: bool,
     first_event_ns: Option<u64>,
     first_output_ns: Option<u64>,
-}
-
-#[derive(Serialize)]
-struct InboundApiEvent<'a> {
-    direction: &'static str,
-    transport: &'static str,
-    phase: &'static str,
-    model_call_index: u32,
-    event: &'a Value,
-}
-
-#[derive(Serialize)]
-struct OutboundApiEvent<'a, T: Serialize + ?Sized> {
-    direction: &'static str,
-    transport: &'static str,
-    phase: &'static str,
-    model_call_index: u32,
-    event: &'a T,
 }
 
 #[derive(Serialize)]
@@ -185,35 +170,35 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
             match (needs_server_event, has_tool_task) {
                 (true, true) => {
                     tokio::select! {
-                        raw_event = self.socket.next_json() => {
-                            self.handle_raw_event(raw_event?)?;
+                        raw_event = self.socket.next_text() => {
+                            let text = raw_event?;
+                            self.handle_raw_event(text.as_str())?;
                         }
                         completed = self.tool_tasks.next() => {
-                            let completed = completed.ok_or_else(|| AgentError::MalformedResponse {
+                            let completed = completed.ok_or(AgentError::MalformedResponse {
                                 detail: "tool task stream ended while work remained",
-                                event: Box::default(),
                             })??;
                             self.handle_tool_completion(completed).await?;
                         }
                     }
                 }
                 (true, false) => {
-                    let raw_event = self.socket.next_json().await?;
-                    self.handle_raw_event(raw_event)?;
+                    let text = self.socket.next_text_or_idle_timeout().await?;
+                    self.handle_raw_event(text.as_str())?;
                 }
                 (false, true) => {
-                    let completed = self.tool_tasks.next().await.ok_or_else(|| {
-                        AgentError::MalformedResponse {
-                            detail: "tool task stream ended while work remained",
-                            event: Box::default(),
-                        }
-                    })??;
+                    let completed =
+                        self.tool_tasks
+                            .next()
+                            .await
+                            .ok_or(AgentError::MalformedResponse {
+                                detail: "tool task stream ended while work remained",
+                            })??;
                     self.handle_tool_completion(completed).await?;
                 }
                 (false, false) => {
                     return Err(AgentError::MalformedResponse {
                         detail: "response driver stopped before response.completed",
-                        event: Box::default(),
                     }
                     .into());
                 }
@@ -227,20 +212,21 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
         self.completed.is_some() && self.tool_tasks.is_empty() && self.pending_injections.is_empty()
     }
 
-    fn handle_raw_event(&mut self, raw_event: Value) -> Result<()> {
+    fn handle_raw_event(&mut self, text: &str) -> Result<()> {
+        let raw_event = parse_raw_json(text)?;
         let elapsed = elapsed_ns(self.started_at);
         self.first_event_ns.get_or_insert(elapsed);
         self.events.emit(
             "api.event",
-            InboundApiEvent {
+            ApiEvent {
                 direction: "inbound",
                 transport: TRANSPORT,
                 phase: "generation",
-                model_call_index: self.call_index,
-                event: &raw_event,
+                model_call_index: Some(self.call_index),
+                event: raw_event,
             },
         )?;
-        let event = decode_event(&raw_event)?;
+        let event = decode_event::<ServerEvent>(raw_event)?;
         if event.is_output() {
             self.first_output_ns.get_or_insert(elapsed);
         }
@@ -281,7 +267,7 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
                 input,
                 error,
             } => {
-                self.handle_injection_failed(&raw_event, &response_id, input, &error)?;
+                self.handle_injection_failed(raw_event.get(), &response_id, input, &error)?;
             }
             ServerEvent::Completed { mut response } => {
                 self.response_id = Some(response.id.clone());
@@ -292,7 +278,7 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
             }
             ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete => {
                 return Err(ResponsesError::Api {
-                    event: Box::new(raw_event),
+                    event: raw_event.get().to_owned(),
                 }
                 .into());
             }
@@ -405,9 +391,8 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
             let batch_started_at =
                 self.tool_batch_started_at
                     .take()
-                    .ok_or_else(|| AgentError::MalformedResponse {
+                    .ok_or(AgentError::MalformedResponse {
                         detail: "tool batch completed without a start timestamp",
-                        event: Box::default(),
                     })?;
             self.stats.tool_wall_duration_ns += elapsed_ns(batch_started_at);
         }
@@ -435,20 +420,19 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
             return Ok(());
         }
 
-        let response_id =
-            self.response_id
-                .clone()
-                .ok_or_else(|| AgentError::MalformedResponse {
-                    detail: "tool call completed before response.created",
-                    event: Box::default(),
-                })?;
+        let response_id = self
+            .response_id
+            .clone()
+            .ok_or(AgentError::MalformedResponse {
+                detail: "tool call completed before response.created",
+            })?;
         let input = [completed.output];
+        let started_at = Instant::now();
         self.send_injection(&response_id, &input, "injection")
             .await?;
         self.stats.injections_sent += 1;
-        self.pending_injections.push_back(PendingInjection {
-            started_at: Instant::now(),
-        });
+        self.pending_injections
+            .push_back(PendingInjection { started_at });
         Ok(())
     }
 
@@ -458,15 +442,15 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
         input: &[FunctionCallOutput],
         phase: &'static str,
     ) -> Result<()> {
-        let request = ResponseInject::new(response_id, input);
+        let request = EncodedRequest::new(&ResponseInject::new(response_id, input))?;
         self.events.emit(
             "api.event",
-            OutboundApiEvent {
+            ApiEvent {
                 direction: "outbound",
                 transport: TRANSPORT,
                 phase,
-                model_call_index: self.call_index,
-                event: &request,
+                model_call_index: Some(self.call_index),
+                event: request.raw(),
             },
         )?;
         self.socket.send(&request).await.map_err(Into::into)
@@ -474,13 +458,12 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
 
     fn handle_injection_created(&mut self, response_id: &str) -> Result<()> {
         self.validate_injection_response(response_id)?;
-        let pending =
-            self.pending_injections
-                .pop_front()
-                .ok_or_else(|| AgentError::MalformedResponse {
-                    detail: "response.inject.created had no pending injection",
-                    event: Box::default(),
-                })?;
+        let pending = self
+            .pending_injections
+            .pop_front()
+            .ok_or(AgentError::MalformedResponse {
+                detail: "response.inject.created had no pending injection",
+            })?;
         let duration_ns = elapsed_ns(pending.started_at);
         self.stats.injections_accepted += 1;
         self.stats.injection_ack_wait_ns += duration_ns;
@@ -496,24 +479,23 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
 
     fn handle_injection_failed(
         &mut self,
-        raw_event: &Value,
+        raw_event: &str,
         response_id: &str,
         input: Vec<FunctionCallOutput>,
         error: &ResponseInjectError,
     ) -> Result<()> {
         self.validate_injection_response(response_id)?;
-        let pending =
-            self.pending_injections
-                .pop_front()
-                .ok_or_else(|| AgentError::MalformedResponse {
-                    detail: "response.inject.failed had no pending injection",
-                    event: Box::new(raw_event.clone()),
-                })?;
+        let pending = self
+            .pending_injections
+            .pop_front()
+            .ok_or(AgentError::MalformedResponse {
+                detail: "response.inject.failed had no pending injection",
+            })?;
         let duration_ns = elapsed_ns(pending.started_at);
         self.stats.injection_ack_wait_ns += duration_ns;
         if error.code != ResponseInjectErrorCode::ResponseAlreadyCompleted {
             return Err(ResponsesError::Api {
-                event: Box::new(raw_event.clone()),
+                event: raw_event.to_owned(),
             }
             .into());
         }
@@ -537,19 +519,14 @@ impl<'a, W: Write> ResponseDriver<'a, W> {
         }
         Err(AgentError::MalformedResponse {
             detail: "injection acknowledgement referenced another response",
-            event: Box::default(),
         }
         .into())
     }
 
     fn finish(mut self) -> Result<TurnResult> {
-        let response = self
-            .completed
-            .take()
-            .ok_or_else(|| AgentError::MalformedResponse {
-                detail: "response driver finished without response.completed",
-                event: Box::default(),
-            })?;
+        let response = self.completed.take().ok_or(AgentError::MalformedResponse {
+            detail: "response driver finished without response.completed",
+        })?;
         Ok(TurnResult {
             id: response.id,
             status: response.status,
@@ -577,13 +554,4 @@ fn message_text(content: Vec<OutputContent>) -> String {
             OutputContent::Other => None,
         })
         .collect()
-}
-
-fn decode_event(raw_event: &Value) -> Result<ServerEvent> {
-    serde_json::from_value(raw_event.clone())
-        .map_err(|source| ResponsesError::InvalidPayload {
-            source,
-            event: Box::new(raw_event.clone()),
-        })
-        .map_err(Into::into)
 }

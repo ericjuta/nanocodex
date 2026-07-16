@@ -265,6 +265,46 @@ exception or retry. `overfull-hbox` and `compile-compcert` are green;
 speed misses. CompCert starts the next three-task batch. The table records
 representative warm samples:
 
+### Runtime convergence gate: complete
+
+The Alloy-style WebSocket boundary rewrite was a shared behavior change, so it
+triggered the earlier full gate before another task was admitted. This work
+remains inside Milestone 2; review provenance does not start until the runtime
+is both smaller and green again.
+
+1. Fix the audited runtime failures: preserve partial subprocess output when a
+   descendant holds a pipe open, clean up the process group on wait failure,
+   keep a direct multi-agent tool alive beyond the socket's ordinary idle
+   interval, and measure injection acknowledgement from before the send.
+2. Contract the request path around one encoded tool catalog, remove dead
+   initial-response state, and collapse redundant Rust/Python accounting. The
+   convergence slice must remain a material net reduction in production LOC.
+3. Add focused deterministic regressions only for the demonstrated subprocess
+   and active-tool timeout failures, then run `just check` plus real PTC and
+   Multi-agent `just run` smokes.
+4. Rerun the unchanged `fix-git` and `openssl-selfsigned-cert` anchors, then run
+   the complete 36-task gate and inspect JSONL, ATIF, verifier output, and task
+   diffs. Resume one-at-a-time admissions only after that gate is understood.
+
+All four steps are complete. Production code shrank by 221 lines while the two
+demonstrated regressions gained focused deterministic coverage. `just check`,
+the live PTC and Multi-agent smokes, and both unchanged anchors passed. The
+complete gate at `.harness/harbor/jobs/2026-07-16__11-28-41` completed 36/36
+trials with no exception, retry, or WebSocket reconnect in 20 minutes 33
+seconds and scored 34/36. Its misses were task-output failures: POV-Ray omitted
+a canonical source file after a successful build, and Cancel Async Tasks missed
+one queued-SIGINT cleanup assertion.
+
+The timing record rules out the local client loop as the gate bottleneck. Mean
+trial time was 128.72 seconds: 115.86 seconds in agent execution, 1.89 seconds
+in environment setup, 0.72 seconds in agent setup, and 8.36 seconds in the
+verifier. Rust recorded only 3.68 milliseconds per trial outside connection,
+warmup, and model-call spans (10.21 milliseconds worst case), with zero
+reconnects across 257 model calls. Tool waits averaged 59.03 seconds and are a
+subset of the model-call spans; CompCert alone occupied the gate's critical
+path for 19 minutes 57 seconds. The next action is an unchanged focused retry
+of the two output misses, then one-at-a-time task admission resumes.
+
 The first unchanged `overfull-hbox` attempt passed all four assertions but
 spent 68.00 of its 135.45 trial seconds reinstalling an already pinned TeX
 package and regenerating formats. A guarded verifier-image cache now skips
@@ -1561,11 +1601,11 @@ existing UI only if it cleanly exposes trace links; keep the CLI as the control.
 - Approval and policy machinery.
 - Durable replay, a parallel journal, or content-addressed artifact storage.
 - Large mock-heavy unit-test suites ahead of working end-to-end behavior.
-- Unit tests for the current runtime cleanup; rely on the real run/eval gates
-  until a demonstrated regression justifies a focused deterministic test.
+- Broad unit-test expansion for the current runtime cleanup; retain only
+  focused deterministic tests justified by demonstrated regressions.
 - Improving the environment-secret-name heuristic.
-- Preserving byte-exact inbound WebSocket frames instead of parsed and
-  reserialized API events.
+- Preserving complete byte-exact inbound WebSocket frames, including framing
+  whitespace; raw event bodies already avoid a JSON value round trip.
 - Removing duplicate derived assistant/reasoning delta events or otherwise
   reducing event volume; first establish which representation the ATIF adapter
   should consume.

@@ -15,6 +15,7 @@ use nix::{
 };
 use tokio::{
     process::{Child, Command},
+    sync::oneshot,
     task::JoinHandle,
     time::timeout,
 };
@@ -89,15 +90,20 @@ pub(super) async fn execute(
     };
     let mut process_group = ProcessGroupGuard::new(pid);
     let capture_limit = output_limit.saturating_mul(4);
+    let (finish_drain, finish_requested) = oneshot::channel();
     let mut drain = tokio::spawn(output::drain_pipes(
         child.stdout.take(),
         child.stderr.take(),
         capture_limit,
+        finish_requested,
     ));
 
-    let (outcome, wait_error) = wait_for_child(&mut child, command_timeout, &process_group).await;
-    let captured = finish_drain(&mut drain).await;
-    process_group.disarm();
+    let (outcome, wait_error, exited) =
+        wait_for_child(&mut child, command_timeout, &process_group).await;
+    let captured = finish_output_drain(&mut drain, finish_drain).await;
+    if exited {
+        process_group.disarm();
+    }
     let (stdout, stderr) = output::render(captured, wait_error, secrets, output_limit);
 
     ShellCommandOutput {
@@ -111,19 +117,31 @@ async fn wait_for_child(
     child: &mut Child,
     command_timeout: Duration,
     process_group: &ProcessGroupGuard,
-) -> (ShellOutcome, Option<String>) {
+) -> (ShellOutcome, Option<String>, bool) {
     match timeout(command_timeout, child.wait()).await {
         Ok(Ok(status)) => {
             let exit_code = status
                 .code()
                 .or_else(|| status.signal().map(|signal| 128_i32.saturating_add(signal)))
                 .unwrap_or(1);
-            (ShellOutcome::Exit { exit_code }, None)
+            (ShellOutcome::Exit { exit_code }, None, true)
         }
-        Ok(Err(error)) => (
-            ShellOutcome::Exit { exit_code: 1 },
-            Some(format!("failed to wait for /bin/sh: {error}")),
-        ),
+        Ok(Err(error)) => {
+            let mut errors = vec![format!("failed to wait for /bin/sh: {error}")];
+            if let Err(error) = process_group.terminate() {
+                errors.push(format!(
+                    "failed to terminate command process group: {error}"
+                ));
+                if let Err(error) = child.kill().await {
+                    errors.push(format!("failed to terminate /bin/sh: {error}"));
+                }
+            }
+            (
+                ShellOutcome::Exit { exit_code: 1 },
+                Some(errors.join("; ")),
+                false,
+            )
+        }
         Err(_) => {
             let mut cleanup_errors = Vec::new();
             if let Err(error) = process_group.terminate() {
@@ -140,18 +158,22 @@ async fn wait_for_child(
             (
                 ShellOutcome::Timeout,
                 (!cleanup_errors.is_empty()).then(|| cleanup_errors.join("; ")),
+                false,
             )
         }
     }
 }
 
-async fn finish_drain(drain: &mut JoinHandle<output::CapturedOutput>) -> output::CapturedOutput {
+async fn finish_output_drain(
+    drain: &mut JoinHandle<output::CapturedOutput>,
+    finish: oneshot::Sender<()>,
+) -> output::CapturedOutput {
     if let Ok(result) = timeout(PIPE_DRAIN_GRACE, &mut *drain).await {
         return joined_output(result);
     }
 
-    drain.abort();
-    output::CapturedOutput::empty()
+    let _ = finish.send(());
+    joined_output(drain.await)
 }
 
 fn joined_output(
@@ -248,7 +270,7 @@ mod tests {
         ));
 
         let result = execute(
-            "(sleep 3; printf survived > \"$HARNESS_BACKGROUND_MARKER\") &",
+            "printf 'foreground\\n'; (sleep 3; printf survived > \"$HARNESS_BACKGROUND_MARKER\") &",
             Path::new("/"),
             false,
             Duration::from_secs(10),
@@ -271,6 +293,7 @@ mod tests {
             result.outcome,
             ShellOutcome::Exit { exit_code: 0 }
         ));
+        assert_eq!(result.stdout, "foreground\n");
         assert!(survived, "background process was killed after shell exit");
         Ok(())
     }

@@ -1,6 +1,5 @@
 use std::{io, path::PathBuf};
 
-use serde_json::Value;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, http::header::InvalidHeaderValue};
 
 /// Failures at the Responses API transport and wire boundary.
@@ -39,6 +38,9 @@ pub enum ResponsesError {
     #[error("Responses WebSocket event was not valid JSON")]
     InvalidJson(#[source] serde_json::Error),
 
+    #[error("Responses WebSocket returned a binary data frame; expected JSON text")]
+    UnexpectedBinary,
+
     #[error("failed to encode a Responses WebSocket request")]
     EncodeRequest(#[source] serde_json::Error),
 
@@ -60,14 +62,14 @@ pub enum ResponsesError {
     InvalidPayload {
         #[source]
         source: serde_json::Error,
-        event: Box<Value>,
+        event: String,
     },
 
     #[error("Responses WebSocket closed {detail}")]
     Closed { detail: String },
 
     #[error("Responses API returned an error event: {event}")]
-    Api { event: Box<Value> },
+    Api { event: String },
 }
 
 impl ResponsesError {
@@ -101,11 +103,8 @@ pub enum AgentError {
     #[error("Responses API requested unsupported function {name} in call {call_id}")]
     UnsupportedFunction { name: String, call_id: String },
 
-    #[error("malformed Responses API event ({detail}): {event}")]
-    MalformedResponse {
-        detail: &'static str,
-        event: Box<Value>,
-    },
+    #[error("malformed Responses API event: {detail}")]
+    MalformedResponse { detail: &'static str },
 }
 
 /// Error returned by the harness library boundary.

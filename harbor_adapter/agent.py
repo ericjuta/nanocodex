@@ -28,6 +28,24 @@ from harbor.utils.trajectory_utils import format_trajectory_json
 
 PROTOCOL_VERSION = 1
 TERMINAL_EVENTS = {"run.completed", "run.failed"}
+RUN_METRIC_FIELDS = (
+    "connection_attempts",
+    "websocket_reconnects",
+    "connection_duration_ns",
+    "model_duration_ns",
+    "warmup_duration_ns",
+    "tool_work_duration_ns",
+    "tool_wall_duration_ns",
+    "injections_sent",
+    "injections_accepted",
+    "injections_deferred",
+    "continuations_queued",
+    "injection_ack_wait_ns",
+    "hosted_multi_agent_calls",
+    "agent_messages",
+    "compactions",
+)
+USAGE_METRIC_FIELDS = ("cache_write_input_tokens", "reasoning_output_tokens")
 
 
 class HarnessAgent(BaseInstalledAgent):
@@ -191,6 +209,13 @@ class HarnessAgent(BaseInstalledAgent):
         usage = usage if isinstance(usage, dict) else {}
         warmup_usage = terminal_payload.get("warmup_usage")
         warmup_usage = warmup_usage if isinstance(warmup_usage, dict) else {}
+        runtime_metrics = {
+            field: terminal_payload.get(field) for field in RUN_METRIC_FIELDS
+        }
+        runtime_metrics["warmup_usage"] = warmup_usage
+        runtime_metrics.update(
+            {field: usage.get(field) for field in USAGE_METRIC_FIELDS}
+        )
         input_tokens = self._optional_int(usage.get("input_tokens"))
         cached_tokens = self._optional_int(usage.get("cached_input_tokens"))
         output_tokens = self._optional_int(usage.get("output_tokens"))
@@ -245,58 +270,7 @@ class HarnessAgent(BaseInstalledAgent):
                         completion_tokens=output_tokens,
                         cached_tokens=cached_tokens,
                         cost_usd=cost_usd,
-                        extra={
-                            "cache_write_input_tokens": usage.get(
-                                "cache_write_input_tokens"
-                            ),
-                            "reasoning_output_tokens": usage.get(
-                                "reasoning_output_tokens"
-                            ),
-                            "connection_attempts": terminal_payload.get(
-                                "connection_attempts"
-                            ),
-                            "websocket_reconnects": terminal_payload.get(
-                                "websocket_reconnects"
-                            ),
-                            "connection_duration_ns": terminal_payload.get(
-                                "connection_duration_ns"
-                            ),
-                            "model_duration_ns": terminal_payload.get(
-                                "model_duration_ns"
-                            ),
-                            "warmup_duration_ns": terminal_payload.get(
-                                "warmup_duration_ns"
-                            ),
-                            "warmup_usage": warmup_usage,
-                            "tool_work_duration_ns": terminal_payload.get(
-                                "tool_work_duration_ns"
-                            ),
-                            "tool_wall_duration_ns": terminal_payload.get(
-                                "tool_wall_duration_ns"
-                            ),
-                            "injections_sent": terminal_payload.get(
-                                "injections_sent"
-                            ),
-                            "injections_accepted": terminal_payload.get(
-                                "injections_accepted"
-                            ),
-                            "injections_deferred": terminal_payload.get(
-                                "injections_deferred"
-                            ),
-                            "continuations_queued": terminal_payload.get(
-                                "continuations_queued"
-                            ),
-                            "injection_ack_wait_ns": terminal_payload.get(
-                                "injection_ack_wait_ns"
-                            ),
-                            "hosted_multi_agent_calls": terminal_payload.get(
-                                "hosted_multi_agent_calls"
-                            ),
-                            "agent_messages": terminal_payload.get(
-                                "agent_messages"
-                            ),
-                            "compactions": terminal_payload.get("compactions"),
-                        },
+                        extra=runtime_metrics,
                     )
                     if model_calls
                     else None,
@@ -318,48 +292,7 @@ class HarnessAgent(BaseInstalledAgent):
                     "model_calls": model_calls,
                     "tool_calls": tool_calls,
                     "duration_ns": terminal_payload.get("duration_ns"),
-                    "connection_attempts": terminal_payload.get(
-                        "connection_attempts"
-                    ),
-                    "websocket_reconnects": terminal_payload.get(
-                        "websocket_reconnects"
-                    ),
-                    "connection_duration_ns": terminal_payload.get(
-                        "connection_duration_ns"
-                    ),
-                    "model_duration_ns": terminal_payload.get("model_duration_ns"),
-                    "warmup_duration_ns": terminal_payload.get("warmup_duration_ns"),
-                    "warmup_usage": warmup_usage,
-                    "tool_work_duration_ns": terminal_payload.get(
-                        "tool_work_duration_ns"
-                    ),
-                    "tool_wall_duration_ns": terminal_payload.get(
-                        "tool_wall_duration_ns"
-                    ),
-                    "injections_sent": terminal_payload.get("injections_sent"),
-                    "injections_accepted": terminal_payload.get(
-                        "injections_accepted"
-                    ),
-                    "injections_deferred": terminal_payload.get(
-                        "injections_deferred"
-                    ),
-                    "continuations_queued": terminal_payload.get(
-                        "continuations_queued"
-                    ),
-                    "injection_ack_wait_ns": terminal_payload.get(
-                        "injection_ack_wait_ns"
-                    ),
-                    "hosted_multi_agent_calls": terminal_payload.get(
-                        "hosted_multi_agent_calls"
-                    ),
-                    "agent_messages": terminal_payload.get("agent_messages"),
-                    "compactions": terminal_payload.get("compactions"),
-                    "cache_write_input_tokens": usage.get(
-                        "cache_write_input_tokens"
-                    ),
-                    "reasoning_output_tokens": usage.get(
-                        "reasoning_output_tokens"
-                    ),
+                    **runtime_metrics,
                 },
             ),
         )
@@ -382,28 +315,7 @@ class HarnessAgent(BaseInstalledAgent):
             "orchestration": terminal_payload.get("orchestration"),
             "duration_ms": terminal_payload.get("duration_ms"),
             "duration_ns": terminal_payload.get("duration_ns"),
-            "connection_attempts": terminal_payload.get("connection_attempts"),
-            "websocket_reconnects": terminal_payload.get("websocket_reconnects"),
-            "connection_duration_ns": terminal_payload.get(
-                "connection_duration_ns"
-            ),
-            "model_duration_ns": terminal_payload.get("model_duration_ns"),
-            "warmup_duration_ns": terminal_payload.get("warmup_duration_ns"),
-            "warmup_usage": warmup_usage,
-            "tool_work_duration_ns": terminal_payload.get("tool_work_duration_ns"),
-            "tool_wall_duration_ns": terminal_payload.get("tool_wall_duration_ns"),
-            "injections_sent": terminal_payload.get("injections_sent"),
-            "injections_accepted": terminal_payload.get("injections_accepted"),
-            "injections_deferred": terminal_payload.get("injections_deferred"),
-            "continuations_queued": terminal_payload.get("continuations_queued"),
-            "injection_ack_wait_ns": terminal_payload.get("injection_ack_wait_ns"),
-            "hosted_multi_agent_calls": terminal_payload.get(
-                "hosted_multi_agent_calls"
-            ),
-            "agent_messages": terminal_payload.get("agent_messages"),
-            "compactions": terminal_payload.get("compactions"),
-            "reasoning_output_tokens": usage.get("reasoning_output_tokens"),
-            "cache_write_input_tokens": usage.get("cache_write_input_tokens"),
+            **runtime_metrics,
             "last_response_id": terminal_payload.get("last_response_id"),
             "cost_status": terminal_payload.get("cost_status"),
         }

@@ -110,8 +110,12 @@ unchanged focused retries recovered the Compressor and Cython misses. Tune
 MJCF missed its speed threshold both in the gate and an unchanged retry, so it
 joins Core Wars as a retained variance experiment excluded from the stable
 slice rather than receiving a benchmark-specific hint. CompCert 3.13.1 is the
-first green admission in the next three-task batch; the next full gate follows
-two more green admissions unless a shared behavior change triggers it earlier.
+first green admission in the next three-task batch. The Alloy-style WebSocket
+convergence slice reduced production code by 221 lines; its 36-task gate
+completed without an exception, retry, or reconnect in 20 minutes 33 seconds
+and scored 34/36. The two misses were task-output failures, not harness
+failures, and are next for unchanged focused retries before another task is
+admitted.
 Browser automation, computer-use, GUI interaction, and image/video perception
 are outside this milestone. Downloaded tasks and canonical verifier assertions
 remain unchanged.

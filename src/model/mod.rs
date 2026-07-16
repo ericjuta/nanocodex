@@ -10,6 +10,7 @@ use std::{
 
 use clap::ValueEnum;
 use serde::Serialize;
+use serde_json::value::RawValue;
 
 use self::wire::Usage;
 use crate::{
@@ -19,7 +20,18 @@ use crate::{
 
 const TRANSPORT: &str = "responses_websocket_v2";
 const COST_STATUS: &str = "not_reported_by_responses_api";
+const SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
 pub(super) const MAX_CONCURRENT_SUBAGENTS: u32 = 3;
+
+#[derive(Serialize)]
+struct ApiEvent<'a> {
+    direction: &'static str,
+    transport: &'static str,
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_call_index: Option<u32>,
+    event: &'a RawValue,
+}
 
 /// OpenAI-specific settings for the deliberately single-provider harness.
 pub struct ModelConfig {
@@ -39,6 +51,10 @@ impl ModelConfig {
         } else {
             "programmatic_tool_calling"
         }
+    }
+
+    pub(super) const fn system_prompt() -> &'static str {
+        SYSTEM_PROMPT
     }
 }
 
@@ -86,7 +102,7 @@ impl UsageTotals {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize)]
 struct RunStats {
     model_calls: u32,
     tool_calls: u32,
@@ -141,7 +157,7 @@ fn terminal_payload<'a>(
     terminal_status: &'static str,
     elapsed: Duration,
     config: &'a ModelConfig,
-    metrics: &'a RunStats,
+    stats: &'a RunStats,
 ) -> TerminalPayload<'a> {
     TerminalPayload {
         status: terminal_status,
@@ -149,28 +165,9 @@ fn terminal_payload<'a>(
         effort: config.effort.as_str(),
         transport: TRANSPORT,
         orchestration: config.orchestration(),
-        model_calls: metrics.model_calls,
-        tool_calls: metrics.tool_calls,
-        connection_attempts: metrics.connection_attempts,
-        websocket_reconnects: metrics.websocket_reconnects,
-        connection_duration_ns: metrics.connection_duration_ns,
         duration_ms: duration_ms(elapsed),
         duration_ns: duration_ns(elapsed),
-        model_duration_ns: metrics.model_duration_ns,
-        warmup_duration_ns: metrics.warmup_duration_ns,
-        tool_work_duration_ns: metrics.tool_work_duration_ns,
-        tool_wall_duration_ns: metrics.tool_wall_duration_ns,
-        last_response_id: metrics.last_response_id.as_deref(),
-        usage: &metrics.usage,
-        warmup_usage: &metrics.warmup_usage,
-        injections_sent: metrics.injections_sent,
-        injections_accepted: metrics.injections_accepted,
-        injections_deferred: metrics.injections_deferred,
-        continuations_queued: metrics.continuations_queued,
-        injection_ack_wait_ns: metrics.injection_ack_wait_ns,
-        hosted_multi_agent_calls: metrics.hosted_multi_agent_calls,
-        agent_messages: metrics.agent_messages,
-        compactions: metrics.compactions,
+        stats,
         cost_usd: None,
         cost_status: COST_STATUS,
     }
@@ -210,28 +207,10 @@ struct TerminalPayload<'a> {
     effort: &'static str,
     transport: &'static str,
     orchestration: &'static str,
-    model_calls: u32,
-    tool_calls: u32,
-    connection_attempts: u32,
-    websocket_reconnects: u32,
-    connection_duration_ns: u64,
     duration_ms: u64,
     duration_ns: u64,
-    model_duration_ns: u64,
-    warmup_duration_ns: u64,
-    tool_work_duration_ns: u64,
-    tool_wall_duration_ns: u64,
-    last_response_id: Option<&'a str>,
-    usage: &'a UsageTotals,
-    warmup_usage: &'a UsageTotals,
-    injections_sent: u32,
-    injections_accepted: u32,
-    injections_deferred: u32,
-    continuations_queued: u32,
-    injection_ack_wait_ns: u64,
-    hosted_multi_agent_calls: u32,
-    agent_messages: u32,
-    compactions: u32,
+    #[serde(flatten)]
+    stats: &'a RunStats,
     cost_usd: Option<f64>,
     cost_status: &'static str,
 }

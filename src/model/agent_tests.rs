@@ -23,6 +23,8 @@ async fn reconnects_before_resending_a_stored_continuation() -> Result<()> {
         let warmup = next_json(&mut first).await?;
         assert_eq!(warmup["generate"], false);
         assert_eq!(warmup["previous_response_id"], Value::Null);
+        assert_eq!(warmup["tools"][0]["allowed_callers"][0], "programmatic");
+        assert_eq!(warmup["tools"][1]["type"], "programmatic_tool_calling");
         send_json(
             &mut first,
             json!({
@@ -107,6 +109,124 @@ async fn reconnects_before_resending_a_stored_continuation() -> Result<()> {
     assert_eq!(terminal["payload"]["connection_attempts"], 2);
     assert_eq!(terminal["payload"]["websocket_reconnects"], 1);
     Ok(())
+}
+
+#[tokio::test]
+async fn active_direct_tool_outlives_the_server_event_idle_timeout() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(serve_active_direct_tool(listener));
+
+    let task = Task {
+        instruction: "exercise active direct tool handling".to_owned(),
+        workspace: Some(env!("CARGO_MANIFEST_DIR").to_owned()),
+    };
+    let config = ModelConfig {
+        model: "test-model".to_owned(),
+        api_key: "test-key".to_owned(),
+        effort: ReasoningEffort::Low,
+        websocket_url: endpoint,
+        max_model_calls: 1,
+        compact_threshold: 350_000,
+        multi_agent: true,
+    };
+    let mut output = Vec::new();
+    {
+        let mut events = EventWriter::new(&mut output, "active-tool-test".to_owned());
+        ModelRun::new(&mut events, &task, &config).execute().await?;
+    }
+    timeout(Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+
+    let events = String::from_utf8(output)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    let terminal = events
+        .last()
+        .ok_or_else(|| eyre!("missing terminal event"))?;
+    assert_eq!(terminal["type"], "run.completed");
+    assert_eq!(terminal["payload"]["injections_accepted"], 1);
+    Ok(())
+}
+
+async fn serve_active_direct_tool(listener: TcpListener) -> Result<()> {
+    let (stream, _) = listener.accept().await?;
+    let mut socket = accept_async(stream).await?;
+
+    let warmup = next_json(&mut socket).await?;
+    assert_eq!(warmup["generate"], false);
+    assert_eq!(warmup["tools"].as_array().map(Vec::len), Some(1));
+    assert_eq!(warmup["tools"][0]["allowed_callers"][0], "direct");
+    send_json(
+        &mut socket,
+        json!({
+            "type": "response.completed",
+            "response": { "id": "resp-warmup", "usage": null }
+        }),
+    )
+    .await?;
+
+    let request = next_json(&mut socket).await?;
+    assert_eq!(request["previous_response_id"], "resp-warmup");
+    send_json(
+        &mut socket,
+        json!({
+            "type": "response.created",
+            "response": { "id": "resp-active-tool" }
+        }),
+    )
+    .await?;
+    send_json(
+        &mut socket,
+        json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "call_id": "call-active-tool",
+                "name": "exec_command",
+                "arguments": json!({
+                    "cmd": "sleep 0.2; printf active",
+                    "login": false
+                }).to_string()
+            }
+        }),
+    )
+    .await?;
+
+    let injection = next_json(&mut socket).await?;
+    assert_eq!(injection["type"], "response.inject");
+    assert_eq!(injection["response_id"], "resp-active-tool");
+    assert_eq!(injection["input"][0]["call_id"], "call-active-tool");
+    let output: Value = serde_json::from_str(
+        injection["input"][0]["output"]
+            .as_str()
+            .ok_or_else(|| eyre!("injection output was not a string"))?,
+    )?;
+    assert_eq!(output["output"], "active");
+
+    send_json(
+        &mut socket,
+        json!({
+            "type": "response.inject.created",
+            "response_id": "resp-active-tool"
+        }),
+    )
+    .await?;
+    send_json(
+        &mut socket,
+        completed_response(
+            "resp-active-tool",
+            &[json!({
+                "type": "message",
+                "content": [{ "type": "output_text", "text": "done" }],
+                "agent": { "agent_name": "/root" },
+                "phase": "final_answer"
+            })],
+        ),
+    )
+    .await
 }
 
 async fn next_json<S>(socket: &mut WebSocketStream<S>) -> Result<Value>

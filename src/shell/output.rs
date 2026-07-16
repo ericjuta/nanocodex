@@ -1,6 +1,9 @@
 use std::io;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync::oneshot,
+};
 
 const DEFAULT_MAX_OUTPUT_LENGTH: usize = 4_096;
 const MAX_OUTPUT_LENGTH: usize = 1024 * 1024;
@@ -23,10 +26,6 @@ impl CapturedOutput {
         }
     }
 
-    pub(super) fn empty() -> Self {
-        Self::new(0)
-    }
-
     pub(super) fn error(error: String) -> Self {
         let mut captured = Self::new(0);
         captured.error = Some(error);
@@ -47,6 +46,7 @@ pub(super) async fn drain_pipes(
     mut stdout: Option<impl AsyncRead + Unpin>,
     mut stderr: Option<impl AsyncRead + Unpin>,
     capture_limit: usize,
+    mut finish: oneshot::Receiver<()>,
 ) -> CapturedOutput {
     let mut captured = CapturedOutput::new(capture_limit);
     let mut stdout_buffer = [0_u8; READ_BUFFER_LENGTH];
@@ -54,6 +54,8 @@ pub(super) async fn drain_pipes(
 
     while stdout.is_some() || stderr.is_some() {
         tokio::select! {
+            biased;
+            _ = &mut finish => break,
             read = read_pipe(&mut stdout, &mut stdout_buffer), if stdout.is_some() => {
                 capture_read(
                     read,
