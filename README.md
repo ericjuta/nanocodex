@@ -114,8 +114,9 @@ first green admission in the next three-task batch; the next full gate follows
 two more green admissions unless a shared behavior change triggers it earlier.
 Browser automation, computer-use, GUI interaction, and image/video perception
 are outside this milestone; the pinned Caffe/CIFAR-10 training task is deferred
-under that boundary without a model run. Downloaded tasks and canonical
-verifier assertions remain unchanged.
+under that boundary without a model run, as is the pinned Windows 3.11
+VNC/screenshot task. Downloaded tasks and canonical verifier assertions remain
+unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
 before model work, and a task that repeatedly requires benchmark-specific
