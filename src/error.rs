@@ -63,12 +63,6 @@ pub enum ResponsesError {
         event: Box<Value>,
     },
 
-    #[error("failed to answer a Responses WebSocket ping")]
-    Pong(#[source] WebSocketError),
-
-    #[error("answering a Responses WebSocket ping exceeded {seconds} seconds")]
-    PongTimeout { seconds: u64 },
-
     #[error("Responses WebSocket closed {detail}")]
     Closed { detail: String },
 
