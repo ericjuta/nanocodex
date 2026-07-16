@@ -254,7 +254,7 @@ and reproducibly rejected, which is why it is not a supported profile.
 
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. Thirty-six public tasks are active with green low-effort
+Status: in progress. Thirty-seven public tasks are active with green low-effort
 PTC samples under the current `openai-coding-v13` prompt. The first required
 35-task gate completed every trial without an exception or retry and scored
 34/35; its only miss exposed verifier-package contamination rather than a
@@ -262,7 +262,8 @@ model failure. The verifier dependencies are now isolated, the affected
 focused regressions pass, and the corrected 35-task gate passes 35/35 with zero
 exception or retry. `overfull-hbox` and `compile-compcert` are green;
 `tune-mjcf` is now a retained variance experiment after two consecutive current
-speed misses. CompCert starts the next three-task batch. The table records
+speed misses. CompCert and Crack 7z Hash are the first two admissions in the
+next three-task batch. The table records
 representative warm samples:
 
 The first unchanged `overfull-hbox` attempt passed all four assertions but
@@ -314,6 +315,7 @@ anchors remained green at 2/2 and 6/6, with 1.16- and 0.99-second verifiers.
 | `build-pov-ray` | 1.0 | 139.58s | 128.75s | 128.17s | 26.10s | 21/20 | 349,918/47,542/4,894 |
 | `overfull-hbox` | 1.0 | 54.56s | 49.93s | 49.32s | 0.69s | 8/7 | 47,067/15,692/2,605 |
 | `compile-compcert` | 1.0 | 960.91s | 953.13s | 952.26s | 855.66s | 15/14 | 312,242/55,370/3,427 |
+| `crack-7z-hash` | 1.0 | 732.33s | 725.20s | 724.02s | 425.20s | 22/21 | 121,990/38,728/5,253 |
 
 Generated-turn time includes local tool wait; tool wall is a measured subset.
 WebSocket connection and warmup added 0.56--1.31 seconds per task, and Rust
@@ -1500,6 +1502,36 @@ present from the source build; the assertions passed in 0.08 seconds. With a
 shared dependency layer for no measured gain. Raw JSONL and ATIF terminal
 payloads matched, stderr was empty, and there was no exception, retry,
 reconnect, compaction, hosted subagent, injection, or API-reported cost.
+
+`crack-7z-hash` at pinned digest
+`sha256:c5b858a93a842b32c06ce0713d82af10102b7c1a3f3b8d6351c1d0ecb4d47dc9`
+is the second admission in the current batch. Cold preparation compiled the
+task's pinned John the Ripper revision into its native AArch64 image: Harbor
+used 4 minutes 3 seconds and the complete `just prepare-task` command used
+246.21 seconds. The first unchanged low-effort trial passed both canonical
+assertions in 732.33 trial seconds; the complete `just eval-task` command used
+744.74 seconds. Environment startup used 1.61 seconds, agent setup 0.53
+seconds, agent execution 726.37 seconds, canonical verification 0.76 seconds,
+and the remaining pre-verifier and teardown gaps used 2.93 seconds.
+
+Rust used 725.20 seconds, including 724.02 seconds across 22 generated-model
+turns and 425.20 seconds across 21 PTC shell phases. The model initially used
+two 120-second wordlist phases that exhausted their tool timeouts, then a
+165.56-second continuation of the supplied wordlist found the password; this
+task-level search accounts for almost all tool time. Model calls averaged
+32.91 seconds with 12.11-second p50, 131.88-second p95, and 184.17-second
+maximum; mean time to first output was 1.98 seconds. The run consumed 121,990
+input, 38,728 cached-input, and 5,253 output tokens, including 1,024 reasoning
+tokens; warmup used another 1,490 input tokens.
+
+Harbor recorded one completed trial, zero errors or retries, and no exception.
+The raw stream contained exactly one `run.completed`; its terminal payload
+matched ATIF exactly, the one-line input was retained, and agent stderr was
+empty. There was no safety refusal, reconnect, compaction, injection, hosted
+subagent, agent message, or API-reported cost. The canonical verifier passed
+both file-existence and exact-content assertions in 0.01 seconds. No shared
+prompt, runtime, environment, or verifier change was inferred from the long
+solution search.
 
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
