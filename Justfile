@@ -1,5 +1,6 @@
 set dotenv-load := true
 set shell := ["bash", "-euo", "pipefail", "-c"]
+export PYTHONPATH := justfile_directory()
 
 harbor := ".venv/bin/harbor"
 build_profile := env_var_or_default("HARNESS_BUILD_PROFILE", "dev")
