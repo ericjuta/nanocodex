@@ -83,10 +83,12 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The current development slice contains twenty-six public shell/code
-tasks with green low-effort v13 samples. The latest complete-suite checkpoint
-passed all twenty-six tasks together. Browser automation, computer-use, GUI
-interaction, and image/video perception are outside this milestone.
+and tasks. The current development slice contains twenty-seven public
+shell/code tasks with green low-effort v13 samples. The latest 27-task
+full-suite attempt passed 26/27 because Core Wars repeated its earlier failing
+scores; the latest all-green checkpoint passed the preceding twenty-six tasks
+together. Browser automation, computer-use, GUI interaction, and image/video
+perception are outside this milestone.
 Downloaded tasks and canonical verifier assertions remain unchanged.
 
 Candidate admission is evidence-driven. Cold task preparation is measured
@@ -98,6 +100,8 @@ SPARQL task was paid once during preparation and adds no warm-trial
 installation. The active PyPI-server task needs only an exact cached verifier
 command shape and adds no image dependency. Distribution Search uses a pinned
 final NumPy layer paid during preparation and performs no warm-trial install.
+Largest Eigenvalue likewise uses an exact cached pip command and adds no image
+dependency.
 Primer3 support is retained for the deferred DNA experiments, but `dna-insert`
 and `dna-assembly` are excluded from the active gate after respectively scoring
 2/4 and 1/3 across unchanged low-effort samples.
