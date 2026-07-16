@@ -1135,6 +1135,25 @@ regression pass kept Fix Git at 2/2 tests in a 46.63-second trial and OpenSSL at
 6/6 in a 29.91-second trial. Both again had reward 1.0 with zero exceptions,
 retries, and agent stderr.
 
+`qemu-startup` at pinned digest
+`sha256:e9796833ca178d98500b4146d107d947226485065f5a79a1dff2cdf7430f4f95`
+is the next focused admission. Its task-image build was paid during the initial
+115.93-second install-only trial, before the shared verifier overlay exposed
+the legacy-Python failures described above; after those generic corrections,
+the clean install-only job took 9.81 seconds with 7.36 seconds of environment
+setup. The accepted low-effort sample started x86_64 Alpine 3.19 under QEMU,
+waited for the real serial login banner, preserved the background VM, and
+passed the canonical telnet login and `6.6.4-1-lts` kernel check. Its
+122.07-second warm trial used 1.60 seconds for environment startup, 0.52 seconds
+for agent setup, and 2.67 seconds for the unchanged verifier. Rust used 115.47
+seconds, including 114.83 generated-model seconds and 55.73 seconds across
+eight inspection, boot, readiness, and boundary-check tool phases. Nine model
+calls consumed 28,518 input, 13,022 cached-input, and 3,307 output tokens, of
+which 888 were reasoning tokens; warmup used another 1,536 input tokens. No
+compaction, hosted subagent, API-reported cost, exception, retry, or agent
+stderr occurred. The earlier green sample with the verifier setup warning is
+retained as diagnostic evidence but is not the admission sample.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936

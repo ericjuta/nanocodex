@@ -51,6 +51,7 @@ datasets:
       - terminal-bench/build-pmars
       - terminal-bench/prove-plus-comm
       - terminal-bench/custom-memory-heap-crash
+      - terminal-bench/qemu-startup
 
 environment:
   import_path: harbor_adapter.environment:FastDockerEnvironment
