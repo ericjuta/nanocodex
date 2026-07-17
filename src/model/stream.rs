@@ -51,6 +51,22 @@ struct TextDelta<'a> {
     text: &'a str,
 }
 
+struct StreamTiming {
+    started_at: Instant,
+    first_event_ns: Option<u64>,
+    first_output_ns: Option<u64>,
+}
+
+impl StreamTiming {
+    const fn new(started_at: Instant) -> Self {
+        Self {
+            started_at,
+            first_event_ns: None,
+            first_output_ns: None,
+        }
+    }
+}
+
 pub(super) async fn receive<W: Write>(
     socket: &mut ResponsesSocket,
     events: &mut EventWriter<W>,
@@ -58,30 +74,10 @@ pub(super) async fn receive<W: Write>(
     started_at: Instant,
 ) -> Result<TurnResult> {
     let mut done_items = Vec::new();
-    let mut first_event_ns = None;
-    let mut first_output_ns = None;
+    let mut timing = StreamTiming::new(started_at);
 
     loop {
-        let text = socket.next_text_or_idle_timeout().await?;
-        let raw_event = parse_raw_json(text.as_str())?;
-        let elapsed = elapsed_ns(started_at);
-        first_event_ns.get_or_insert(elapsed);
-        events.emit(
-            "api.event",
-            ApiEvent {
-                direction: "inbound",
-                transport: TRANSPORT,
-                phase: "generation",
-                model_call_index: Some(call_index),
-                event: raw_event,
-            },
-        )?;
-        let event = decode_event::<ServerEvent>(raw_event)?;
-        if event.is_output() {
-            first_output_ns.get_or_insert(elapsed);
-        }
-
-        match event {
+        match next_event(socket, events, "generation", call_index, &mut timing).await? {
             ServerEvent::OutputTextDelta { delta } => {
                 events.emit(
                     "assistant.delta",
@@ -117,17 +113,11 @@ pub(super) async fn receive<W: Write>(
                     output_items,
                     code_calls,
                     usage: response.usage,
-                    time_to_first_event_ns: first_event_ns.unwrap_or_default(),
-                    time_to_first_output_ns: first_output_ns,
+                    time_to_first_event_ns: timing.first_event_ns.unwrap_or_default(),
+                    time_to_first_output_ns: timing.first_output_ns,
                 });
             }
-            ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete => {
-                return Err(ResponsesError::Api {
-                    event: raw_event.get().to_owned(),
-                }
-                .into());
-            }
-            ServerEvent::Created | ServerEvent::Other => {}
+            _ => {}
         }
     }
 }
@@ -139,30 +129,10 @@ pub(super) async fn receive_compaction<W: Write>(
     started_at: Instant,
 ) -> Result<CompactionResult> {
     let mut done_items = Vec::new();
-    let mut first_event_ns = None;
-    let mut first_output_ns = None;
+    let mut timing = StreamTiming::new(started_at);
 
     loop {
-        let text = socket.next_text_or_idle_timeout().await?;
-        let raw_event = parse_raw_json(text.as_str())?;
-        let elapsed = elapsed_ns(started_at);
-        first_event_ns.get_or_insert(elapsed);
-        events.emit(
-            "api.event",
-            ApiEvent {
-                direction: "inbound",
-                transport: TRANSPORT,
-                phase: "compaction",
-                model_call_index: Some(call_index),
-                event: raw_event,
-            },
-        )?;
-        let event = decode_event::<ServerEvent>(raw_event)?;
-        if event.is_output() {
-            first_output_ns.get_or_insert(elapsed);
-        }
-
-        match event {
+        match next_event(socket, events, "compaction", call_index, &mut timing).await? {
             ServerEvent::OutputItemDone { item } => done_items.push(item),
             ServerEvent::Completed { mut response } => {
                 let output_items = if response.output.is_empty() {
@@ -189,23 +159,56 @@ pub(super) async fn receive_compaction<W: Write>(
                     status: response.status,
                     item,
                     usage: response.usage,
-                    time_to_first_event_ns: first_event_ns.unwrap_or_default(),
-                    time_to_first_output_ns: first_output_ns,
+                    time_to_first_event_ns: timing.first_event_ns.unwrap_or_default(),
+                    time_to_first_output_ns: timing.first_output_ns,
                 });
             }
-            ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete => {
-                return Err(ResponsesError::Api {
-                    event: raw_event.get().to_owned(),
-                }
-                .into());
-            }
-            ServerEvent::Created
-            | ServerEvent::OutputTextDelta { .. }
-            | ServerEvent::ReasoningSummaryTextDelta { .. }
-            | ServerEvent::ReasoningSummaryDelta { .. }
-            | ServerEvent::Other => {}
+            _ => {}
         }
     }
+}
+
+async fn next_event<W: Write>(
+    socket: &mut ResponsesSocket,
+    events: &mut EventWriter<W>,
+    phase: &'static str,
+    call_index: u32,
+    timing: &mut StreamTiming,
+) -> Result<ServerEvent> {
+    let text = socket.next_text_or_idle_timeout().await?;
+    let raw_event = parse_raw_json(text.as_str())?;
+    let elapsed = elapsed_ns(timing.started_at);
+    timing.first_event_ns.get_or_insert(elapsed);
+    events.emit(
+        "api.event",
+        ApiEvent {
+            direction: "inbound",
+            transport: TRANSPORT,
+            phase,
+            model_call_index: Some(call_index),
+            event: raw_event,
+        },
+    )?;
+    let event = decode_event::<ServerEvent>(raw_event)?;
+    if matches!(
+        event,
+        ServerEvent::OutputTextDelta { .. }
+            | ServerEvent::ReasoningSummaryTextDelta { .. }
+            | ServerEvent::ReasoningSummaryDelta { .. }
+            | ServerEvent::OutputItemDone { .. }
+    ) {
+        timing.first_output_ns.get_or_insert(elapsed);
+    }
+    if matches!(
+        event,
+        ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete
+    ) {
+        return Err(ResponsesError::Api {
+            event: raw_event.get().to_owned(),
+        }
+        .into());
+    }
+    Ok(event)
 }
 
 fn code_calls(items: &[Value]) -> Result<Vec<CodeCall>> {

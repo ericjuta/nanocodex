@@ -54,18 +54,6 @@ pub(in crate::model) enum ServerEvent {
     Other,
 }
 
-impl ServerEvent {
-    pub(in crate::model) const fn is_output(&self) -> bool {
-        matches!(
-            self,
-            Self::OutputTextDelta { .. }
-                | Self::ReasoningSummaryTextDelta { .. }
-                | Self::ReasoningSummaryDelta { .. }
-                | Self::OutputItemDone { .. }
-        )
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(tag = "type")]
 pub(in crate::model) enum WarmupServerEvent {
