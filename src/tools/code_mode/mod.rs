@@ -112,6 +112,8 @@ enum RuntimeEvent {
         cell_id: u64,
         message: String,
         #[serde(default)]
+        content: Vec<ToolOutputContent>,
+        #[serde(default)]
         stored: HashMap<String, Value>,
     },
 }
@@ -146,6 +148,7 @@ enum CellOutcome {
     },
     ScriptFailed {
         message: String,
+        content: Vec<ToolOutputContent>,
         stored: HashMap<String, Value>,
         nested_calls: Vec<NestedToolCall>,
     },
@@ -439,15 +442,16 @@ async fn finish_cell(
         }
         Ok(CellOutcome::ScriptFailed {
             message,
+            mut content,
             stored,
             nested_calls,
         }) => {
             state.live_cell = None;
             state.stored = stored;
-            let content = output::truncate_content(
-                vec![ToolOutputContent::InputText { text: message }],
-                max_output_tokens,
-            );
+            content.push(ToolOutputContent::InputText {
+                text: format!("Script error:\n{message}"),
+            });
+            let content = output::truncate_content(content, max_output_tokens);
             CodeModeExecution {
                 output: with_status("Script failed", wall_time, content),
                 success: false,
@@ -612,11 +616,13 @@ impl NodeHost {
                         }
                         RuntimeEvent::Error {
                             message,
+                            content,
                             stored,
                             ..
                         } => {
                             return Ok(CellOutcome::ScriptFailed {
                                 message,
+                                content,
                                 stored,
                                 nested_calls: ordered_calls(completed_calls),
                             });

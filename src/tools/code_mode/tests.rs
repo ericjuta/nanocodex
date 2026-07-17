@@ -95,18 +95,62 @@ async fn image_helper_requires_data_urls() -> Result<()> {
         )
         .await;
     assert!(!remote.success);
-    assert!(execution_output(&remote).contains(
-        "Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead"
+    let remote_output = execution_output(&remote);
+    assert!(remote_output.contains(
+        "Script error:\nTool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead"
     ));
+    assert!(!remote_output.contains("at image"));
 
     let invalid = tools
         .execute_code(r#"image("not-an-image");"#, test_context(&history))
         .await;
     assert!(!invalid.success);
-    assert!(
-        execution_output(&invalid)
-            .contains("Tool call failed: invalid image output. Pass a base64 data URI instead")
-    );
+    let invalid_output = execution_output(&invalid);
+    assert!(invalid_output.contains(
+        "Script error:\nTool call failed: invalid image output. Pass a base64 data URI instead"
+    ));
+    assert!(!invalid_output.contains("at image"));
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cell_preserves_accumulated_output() -> Result<()> {
+    let workspace = temporary_workspace("failed-cell-output")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+text("before crash");
+image("data:image/png;base64,a", "original");
+throw new Error("boom");
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(!execution.success);
+    let ToolOutputBody::Content(content) = &execution.output else {
+        return Err(eyre!("code-mode execution did not emit content"));
+    };
+    assert!(matches!(
+        content.get(1),
+        Some(ToolOutputContent::InputText { text }) if text == "before crash"
+    ));
+    assert!(matches!(
+        content.get(2),
+        Some(ToolOutputContent::InputImage {
+            image_url,
+            detail: crate::tools::ImageDetail::Original,
+        }) if image_url == "data:image/png;base64,a"
+    ));
+    assert!(matches!(
+        content.get(3),
+        Some(ToolOutputContent::InputText { text })
+            if text.starts_with("Script error:\nError: boom\n")
+    ));
 
     std::fs::remove_dir_all(workspace)?;
     Ok(())

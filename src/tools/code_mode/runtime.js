@@ -117,22 +117,22 @@ async function runCell(init) {
       imageUrl = value.image_url;
       embeddedDetail = value.detail;
     } else {
-      throw new TypeError(imageHelperExpects);
+      throw imageHelperExpects;
     }
 
     if (!imageUrl) {
-      throw new TypeError(imageHelperExpects);
+      throw imageHelperExpects;
     }
     const separator = imageUrl.indexOf(":");
     if (separator < 0) {
-      throw new TypeError(invalidImageOutput);
+      throw invalidImageOutput;
     }
     const scheme = imageUrl.slice(0, separator).toLowerCase();
     if (scheme === "http" || scheme === "https") {
-      throw new TypeError(remoteImageOutput);
+      throw remoteImageOutput;
     }
     if (scheme !== "data") {
-      throw new TypeError(invalidImageOutput);
+      throw invalidImageOutput;
     }
 
     const selectedDetail = detail != null
@@ -141,11 +141,11 @@ async function runCell(init) {
         ? embeddedDetail
         : "auto";
     if (typeof selectedDetail !== "string") {
-      throw new TypeError("image detail must be one of: auto, low, high, original");
+      throw "image detail must be one of: auto, low, high, original";
     }
     const normalizedDetail = selectedDetail.toLowerCase();
     if (!imageDetails.has(normalizedDetail)) {
-      throw new TypeError("image detail must be one of: auto, low, high, original");
+      throw "image detail must be one of: auto, low, high, original";
     }
 
     content.push({
@@ -223,6 +223,7 @@ async function runCell(init) {
       type: "error",
       cell_id: init.cell_id,
       message,
+      content,
       stored: Object.fromEntries(stored),
     });
   } finally {
