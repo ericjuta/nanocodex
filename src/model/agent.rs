@@ -180,7 +180,7 @@ impl ConversationState {
             .first()
             .cloned()
             .ok_or(AgentError::MalformedResponse {
-                detail: "task input did not include initial project context",
+                detail: "task input did not include initial context",
             })?;
         Ok(Self {
             initial_context,

@@ -1,3 +1,4 @@
+use chrono::{Local, Utc};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -6,8 +7,6 @@ use crate::{
     protocol::Task,
     tools::{ToolOutputBody, ToolRuntime},
 };
-
-const PROJECT_CONTEXT_HEADER: &str = "# Project context";
 
 pub(in crate::model) struct RequestProfile {
     prompt_cache_key: String,
@@ -57,10 +56,24 @@ pub(in crate::model) fn task_input(
     workspace: &str,
     project_instructions: Option<&str>,
 ) -> Vec<Value> {
-    let mut context = vec![json!({
-        "type": "input_text",
-        "text": PROJECT_CONTEXT_HEADER,
-    })];
+    let (current_date, timezone) = local_time_context();
+    task_input_with_time_context(
+        task,
+        workspace,
+        project_instructions,
+        &current_date,
+        &timezone,
+    )
+}
+
+fn task_input_with_time_context(
+    task: &Task,
+    workspace: &str,
+    project_instructions: Option<&str>,
+    current_date: &str,
+    timezone: &str,
+) -> Vec<Value> {
+    let mut context = Vec::with_capacity(2);
     if let Some(project_instructions) = project_instructions {
         context.push(json!({
             "type": "input_text",
@@ -71,9 +84,7 @@ pub(in crate::model) fn task_input(
     }
     context.push(json!({
         "type": "input_text",
-        "text": format!(
-            "<environment_context>\n<cwd>{workspace}</cwd>\n<shell>/bin/sh</shell>\n</environment_context>"
-        ),
+        "text": environment_context(workspace, current_date, timezone),
     }));
     vec![
         json!({
@@ -90,6 +101,44 @@ pub(in crate::model) fn task_input(
             }],
         }),
     ]
+}
+
+fn local_time_context() -> (String, String) {
+    match iana_time_zone::get_timezone() {
+        Ok(timezone) => (Local::now().format("%Y-%m-%d").to_string(), timezone),
+        Err(_) => (
+            Utc::now().format("%Y-%m-%d").to_string(),
+            "Etc/UTC".to_owned(),
+        ),
+    }
+}
+
+fn environment_context(workspace: &str, current_date: &str, timezone: &str) -> String {
+    let mut context = String::from("<environment_context>\n  <cwd>");
+    push_xml_escaped_text(&mut context, workspace);
+    context.push_str("</cwd>\n  <shell>sh</shell>\n  <current_date>");
+    push_xml_escaped_text(&mut context, current_date);
+    context.push_str("</current_date>\n  <timezone>");
+    push_xml_escaped_text(&mut context, timezone);
+    context.push_str("</timezone>\n  <filesystem><workspace_roots><root>");
+    push_xml_escaped_text(&mut context, workspace);
+    context.push_str(
+        "</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>",
+    );
+    context
+}
+
+fn push_xml_escaped_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            _ => output.push(character),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -163,6 +212,7 @@ impl<'a> ResponseCreate<'a> {
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
                 effort: config.effort.as_str(),
+                summary: "auto",
                 context: "all_turns",
             },
             store: false,
@@ -200,6 +250,7 @@ pub(in crate::model) fn function_tool_output(call_id: &str, output: &ToolOutputB
 #[derive(Clone, Copy, Serialize)]
 struct ReasoningControls {
     effort: &'static str,
+    summary: &'static str,
     context: &'static str,
 }
 
@@ -225,6 +276,48 @@ mod tests {
     use crate::model::ReasoningEffort;
 
     #[test]
+    fn task_input_matches_codex_context_shape() {
+        let task = Task {
+            instruction: "fix the bug".to_owned(),
+            workspace: None,
+        };
+
+        assert_eq!(
+            task_input_with_time_context(
+                &task,
+                "/workspace/a&b",
+                Some("Follow the project formatter."),
+                "2026-07-17",
+                "America/Los_Angeles",
+            ),
+            vec![
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "# AGENTS.md instructions for /workspace/a&b\n\n<INSTRUCTIONS>\nFollow the project formatter.\n</INSTRUCTIONS>",
+                        },
+                        {
+                            "type": "input_text",
+                            "text": "<environment_context>\n  <cwd>/workspace/a&amp;b</cwd>\n  <shell>sh</shell>\n  <current_date>2026-07-17</current_date>\n  <timezone>America/Los_Angeles</timezone>\n  <filesystem><workspace_roots><root>/workspace/a&amp;b</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>",
+                        },
+                    ],
+                }),
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "fix the bug",
+                    }],
+                }),
+            ],
+        );
+    }
+
+    #[test]
     fn prompt_cache_key_is_scoped_to_the_session() {
         let config = ModelConfig {
             model: "test-model".to_owned(),
@@ -247,6 +340,7 @@ mod tests {
         assert_eq!(request["generate"], false);
         assert!(request.get("tools").is_none());
         assert!(request.get("instructions").is_none());
+        assert_eq!(request["reasoning"]["summary"], "auto");
         assert!(request["reasoning"].get("mode").is_none());
         assert!(request.get("context_management").is_none());
     }

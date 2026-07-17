@@ -7,11 +7,13 @@ publish = false
 
 [dependencies]
 base64 = "0.22.1"
+chrono = "0.4.43"
 clap = { version = "4.5.54", features = ["derive", "env"] }
 dotenvy = "0.15.7"
 eyre = "0.6.12"
 futures-util = "0.3.31"
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "pnm", "webp"] }
+iana-time-zone = "0.1.64"
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal"] }
 portable-pty = "0.9.0"
 serde = { version = "1.0.228", features = ["derive"] }
