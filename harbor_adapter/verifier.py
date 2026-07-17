@@ -9,6 +9,7 @@ from harbor.utils.env import resolve_env_vars
 from harbor.verifier.verifier import Verifier
 
 _POV_VERIFIER_SITE_PACKAGES = "/opt/harness-verifier/pov"
+_PARQUET_VERIFIER_SITE_PACKAGES = "/opt/harness-verifier/parquet"
 
 
 class PytestVerifier(Verifier):
@@ -87,6 +88,9 @@ class PytestVerifier(Verifier):
             "uvx() { "
             "local verifier_pythonpath=; "
             'case "$*" in '
+            '"-p 3.13 -w pytest==8.4.1 -w pandas==2.3.3 '
+            '-w pyarrow==22.0.0 -w pytest-json-ctrf==0.3.5 pytest "*) '
+            f'verifier_pythonpath={_PARQUET_VERIFIER_SITE_PACKAGES} ;; '
             '"-p 3.13 -w pytest==8.4.1 -w pytest-json-ctrf==0.3.5 pytest "*|'
             '"-p 3.13 -w pytest==8.4.1 -w pip==25.2 '
             '-w pytest-json-ctrf==0.3.5 pytest "*|'

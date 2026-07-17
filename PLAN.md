@@ -29,13 +29,12 @@ The Python `BaseInstalledAgent` integration is only a lifecycle adapter:
 upload one static executable, run it headlessly, retain JSONL, and derive ATIF.
 Rust performs API calls and tools directly inside the task container.
 
-The governing runtime constraint is hosted-first. OpenAI owns model reasoning,
-the Programmatic Tool Calling JavaScript runtime, root/subagent orchestration,
-stored response state, prompt caching, and compaction. Rust owns the narrow
-capabilities that must touch the Harbor task container: JSONL, local tools,
-bounded process cleanup, reconnect replay, and API-visible measurements. Do not
-grow a local agent scheduler, transcript manager, compactor, or second eval
-record.
+OpenAI owns model reasoning and prompt caching. Rust owns the ordered
+conversation history, WebSocket lifecycle, JSONL, local code-mode dispatch,
+common tools, bounded process cleanup, reconnect replay, and API-visible
+measurements. One lazily spawned local Node.js host executes all `exec` cells
+for a run and Rust dispatches independent nested calls concurrently. Do not grow
+a local agent scheduler, compactor, provider abstraction, or second eval record.
 
 Local artifacts are built by a native-architecture Linux BuildKit container.
 Cargo `dev` is the default; `HARNESS_BUILD_PROFILE=profiling` selects an
@@ -95,73 +94,50 @@ Status: first real model/tool vertical slice complete.
 1. Target `gpt-5.6-sol` directly through the Responses API. Do not add a
    provider interface, alternate model path, HTTP/SSE fallback, or legacy wire
    compatibility.
-2. Keep one persistent Responses WebSocket connection. Streaming is implicit;
-   do not send the HTTP `stream` field. Prewarm the stable instructions and
-   tools with empty input and `generate: false`, continue incrementally with
-   `previous_response_id`, and preserve every raw inbound and outbound API
-   event.
-3. Keep the common local tool surface exclusively behind hosted Programmatic
-   Tool Calling with `allowed_callers: ["programmatic"]`. Rust executes typed
-   `function_call` items and returns typed `function_call_output` items with
-   the original PTC caller. OpenAI runs the generated JavaScript; Rust never
-   does.
-4. Treat one generated JavaScript program as a bounded mechanical phase. Use
-   `Promise.all` for independent reads, sequence dependent work and mutations,
-   reduce intermediate results in hosted JavaScript, retry transient work at
-   most once, and return to the model only for semantic judgment. Preserve
-   every `program`, `program_output`, `call_id`, and `caller` relationship.
-5. A completed response is not a completed task until the root emits a final
-   assistant message. A response containing only program or tool work
-   continues from its response ID.
-6. Use `store: true` with `previous_response_id` so the server owns the response
-   chain and a reconnect can resend the same incremental continuation. Capture
-   `x-codex-turn-state` from the handshake or `response.metadata`, replay it
-   unchanged in WebSocket `client_metadata`, and send it on a same-turn
-   reconnect. Do not maintain or replay a parallel local transcript.
-7. Enable server-side compaction through `context_management` on every
-   generated response. Preserve opaque compaction items in API order; never
-   interpret, reorder, or replace them with a local natural-language summary.
-   Seed the quality-first profile near 350K tokens and evaluate a cost-sensitive
-   profile just below GPT-5.6 Sol's 272K long-context pricing boundary.
-8. Follow Codex's automatic GPT-5.6 prompt caching behavior. Keep exact base
-   instructions, tools, and contextual input in stable order, use the raw
-   run/session ID as `prompt_cache_key` for every request in the response chain,
-   and let the server cache the longest growing prefix without explicit cache
-   options or breakpoints. Record `cached_tokens` and `cache_write_tokens`.
-9. Use `reasoning.context: "all_turns"` while task goals remain stable. Keep
-   `reasoning.mode: "standard"` for the interactive tool loop and make effort a
-   CLI/eval setting: low for the fast smoke loop, max only when the measured
-   quality gain warrants its latency and cost.
-10. Keep hosted Responses Multi-agent opt-in with `--multi-agent`; selecting it
-    is appropriate when the user explicitly asks for delegation or a genuinely
-    difficult task has independent workstreams. Do not spawn for routine,
-    short, or sequential work. Start with three concurrent subagents. OpenAI
-    owns spawning, messaging, waiting, interruption, contexts, scheduling, and
-    result delivery.
-11. Keep PTC and Multi-agent as separate request profiles. PTC is the default
-    for predictable mechanical control flow. The current live API rejects
-    `response.inject` for PTC-nested calls (`caller.type = "program"`) while a
-    Multi-agent response is active, so the Multi-agent profile exposes the same
-    `exec_command` function to direct callers and omits PTC. Do not hide this
-    compatibility boundary behind retries or a local orchestration fallback.
-12. In Multi-agent WebSocket turns, execute each direct local call and send its
-    output with `response.inject` as soon as it is ready so the waiting agent
-    can resume. In PTC turns, continue the stored response with the typed output
-    and `previous_response_id`. Preserve caller and agent attribution plus
-    injection acknowledgement in JSONL.
-13. Multi-agent does not support `reasoning.summary`. Preserve exposed root and
-    agent messages, encrypted content, and raw events honestly; never claim to
-    have captured hidden chain of thought. If a later single-agent mutation
-    phase requests an API-visible summary, label it as a summary.
-14. Record model, mode, effort, response and agent IDs, cache activity, tokens,
-    latency, tool execution, injections, retries, and compactions in JSONL and
-    the Harbor-derived ATIF. Harbor remains the eval record.
+2. Keep one persistent Responses WebSocket connection. Send `stream: true`.
+   Best-effort prewarm the stable Responses Lite prefix with `generate: false`;
+   normal requests omit `generate`. If setup fails, replace the socket and send
+   a normal full first request without `previous_response_id`. Preserve every
+   raw inbound and outbound API event.
+3. Follow Codex's Responses Lite request shape. Put one `additional_tools`
+   developer item followed by the developer system message at the start of
+   input. Omit top-level `tools` and `instructions`, and set
+   `parallel_tool_calls: false`.
+4. Expose only the custom freeform `exec` tool to the model. Run its raw
+   JavaScript through one local Node.js host reused for the run and inject the
+   common Rust tools through the `tools` object. Execute independent nested
+   calls concurrently. Native runs use `node` from `PATH`; the shared Harbor
+   eval-image overlay installs the distribution's `nodejs` package. The Rust
+   executable does not download or bundle a runtime.
+5. Use `store: false` and retain the complete ordered logical history locally.
+   Preserve model output items and encrypted reasoning, but remove top-level
+   response item IDs before replay just as Codex does when item IDs are not
+   enabled.
+6. On a healthy WebSocket, use `previous_response_id` only as a transport
+   compression mechanism and send the strict input delta. If the socket is
+   replaced, clear the response ID and replay the full Responses Lite prefix
+   plus local history.
+7. Keep exact base instructions, tools, and contextual input in stable order.
+   Use the raw run/session ID as `prompt_cache_key` throughout the run and do
+   not send explicit cache options or breakpoints. Record cached and cache-write
+   token counts.
+8. Capture `x-codex-turn-state` from handshake metadata or
+   `response.metadata` and include it in WebSocket `client_metadata`. Also send
+   Codex's Responses Lite WebSocket metadata marker.
+9. Include `reasoning.encrypted_content`, use
+   `reasoning.context: "all_turns"`, omit `reasoning.mode` and server
+   `context_management`, and keep effort as a CLI/eval setting.
+10. A response containing `exec` calls continues with
+    `custom_tool_call_output`; a task completes only when a response has no tool
+    calls and contains a final assistant message. Record model, cache, timing,
+    code-mode, nested-tool, retry, and connection data in JSONL and derived
+    ATIF. Harbor remains the eval record.
 
 Gate: at least one Terminal-Bench task completes with a real OpenAI-driven tool
 loop, canonical reward, raw API events, and trustworthy usage/timing metadata.
 
-Gate achieved twice on Terminal-Bench `fix-git`. The final regression run earned
-reward `1.0` with 9 model calls, 8 PTC shell calls, 29.5 seconds inside Rust,
+Gate achieved twice on Terminal-Bench `fix-git`. The historical regression run
+earned reward `1.0` with 9 model calls, 8 shell calls, 29.5 seconds inside Rust,
 and 35 seconds of Harbor runtime. It used 24,186 input tokens (17,712 cached),
 4,546 cache-write tokens, and 1,086 output tokens. The benchmark task and
 verifier were not modified.
@@ -188,10 +164,9 @@ new framework layers whose main effect is moving code around.
    values for one-off static tool schemas where dedicated serde types only add
    lines. Do not add event buses, channels, collector traits, or shared mutable
    statistics.
-5. Keep a deliberately one-shot subset of Codex's `exec_command` function:
-   `cmd`, `workdir`, `login`, `timeout_ms`, and `max_output_tokens`, with a
-   structured output schema. Do not advertise PTY sessions, `write_stdin`,
-   approval fields, or yield behavior until the runtime implements them.
+5. Keep the common tool surface as boxed asynchronous Rust handlers behind
+   local code mode. Expose only fields and lifecycle behavior the handlers
+   implement; do not add approval or provider compatibility fields.
 6. Collapse redundant model-stream state and processing: consume completed
    output once, remove unread response state and unused error variants, move
    owned function calls into concurrent execution instead of cloning them, and
@@ -215,52 +190,10 @@ event per accepted request, long command output remains memory-bounded,
 timed-out commands leave no descendant processes, and the cleanup produces a
 material net reduction in Rust LOC.
 
-## Milestone 1.2: hosted API compatibility matrix
-
-Status: complete.
-
-Before treating the hosted surface as the eval baseline, prove its combined
-event matrix with one real vertical smoke rather than separate mocks:
-
-1. Open ordinary WebSockets with
-   `OpenAI-Beta: responses_websockets=2026-02-06`; append
-   `responses_multi_agent=v1` only for Multi-agent WebSockets. Send the stable
-   session ID as the session, thread, and client-request identity. Warm each
-   exact stable prompt/tool profile with `generate: false`, then chain from that
-   response ID.
-2. Prove the default PTC profile with a hosted JavaScript program, one
-   programmatic `exec_command`, caller-preserving continuation, and one final
-   assistant message.
-3. Prove the opt-in Multi-agent profile with one named subagent, one direct
-   `exec_command`, an accepted live `response.inject`, agent attribution, and
-   one `/root` final answer.
-4. Retain the negative compatibility evidence that a PTC-nested output is
-   rejected as “not ready for an output” under Multi-agent, rather than adding
-   an arbitrary retry or claiming the combination works.
-5. Use a deliberately low smoke-only threshold to force automatic compaction,
-   then continue to one final root assistant message.
-6. Inspect raw JSONL, cache/usage metrics, continuation or injection timing,
-   compaction event ordering, and the final task result. Retain the Harbor
-   trajectory; do not create a fixture or local journal until a demonstrated
-   regression needs one.
-
-Gate: both supported profiles complete without Python tool plumbing, the
-unsupported composition is explicit, Rust emits exactly one task terminal, and
-all non-API wall time is measured.
-
-The live gate passed on both profiles. The PTC smoke used one hosted program,
-one caller-linked `exec_command`, one stored-response continuation, and a final
-message. The Multi-agent smoke spawned one named subagent, accepted one direct
-tool-output injection, and returned one `/root` final answer. At a smoke-only
-1,500-token threshold, the latter also emitted six generation-time compaction
-items and completed; 27.2 of 27.9 seconds were model/API time while the local
-shell used about 20 milliseconds. PTC-nested injection was tested separately
-and reproducibly rejected, which is why it is not a supported profile.
-
 ## Milestone 2: eval-driven tuning
 
-Status: in progress. Thirty-six public tasks are active with green low-effort
-PTC samples under the current `openai-coding-v13` prompt. The first required
+Status: in progress. Thirty-seven public tasks are active under the current
+Codex-derived prompt. The first required
 35-task gate completed every trial without an exception or retry and scored
 34/35; its only miss exposed verifier-package contamination rather than a
 model failure. The verifier dependencies are now isolated, the affected
@@ -1261,20 +1194,18 @@ correctly reported an agent exception. After a 127.34-second local VM tool
 phase, the server had normally closed the idle WebSocket; the next stored
 continuation failed before transmission with Tungstenite
 `ConnectionClosed`, so Rust emitted `run.failed` even though the workspace was
-valid. The runtime now retries only that unambiguous pre-stream boundary (and
-`AlreadyClosed`): it opens one new WebSocket and resends the exact
-`store: true` request with its existing `previous_response_id`. It does not
-retry arbitrary I/O failures, mid-stream reads, or Multi-agent injections.
-This follows the Responses WebSocket reconnect contract and the comparable
-closed-connection path in Codex's `core/src/client.rs` and
-`codex-api/src/endpoint/responses_websocket.rs` without importing Codex's HTTP
-fallback or provider machinery.
+valid. The current `store: false` runtime retries that unambiguous pre-stream
+boundary by opening a new WebSocket, clearing `previous_response_id`, and
+replaying the full locally owned history. It does not reuse a response ID
+across connections.
 
-A deterministic two-connection test closes the first socket while a local
-tool is running, then proves that the second request retains both the stored
-response ID and tool output. Connection attempts, successful reconnects, and
-connection wall time are now present in terminal JSONL and Harbor/ATIF
-metadata. The fresh real QEMU trial passed its canonical check with a normal
+A deterministic two-connection regression closes the first socket after an
+`exec` response, then proves that the second request contains the stable
+Responses Lite prefix, all logical history, the tool result, and no server
+item IDs or `previous_response_id`. Connection attempts, successful
+reconnects, and connection wall time remain present in terminal JSONL and
+Harbor/ATIF metadata. The historical fresh real QEMU trial passed its canonical
+check with a normal
 `run.completed`, zero exceptions, retries, or stderr, and no reconnect needed
 in that particular sample. Its 245-second Harbor trial spent 237.09 seconds in
 Rust, 236.51 seconds in generated-model turns, and 169.48 seconds in five
@@ -1531,6 +1462,102 @@ shared dependency layer for no measured gain. Raw JSONL and ATIF terminal
 payloads matched, stderr was empty, and there was no exception, retry,
 reconnect, compaction, hosted subagent, injection, or API-reported cost.
 
+### Responses Lite/Codex parity gate (2026-07-16)
+
+The current local Codex checkout established that a model turn is not bounded
+by a fixed number of model calls. `codex-rs/core/src/session/turn.rs` keeps the
+tool-follow-up loop running until completion or cancellation and compacts at
+the context limit. The harness's fixed 32-call ceiling was therefore removed
+from the Rust runtime, CLI, Harbor adapter, and eval configuration. A focused
+mock regression now drives 33 tool-producing responses and completes on model
+call 34.
+
+The literal 36-task harness job at
+`.harness/harbor/jobs/2026-07-16__17-20-40` completed in 11 minutes 29 seconds
+and scored 28/36 before the fix; CompCert was its only exception and stopped
+at the artificial ceiling. The unchanged fixed CompCert rerun at
+`.harness/harbor/jobs/2026-07-16__17-34-05` passed all assertions after 40
+model calls and 78 outer-plus-nested tool calls. It used 1,575,977 input,
+1,518,293 cached-input, and 4,225 output tokens over 883.01 Rust seconds, with
+no exception, reconnect, compaction, or stderr. An unchanged POV-Ray retry at
+`.harness/harbor/jobs/2026-07-16__18-20-37` also passed 3/3 after replacing the
+noncanonical ZIP layout with the authentic TAR.Z source tree.
+
+Substituting those two focused revalidations into the full task matrix yields
+30/36 for the current harness, with the same six misses as the valid Codex
+0.144.5 comparison at
+`.harness/harbor/jobs/20260716-codex-0.144.5-full-2`. Codex completed 30/36
+with zero exception or retry in 22 minutes 19 seconds. This substitution is a
+paired diagnostic, not a second full-suite score; the original full job and
+both focused jobs remain separate records. The only original outcome
+difference was POV-Ray archive selection, and the unchanged retry recovered
+it without a benchmark-specific prompt.
+
+Across the revalidated 36-task matrix, the harness used 5,075,084 input tokens
+with 4,583,442 cached (90.3%) and 95,708 output tokens across 380 model calls.
+Codex used 9,300,633 input with 8,633,709 cached (92.8%) and 114,136 output
+tokens across 513 model calls, reporting $11.08. The harness API did not report
+cost. On the 30 tasks both systems passed, the harness was faster on 20,
+totaled 2,750.05 agent-seconds versus Codex's 2,819, and had a 46.68-second
+median versus 59.50 seconds. All harness event streams were monotonic, paired
+every tool call with a result, and ended in exactly one terminal event. No
+reconnect or compaction was needed. This meets the parity gate for continuing
+one-at-a-time public task admission while retaining the six shared misses as
+solution-quality work rather than changing the common runtime around them.
+
+`crack-7z-hash` at pinned digest
+`sha256:c5b858a93a842b32c06ce0713d82af10102b7c1a3f3b8d6351c1d0ecb4d47dc9`
+is the next admission after the parity gate and the thirty-seventh active task.
+Its install-only preparation at
+`.harness/harbor/setup/2026-07-16__18-22-46-prepare-crack-7z-hash-49343`
+completed in 30.54 seconds with no model or verifier work. The unchanged
+low-effort trial at
+`.harness/harbor/jobs/2026-07-16__18-23-24-crack-7z-hash-49717` then passed
+both canonical assertions in 5 minutes 51 seconds with zero exception or
+retry.
+
+Rust used 347.29 seconds, including 212.20 seconds in generated-model turns
+and 134.70 seconds in outer-plus-nested tool wall. Twenty-four model calls and
+46 paired tool events consumed 657,713 input, 625,414 cached-input (95.1%),
+32,227 cache-write, and 2,746 output tokens. The model performed real archive
+inspection and wordlist search, extracted the requested file, and checked the
+final output; no benchmark-specific prompt or runtime path was added. The raw
+stream was monotonic with one `run.completed`, all tool calls had results,
+stderr was empty, and there was no reconnect or compaction.
+
+The matched Codex 0.144.5 trial at
+`.harness/harbor/jobs/2026-07-16__23-31-19-crack-7z-hash-codex-` also passed
+both assertions. Codex agent work took 626.23 seconds across 36 model calls,
+used 659,998 input, 636,252 cached-input (96.4%), and 3,596 output tokens, and
+reported $0.54. Its trajectory initially spent time in a slow John run before
+switching to direct archive tests; the harness trajectory parallelized those
+tests and completed 278.94 seconds sooner.
+
+`multi-source-data-merger` is the thirty-eighth active task. Cold preparation
+at `.harness/harbor/setup/2026-07-16__23-43-22-prepare-multi-source-data-merger-88805`
+took 58 seconds. The first unchanged harness answer was correct and
+self-validated, but its canonical verifier never ran because the cached
+verifier rejected the task's pandas/PyArrow `uvx` command. The exact pinned
+`pandas==2.3.3` and `pyarrow==22.0.0` stack now lives under the isolated
+`/opt/harness-verifier/parquet` overlay and is selected only for that canonical
+command shape, preserving task-interpreter packages.
+
+After a 9-second overlay preparation, the unchanged harness retry at
+`.harness/harbor/jobs/2026-07-16__23-46-33-multi-source-data-merger-90529`
+passed all 3 assertions. Agent work took 26.49 seconds over 5 model calls and 8
+outer-plus-nested tool events, using 30,246 input, 22,642 cached-input (74.9%),
+7,589 cache-write, and 1,955 output tokens. The matched Codex 0.144.5 trial at
+`.harness/harbor/jobs/2026-07-16__23-47-24-multi-source-data-merger-codex-91000`
+also passed all 3 assertions in 29.07 agent-seconds over 3 model calls and 2
+tool calls, using 29,265 input, 18,144 cached-input (62.0%), and 1,654 output
+tokens. The harness stream was monotonic with one terminal event, empty stderr,
+and no exception, reconnect, or compaction.
+
+The sibling branch's later six-worker gate reproduced RStan's sampler-thinning
+semantic miss, so its historical focused green result is not sufficient to
+import that admission. Select and revalidate the third task in this batch on
+the current runtime before the next full-suite gate.
+
 The scheduler was the main trajectory-variance outlier in the earlier 20-task
 gate: it stayed green but used 14/13 model/tool rounds, 207.04 generated-model
 seconds, and 238,230 input tokens, versus 7/6 rounds, 145.58 seconds, and 51,936
@@ -1596,6 +1623,34 @@ add a second event journal, WAL, artifact graph, or hunk index first.
 After checkpoint links work, add verifier/grader subagents, bounded autoresearch
 loops, user-defined taste constraints, and hunk-oriented human review. Reuse an
 existing UI only if it cleanly exposes trace links; keep the CLI as the control.
+
+### JJ and human-review lifecycle
+
+Codex's `TurnDiffTracker` is a useful reference for live presentation, not a
+replacement for review provenance. It reduces exact, text-only `apply_patch`
+deltas into one in-memory net diff for the current user turn. It does not capture
+arbitrary shell mutations, persist a complete workspace tree, or provide stable
+revision and blob identities for later comments. Harness should not add a
+competing durable diff tracker: JJ is the authoritative snapshot history, and
+any future live diff is a disposable projection reconciled at the next JJ
+checkpoint.
+
+Checkpoint one coherent agent mutation batch rather than every tool call. Each
+new JJ change records its parent plus the causal request and exact JSONL sequence
+interval. A Neovim review binds each comment thread to the observed JJ change,
+commit, blob, side, and line context. A subsequent agent response creates a new
+child change and may mark the thread `addressed_by` that change; only the human
+reviewer may resolve, refine, reopen, dismiss, or finally accept the thread.
+Non-code answers link to their response sequence without creating an empty JJ
+change.
+
+Neovim should expose both the cumulative review (`baseline -> current tip`) and
+the latest response patch (`previous reviewed tip -> current tip`). Final
+acceptance requires the reviewed tip to equal the workspace tip, every actionable
+thread to be resolved or explicitly dismissed, no resolution to be stale after
+overlapping later edits, and validation evidence to correspond to that tip. JJ
+retains the granular provenance stack; a later Git export may synthesize focused
+commits without making Git the review-state journal.
 
 ## Deferred
 

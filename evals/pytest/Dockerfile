@@ -22,6 +22,7 @@ RUN find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
         curl \
         expect \
         git \
+        nodejs \
         openssh-client \
         python3 \
         python-is-python3 \
@@ -55,6 +56,13 @@ RUN if python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then \
             pillow==11.1.0 \
             numpy==2.3.1 \
             scikit-image==0.25.0; \
+    fi
+# Keep the canonical data-merger verifier's newer dataframe stack isolated
+# from task environments that intentionally pin older pandas or PyArrow.
+RUN if python -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then \
+        uv pip install --target /opt/harness-verifier/parquet --no-cache \
+            pandas==2.3.3 \
+            pyarrow==22.0.0; \
     fi
 # Canonical tests sometimes reinstall an already pinned package only to undo
 # possible agent edits. Preserve that guard without repeating expensive TeX

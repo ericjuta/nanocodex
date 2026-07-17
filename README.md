@@ -2,14 +2,13 @@
 
 A small Rust coding-agent harness built around Harbor and the OpenAI API.
 It currently runs `gpt-5.6-sol` over the Responses API WebSocket transport.
-Programmatic Tool Calling (PTC) is the default orchestration profile; hosted
-Multi-agent is an explicit profile for requested delegation or hard parallel
-work.
+It follows Codex's Responses Lite pattern: one model-visible `exec` tool runs
+JavaScript in local Node.js and calls the common Rust tool surface.
 
 ```sh
 just bootstrap      # install pinned host dependencies once
 just prepare-evals  # build/cache native task and verifier images; no model
-just run            # native low-effort PTC smoke; no Python, Docker, or Harbor
+just run            # native low-effort smoke; requires local Node.js
 just eval           # fresh full model-driven Terminal-Bench suite
 just view           # inspect retained Harbor jobs
 ```
@@ -26,28 +25,33 @@ native BuildKit compile -> static Linux binary
 
 The Python `BaseInstalledAgent` shim only uploads and starts the executable,
 then converts its retained JSONL to ATIF. It never dispatches tool calls.
-OpenAI runs the model-generated JavaScript in its hosted PTC runtime. The Rust
-process executes the nested common-tool calls returned by the API, preserves
-their caller linkage, and sends their structured results back over the same
-stored WebSocket continuation chain. Requests use `store: true`, a stable
-session cache key, and matching session/thread transport identity. Rust also
-replays the server's per-turn sticky-routing token on every continuation and
-same-turn reconnect. A dedicated socket pump
-services API keepalives while the response consumer is waiting on local tools;
+The Rust process lazily starts one local Node.js code-mode host and reuses it
+for every model-generated `exec` cell in the run. JavaScript can use normal
+Node.js capabilities and the injected common tools; Rust dispatches independent
+nested calls concurrently, while model decisions and mutations remain outside
+the Python lifecycle adapter.
+
+Requests use `store: false`, a stable session cache key, and matching
+session/thread transport identity. Rust owns the full ordered model history,
+including encrypted reasoning and tool items. On a healthy WebSocket it sends
+only the new delta with `previous_response_id`; after reconnecting it clears
+that ID and replays the complete history with response item IDs removed. The
+server's per-turn sticky-routing token is sent in WebSocket `client_metadata`.
+A dedicated socket pump services API keepalives while the response consumer is
+waiting on local tools;
 connection attempts, reconnects, and connection wall time remain visible in
 JSONL and Harbor/ATIF.
 
 The adapter removes `OPENAI_API_KEY` from Harbor's per-exec environment before
 launching Docker. It uploads a mode-`0400` transient file for the agent user,
-reads and deletes it inside the container, and scopes the value only to the
-Rust process. The key is therefore absent from host process arguments, `tee`,
-verifier commands, retained logs, and model-generated shell environments.
+reads and deletes it inside the container, and scopes the value to the Rust
+process and its Node.js code-mode host. The key is absent from host process
+arguments, `tee`, verifier commands, retained logs, and Rust-dispatched shell
+environments.
 
-`--multi-agent` switches to hosted Multi-agent with direct `exec_command`
-calls and live `response.inject`. The profiles are separate because the live
-API currently rejects injection of PTC-nested outputs during a Multi-agent
-response. Multi-agent remains opt-in and its developer prompt forbids spawning
-for routine or sequential work.
+Node.js is an ordinary runtime prerequisite. Native `just run` uses `node` from
+the host `PATH`; Harbor's shared eval-image overlay installs the distribution's
+`nodejs` package. The Rust executable does not download or bundle a runtime.
 
 For the local eval loop, Harbor builds each canonical task Dockerfile for the
 Docker daemon's native architecture, then adds one content-addressed layer with
@@ -94,7 +98,7 @@ HARNESS_BUILD_PROFILE=profiling
 ## Eval selection
 
 [`evals/terminal-bench-2.yaml`](evals/terminal-bench-2.yaml) selects datasets
-and tasks. The configured development slice contains thirty-six public
+and tasks. The configured development slice contains thirty-eight public
 shell/code tasks. The first 35-task gate after admitting Circuit Fib/Sqrt and
 Build POV-Ray completed every trial without an exception or retry in 16
 minutes 41.92 seconds and scored 34/35. Its only miss was a verifier-cache
@@ -117,6 +121,25 @@ completed without an exception, retry, or reconnect in 20 minutes 33 seconds
 and scored 34/36. The two misses were task-output failures, not harness
 failures, and are next for unchanged focused retries before another task is
 admitted.
+
+The latest Responses Lite parity run found and removed an artificial 32-call
+limit after confirming Codex uses an unbounded tool-follow-up loop with
+context-limit compaction. Fixed CompCert passed after 40 model calls, and an
+unchanged POV-Ray retry recovered the full run's only outcome difference from
+Codex. The revalidated matrix is therefore 30/36 for both systems with the same
+six misses. Harness used 5.08M input tokens at 90.3% cached versus Codex's
+9.30M at 92.8% cached, and was faster on 20 of their 30 shared passes. Public
+task admission can continue one task at a time. `crack-7z-hash` is now active
+after passing both canonical assertions in 5 minutes 51 seconds with zero
+exception or retry and 95.1% cached input.
+
+The matched Codex 0.144.5 archive trial also passed, but the harness completed
+agent work in 347.3 seconds over 24 model calls versus Codex's 626.2 seconds
+over 36. `multi-source-data-merger` is the thirty-eighth active task after both
+agents passed its three deterministic assertions. Its canonical pandas and
+PyArrow verifier stack is cached in an isolated overlay so it cannot replace
+the task environment's scientific packages.
+
 Browser automation, computer-use, GUI interaction, and image/video perception
 are outside this milestone. Downloaded tasks and canonical verifier assertions
 remain unchanged.
@@ -141,6 +164,9 @@ POV-Ray's Pillow/NumPy/scikit-image verifier stack is cached under
 `/opt/harness-verifier/pov` instead of the system interpreter. The adapter adds
 that path only for the exact canonical POV-Ray `uvx` command, so verifier-only
 versions cannot mutate the agent's task environment.
+The data-merger verifier's pandas/PyArrow stack is likewise isolated under
+`/opt/harness-verifier/parquet` and selected only for its exact canonical
+`uvx` command.
 Largest Eigenvalue likewise uses an exact cached pip command and adds no image
 dependency. The retained Tune MJCF experiment uses an exact cached
 `mujoco==3.3.5` command shape and adds no verifier-image dependency.
@@ -155,4 +181,5 @@ reverted.
 Every trial retains `input.jsonl`, `events.jsonl`, `stderr.log`, and
 `trajectory.json` under `.harness/harbor/jobs`. Harbor receives aggregate token
 counts, while ATIF also records cache writes, reasoning summaries, model/tool
-durations, PTC caller linkage, tool arguments, and structured observations.
+durations, code-mode and nested-tool calls, arguments, and structured
+observations.
