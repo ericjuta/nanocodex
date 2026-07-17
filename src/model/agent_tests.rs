@@ -576,7 +576,7 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
                     "name": "exec",
                     "input": "text(\"tool completed\")"
                 })],
-                334_800,
+                372_001,
             ),
         )
         .await?;
@@ -585,6 +585,10 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
         assert_eq!(compact["previous_response_id"], "resp-tool");
         assert_eq!(compact["input"].as_array().map(Vec::len), Some(2));
         assert_eq!(compact["input"][0]["type"], "custom_tool_call_output");
+        assert_eq!(
+            compact["input"][0]["output"],
+            "Output exceeded the available model context and was truncated"
+        );
         assert_eq!(compact["input"][1], json!({ "type": "compaction_trigger" }));
         send_json(
             &mut socket,

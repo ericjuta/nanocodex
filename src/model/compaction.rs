@@ -16,6 +16,8 @@ const RESIZED_IMAGE_BYTES_ESTIMATE: usize = 7_373;
 const ORIGINAL_IMAGE_PATCH_SIZE: u32 = 32;
 const ORIGINAL_IMAGE_MAX_PATCHES: usize = 10_000;
 const ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE: usize = 32;
+const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
+    "Output exceeded the available model context and was truncated";
 
 #[derive(Default)]
 struct OriginalImageEstimateCache {
@@ -69,6 +71,43 @@ pub(super) fn active_context_tokens(usage: &Usage, local_items: &[Value]) -> u64
 
 pub(super) fn trigger() -> Value {
     json!({ "type": "compaction_trigger" })
+}
+
+pub(super) fn trim_tool_outputs_to_fit_context_window(
+    history: &mut [Value],
+    active_context_tokens: u64,
+) -> usize {
+    let mut estimated_tokens = active_context_tokens;
+    let mut rewritten_outputs = 0;
+    for item in history.iter_mut().rev() {
+        if estimated_tokens <= SOL_CONTEXT_WINDOW {
+            break;
+        }
+        let tokens_before = approx_tokens(serialized_len(item));
+        if !rewrite_tool_output(item) {
+            break;
+        }
+        let tokens_after = approx_tokens(serialized_len(item));
+        estimated_tokens = estimated_tokens.saturating_sub(
+            u64::try_from(tokens_before.saturating_sub(tokens_after)).unwrap_or(u64::MAX),
+        );
+        rewritten_outputs += 1;
+    }
+    rewritten_outputs
+}
+
+fn rewrite_tool_output(item: &mut Value) -> bool {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    ) {
+        return false;
+    }
+    let Some(output) = item.get_mut("output") else {
+        return false;
+    };
+    *output = Value::String(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_owned());
+    true
 }
 
 pub(super) fn install_history(
@@ -373,6 +412,63 @@ mod tests {
                 ],
             })]
         );
+    }
+
+    #[test]
+    fn over_window_history_rewrites_trailing_tool_outputs() {
+        let history = vec![
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "call-1",
+                "output": "a".repeat(200_000),
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call-2",
+                "output": "b".repeat(200_000),
+            }),
+        ];
+        let mut request_history = history.clone();
+
+        assert_eq!(
+            trim_tool_outputs_to_fit_context_window(
+                &mut request_history,
+                SOL_CONTEXT_WINDOW + 75_000,
+            ),
+            2
+        );
+        assert_eq!(
+            request_history[0]["output"],
+            CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
+        );
+        assert_eq!(
+            request_history[1]["output"],
+            CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
+        );
+        assert_ne!(history, request_history);
+        assert!(
+            history[0]["output"]
+                .as_str()
+                .is_some_and(|text| text.len() == 200_000)
+        );
+    }
+
+    #[test]
+    fn auto_compaction_below_hard_window_preserves_tool_output() {
+        let mut history = vec![json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "output": "unchanged",
+        })];
+
+        assert_eq!(
+            trim_tool_outputs_to_fit_context_window(
+                &mut history,
+                auto_compact_token_limit("gpt-5.6-sol").expect("Sol has a compact limit"),
+            ),
+            0
+        );
+        assert_eq!(history[0]["output"], "unchanged");
     }
 
     #[test]

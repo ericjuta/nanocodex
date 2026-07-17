@@ -789,8 +789,20 @@ impl<'a, W: Write> ModelRun<'a, W> {
     ) -> Result<Value> {
         self.capture_turn_state(socket);
         let trigger = compaction::trigger();
+        let delta_start =
+            history
+                .len()
+                .checked_sub(delta.len())
+                .ok_or(AgentError::MalformedResponse {
+                    detail: "compaction delta was longer than conversation history",
+                })?;
+        let mut compaction_history = history.to_vec();
+        compaction::trim_tool_outputs_to_fit_context_window(
+            &mut compaction_history,
+            active_context_tokens,
+        );
         let mut incremental_input = Vec::with_capacity(delta.len() + 1);
-        incremental_input.extend_from_slice(delta);
+        incremental_input.extend_from_slice(&compaction_history[delta_start..]);
         incremental_input.push(trigger.clone());
         let request = EncodedRequest::new(&ResponseCreate::generation(
             self.config,
@@ -827,7 +839,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
             )?;
             self.capture_turn_state(socket);
             *socket = self.connect(ConnectionPurpose::Reconnect).await?;
-            let mut replay_input = profile.full_input(history);
+            let mut replay_input = profile.full_input(&compaction_history);
             replay_input.push(trigger);
             let replay = EncodedRequest::new(&ResponseCreate::generation(
                 self.config,
