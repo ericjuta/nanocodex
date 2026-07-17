@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#ffffff" />
+    <script>
+      (() => {
+        try {
+          const stored =
+            localStorage.getItem("nanocodex-theme") ?? localStorage.getItem("xedoc-theme");
+          const theme = stored === "dark" ? "dark" : "light";
+          document.documentElement.dataset.theme = theme;
+          document
+            .querySelector('meta[name="theme-color"]')
+            ?.setAttribute("content", theme === "dark" ? "#161616" : "#ffffff");
+        } catch {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
+    <meta
+      name="description"
+      content="A from-scratch Codex rewrite for the latest models, built with the same tools and an eval-driven development loop."
+    />
+    <meta property="og:title" content="Nanocodex: Minimal Codex reimplementation for the frontier." />
+    <meta
+      property="og:description"
+      content="Copy the tools and behavior the model is trained against, then see how small you can make the runtime."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:image" content="/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Nanocodex: Minimal Codex reimplementation for the frontier." />
+    <meta name="twitter:image" content="/og.png" />
+    <title>Nanocodex: Minimal Codex reimplementation for the frontier.</title>
+    <link rel="stylesheet" href="/src/index.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

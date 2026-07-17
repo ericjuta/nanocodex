@@ -1,4 +1,4 @@
-import { DEFAULT_THEMES, preloadHighlighter } from "@pierre/diffs";
+import { DEFAULT_THEMES } from "@pierre/diffs";
 import {
   WorkerPoolContextProvider,
   type WorkerInitializationRenderOptions,
@@ -7,7 +7,7 @@ import {
 } from "@pierre/diffs/react";
 import DiffWorker from "@pierre/diffs/worker/worker.js?worker";
 import type { ReactNode } from "react";
-import { createContext, useContext, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { preloadedSyntaxLanguages } from "./syntax";
 
 function isMobileBrowser() {
@@ -42,33 +42,15 @@ const highlighterOptions: WorkerInitializationRenderOptions = {
   preferredHighlighter: "shiki-wasm",
 };
 
-const MainHighlighterReadyContext = createContext(false);
-
 export function PierreWorkerProvider({ children }: { children: ReactNode }) {
-  const [mainHighlighterReady, setMainHighlighterReady] = useState(false);
-
-  useEffect(() => {
-    void preloadHighlighter({
-      themes: [DEFAULT_THEMES.dark, DEFAULT_THEMES.light],
-      langs: preloadedSyntaxLanguages,
-      preferredHighlighter: "shiki-wasm",
-    }).then(() => setMainHighlighterReady(true));
-  }, []);
-
   return (
-    <MainHighlighterReadyContext.Provider value={mainHighlighterReady}>
-      <WorkerPoolContextProvider
-        poolOptions={poolOptions}
-        highlighterOptions={highlighterOptions}
-      >
-        {children}
-      </WorkerPoolContextProvider>
-    </MainHighlighterReadyContext.Provider>
+    <WorkerPoolContextProvider
+      poolOptions={poolOptions}
+      highlighterOptions={highlighterOptions}
+    >
+      {children}
+    </WorkerPoolContextProvider>
   );
-}
-
-export function usePierreMainHighlighter() {
-  return useContext(MainHighlighterReadyContext);
 }
 
 export function usePierreRenderer() {

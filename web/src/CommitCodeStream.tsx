@@ -18,19 +18,9 @@ import {
   useRef,
   useState,
 } from "react";
-import {
-  usePierreMainHighlighter,
-  usePierreRenderer,
-} from "./PierreWorkerProvider";
-import { COMMIT_CODE_VIEW_CUSTOM_CSS, CODE_VIEW_LAYOUT } from "./pierreCodeView";
+import { usePierreRenderer } from "./PierreWorkerProvider";
+import { CODE_VIEW_CUSTOM_CSS, CODE_VIEW_LAYOUT } from "./pierreCodeView";
 import type { HarnessCommit, Theme } from "./Xedoc";
-
-const CODE_VIEW_BATCH_COUNT = 25;
-const CODE_VIEW_BATCH_COUNT_MAX = 96;
-const CODE_VIEW_FILE_TREE_ITEM_HEIGHT = 24;
-const STREAM_INITIAL_PUBLISH_INTERVAL_MS = 500;
-const STREAM_WORK_BUDGET_MS = 8;
-const PATCH_FETCH_CONCURRENCY = 6;
 
 const dateFormatter = new Intl.DateTimeFormat("en", {
   month: "short",
@@ -61,8 +51,9 @@ function createCommitItem(commit: HarnessCommit): CommitStreamItem {
   return {
     id: commitItemId(commit),
     type: "file",
+    collapsed: true,
     file: {
-      name: "",
+      name: commit.subject,
       contents: "",
       lang: "markdown",
       cacheKey: `${commit.hash}:message`,
@@ -70,54 +61,26 @@ function createCommitItem(commit: HarnessCommit): CommitStreamItem {
   };
 }
 
-function yieldToBrowser(): Promise<void> {
-  return new Promise((resolve) => {
-    let didResolve = false;
-    const resolveOnce = () => {
-      if (didResolve) return;
-      didResolve = true;
-      window.clearTimeout(timeout);
-      resolve();
-    };
-    const timeout = window.setTimeout(resolveOnce, 50);
-    window.requestAnimationFrame(resolveOnce);
-  });
-}
-
-function getInitialBatchSize() {
-  const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
-  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) {
-    return CODE_VIEW_BATCH_COUNT;
-  }
-  return Math.min(
-    CODE_VIEW_BATCH_COUNT_MAX,
-    Math.max(
-      CODE_VIEW_BATCH_COUNT,
-      Math.ceil(viewportHeight / CODE_VIEW_FILE_TREE_ITEM_HEIGHT),
-    ),
-  );
-}
-
 export const CommitCodeStream = forwardRef<
   CommitCodeStreamHandle,
   CommitCodeStreamProps
 >(function CommitCodeStream({ commits, theme }, forwardedRef) {
   const renderer = usePierreRenderer();
-  const mainHighlighterReady = usePierreMainHighlighter();
   const viewerRef = useRef<CodeViewHandle<CommitAnnotation> | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const commitIndexByItemIdRef = useRef(new Map<string, number>());
-  const loadedCommitIdsRef = useRef<Array<string | undefined>>([]);
   const pendingJumpRef = useRef<number | null>(null);
-  const [viewerGeneration, setViewerGeneration] = useState(0);
-  const [initialItems, setInitialItems] = useState<CommitStreamItem[]>([]);
-  const renderReady =
-    renderer.ready && (!renderer.disableWorkerPool || mainHighlighterReady);
+  const [items, setItems] = useState<CommitStreamItem[] | null>(null);
+  const commitByItemId = useMemo(
+    () => new Map(commits.map((commit) => [commitItemId(commit), commit])),
+    [commits],
+  );
 
   const scrollToCommit = useCallback((index: number) => {
-    const id = loadedCommitIdsRef.current[index];
+    const commit = commits[index];
+    if (commit == null) return;
+    const id = commitItemId(commit);
     const viewer = viewerRef.current;
-    if (id == null || viewer == null) {
+    if (viewer == null || viewer.getItem(id) == null) {
       pendingJumpRef.current = index;
       return;
     }
@@ -128,7 +91,17 @@ export const CommitCodeStream = forwardRef<
       align: "start",
       behavior: "smooth",
     });
-  }, []);
+  }, [commits]);
+
+  const handleViewerRef = useStableCallback(
+    (viewer: CodeViewHandle<CommitAnnotation> | null) => {
+      viewerRef.current = viewer;
+      const pendingJump = pendingJumpRef.current;
+      if (viewer != null && pendingJump != null) {
+        scrollToCommit(pendingJump);
+      }
+    },
+  );
 
   useImperativeHandle(
     forwardedRef,
@@ -152,189 +125,75 @@ export const CommitCodeStream = forwardRef<
       lineHoverHighlight: "number",
       enableLineSelection: true,
       stickyHeaders: true,
-      itemMetrics: {
-        lineHeight: 18,
-        diffHeaderHeight: 44,
-      },
-      unsafeCSS: COMMIT_CODE_VIEW_CUSTOM_CSS,
+      unsafeCSS: CODE_VIEW_CUSTOM_CSS,
     }),
     [theme],
   );
 
-  const renderStreamHeader = useStableCallback((item: CommitStreamItem) => {
-    if (item.type === "diff") {
-      const additions = item.fileDiff.hunks.reduce(
-        (total, hunk) => total + hunk.additionLines,
-        0,
-      );
-      const deletions = item.fileDiff.hunks.reduce(
-        (total, hunk) => total + hunk.deletionLines,
-        0,
-      );
-      const path = item.fileDiff.prevName
-        ? `${item.fileDiff.prevName} → ${item.fileDiff.name}`
-        : item.fileDiff.name;
-      return (
-        <div className="commit-file-header">
-          <span
-            className={`commit-file-status is-${item.fileDiff.type}`}
-            aria-hidden="true"
-          />
-          <span className="commit-file-path">{path}</span>
-          <span className="commit-file-stats">
-            {deletions > 0 ? <span className="deletions">−{deletions}</span> : null}
-            {additions > 0 ? <span className="additions">+{additions}</span> : null}
-          </span>
-        </div>
-      );
-    }
-
-    const commitIndex = commitIndexByItemIdRef.current.get(item.id);
-    if (commitIndex == null) return null;
-    const commit = commits[commitIndex];
+  const renderCommitMetadata = useStableCallback((item: CommitStreamItem) => {
+    if (item.type !== "file") return null;
+    const commit = commitByItemId.get(item.id);
+    if (commit == null) return null;
     return (
-      <article
-        className="commit-section-header"
-        aria-labelledby={`commit-title-${commit.shortHash}`}
-      >
-        <h2 id={`commit-title-${commit.shortHash}`}>{commit.subject}</h2>
-        <div className="commit-code-metadata">
-          <span className="commit-section-hash">Commit {commit.shortHash}</span>
-          <span>{commit.author}</span>
-          <span>{dateFormatter.format(new Date(commit.authoredAt))}</span>
-          <span>
-            {commit.stats.files} file{commit.stats.files === 1 ? "" : "s"}
-          </span>
-          <span className="additions">+{commit.stats.additions}</span>
-          <span className="deletions">−{commit.stats.deletions}</span>
-        </div>
-      </article>
+      <div className="commit-code-metadata">
+        <span className="commit-section-hash">Commit {commit.shortHash}</span>
+        <span>{commit.author}</span>
+        <span>{dateFormatter.format(new Date(commit.authoredAt))}</span>
+        <span>
+          {commit.stats.files} file{commit.stats.files === 1 ? "" : "s"}
+        </span>
+        <span className="additions">+{commit.stats.additions}</span>
+        <span className="deletions">−{commit.stats.deletions}</span>
+      </div>
     );
   });
 
   useEffect(() => {
-    if (!renderReady) return;
-
     const controller = new AbortController();
     let current = true;
-    commitIndexByItemIdRef.current = new Map();
-    loadedCommitIdsRef.current = [];
     pendingJumpRef.current = null;
-    setViewerGeneration((generation) => generation + 1);
-    setInitialItems([]);
+    setItems(null);
 
     async function loadCommits() {
-      // Let the keyed CodeView remount before appending the first batch. This
-      // also makes repository re-syncs and Fast Refresh restart cleanly.
-      await yieldToBrowser();
+      const patches = await Promise.all(
+        commits.map(async (commit) => {
+          try {
+            const response = await fetch(commit.patchUrl, {
+              cache: "force-cache",
+              signal: controller.signal,
+            });
+            if (!response.ok) {
+              throw new Error(`Patch request failed: ${response.status}`);
+            }
+            return await response.text();
+          } catch (error) {
+            if (controller.signal.aborted) throw error;
+            return null;
+          }
+        }),
+      );
       if (!current) return;
 
-      let pendingItems: CommitStreamItem[] = [];
-      let pendingCommitIndexes: number[] = [];
-      let lastWorkYieldTime = performance.now();
-      let lastPublishTime = lastWorkYieldTime;
-      let hasPublishedItems = false;
-      const initialBatchSize = getInitialBatchSize();
+      const nextItems: CommitStreamItem[] = [];
+      for (let commitIndex = 0; commitIndex < commits.length; commitIndex++) {
+        const commit = commits[commitIndex];
+        nextItems.push(createCommitItem(commit));
 
-      const publish = async () => {
-        if (!current || pendingItems.length === 0) return;
-        const publishedCommitIndexes = pendingCommitIndexes;
-        const publishedItems = pendingItems;
-        if (!hasPublishedItems) {
-          setInitialItems(publishedItems);
-        } else if (viewerRef.current != null) {
-          viewerRef.current.addItems(publishedItems);
-        } else {
-          setInitialItems((currentItems) => [...currentItems, ...publishedItems]);
-        }
-        for (const commitIndex of publishedCommitIndexes) {
-          loadedCommitIdsRef.current[commitIndex] = commitItemId(commits[commitIndex]);
-        }
-        pendingItems = [];
-        pendingCommitIndexes = [];
-        hasPublishedItems = true;
-        lastPublishTime = performance.now();
-        const publishedCommitCount = (publishedCommitIndexes.at(-1) ?? -1) + 1;
-        await yieldToBrowser();
-        lastWorkYieldTime = performance.now();
-
-        const pendingJump = pendingJumpRef.current;
-        if (pendingJump != null && pendingJump < publishedCommitCount) {
-          scrollToCommit(pendingJump);
-        }
-      };
-
-      for (let start = 0; start < commits.length; start += PATCH_FETCH_CONCURRENCY) {
-        const group = commits.slice(start, start + PATCH_FETCH_CONCURRENCY);
-        const patches = await Promise.all(
-          group.map(async (commit) => {
-            try {
-              const response = await fetch(commit.patchUrl, {
-                cache: "force-cache",
-                signal: controller.signal,
-              });
-              if (!response.ok) throw new Error(`Patch request failed: ${response.status}`);
-              return await response.text();
-            } catch (error) {
-              if (controller.signal.aborted) throw error;
-              return null;
-            }
-          }),
+        const patch = patches[commitIndex];
+        if (patch == null) continue;
+        const fileDiffs = parsePatchFiles(patch, commit.hash).flatMap(
+          (parsedPatch) => parsedPatch.files,
         );
-        if (!current) return;
-
-        for (let offset = 0; offset < group.length; offset++) {
-          const commitIndex = start + offset;
-          const commit = group[offset];
-          const boundary = createCommitItem(commit);
-          const commitItems: CommitStreamItem[] = [boundary];
-          commitIndexByItemIdRef.current.set(boundary.id, commitIndex);
-
-          const patch = patches[offset];
-          if (patch != null) {
-            const fileDiffs = parsePatchFiles(patch, commit.hash).flatMap(
-              (parsedPatch) => parsedPatch.files,
-            );
-            for (let fileIndex = 0; fileIndex < fileDiffs.length; fileIndex++) {
-              const item: CommitStreamItem = {
-                id: `${commit.hash}:${fileIndex}:${fileDiffs[fileIndex].name}`,
-                type: "diff",
-                fileDiff: fileDiffs[fileIndex],
-              };
-              commitItems.push(item);
-            }
-          }
-
-          const batchSize = hasPublishedItems
-            ? CODE_VIEW_BATCH_COUNT
-            : initialBatchSize;
-          if (pendingItems.length > 0 && pendingItems.length + commitItems.length > batchSize) {
-            await publish();
-          }
-          pendingItems.push(...commitItems);
-          pendingCommitIndexes.push(commitIndex);
-
-          const nextBatchSize = hasPublishedItems
-            ? CODE_VIEW_BATCH_COUNT
-            : initialBatchSize;
-          if (pendingItems.length >= nextBatchSize) {
-            await publish();
-          } else if (performance.now() - lastWorkYieldTime >= STREAM_WORK_BUDGET_MS) {
-            const deferInitialBatch =
-              !hasPublishedItems &&
-              pendingItems.length < initialBatchSize &&
-              performance.now() - lastPublishTime < STREAM_INITIAL_PUBLISH_INTERVAL_MS;
-            if (deferInitialBatch) {
-              await yieldToBrowser();
-              lastWorkYieldTime = performance.now();
-            } else {
-              await publish();
-            }
-          }
+        for (let fileIndex = 0; fileIndex < fileDiffs.length; fileIndex++) {
+          nextItems.push({
+            id: `${commit.hash}:${fileIndex}:${fileDiffs[fileIndex].name}`,
+            type: "diff",
+            fileDiff: fileDiffs[fileIndex],
+          });
         }
       }
 
-      await publish();
+      if (current) setItems(nextItems);
     }
 
     void loadCommits().catch((error) => {
@@ -345,22 +204,21 @@ export const CommitCodeStream = forwardRef<
       current = false;
       controller.abort();
     };
-  }, [commits, renderReady, renderer.disableWorkerPool, scrollToCommit]);
+  }, [commits]);
 
-  if (!renderReady || initialItems.length === 0) {
+  if (!renderer.ready || items == null) {
     return null;
   }
 
   return (
     <CodeView
-      key={`${renderer.disableWorkerPool ? "main" : "workers"}:${viewerGeneration}`}
-      ref={viewerRef}
+      ref={handleViewerRef}
       containerRef={containerRef}
-      initialItems={initialItems}
+      initialItems={items}
       className="commit-stream code-view cv-scrollbar"
       disableWorkerPool={renderer.disableWorkerPool}
       options={options}
-      renderCustomHeader={renderStreamHeader}
+      renderHeaderMetadata={renderCommitMetadata}
     />
   );
 });

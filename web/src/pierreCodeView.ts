@@ -20,15 +20,7 @@ export const CODE_VIEW_CUSTOM_CSS = `
     width: 100%;
     height: 1px;
     content: '';
-    background-color: var(--nanocodex-diff-separator);
+    background-color: var(--border-soft);
   }
-}
-`;
-
-export const COMMIT_CODE_VIEW_CUSTOM_CSS = `
-${CODE_VIEW_CUSTOM_CSS}
-
-[data-diffs-header] {
-  min-height: 44px;
 }
 `;

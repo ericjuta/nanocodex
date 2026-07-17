@@ -179,6 +179,10 @@ async function buildTrial(jobName, trialName, trialPath, context) {
     startedAt: result.started_at ?? null,
     finishedAt: result.finished_at ?? null,
     durationMs: millisecondsBetween(result.started_at, result.finished_at),
+    agentDurationMs: millisecondsBetween(
+      result?.agent_execution?.started_at,
+      result?.agent_execution?.finished_at,
+    ),
     model: result?.agent_info?.model_info?.name ?? metadata.model ?? null,
     effort:
       metadata.effort ??
@@ -446,10 +450,16 @@ function buildComparison(allJobs) {
     branch: job.branch,
     finishedAt: job.finishedAt,
     durationMs: job.durationMs,
+    agentDurationMs: job.trials.reduce(
+      (total, trial) => total + (trial.agentDurationMs ?? 0),
+      0,
+    ),
     passed: job.trials.filter((trial) => trial.status === "passed").length,
     score: job.mean,
     model: job.trials[0]?.model ?? null,
     effort: job.trials[0]?.effort ?? null,
+    modelCalls: job.trials.reduce((total, trial) => total + trial.modelCalls, 0),
+    tokens: job.tokens,
   });
   return {
     taskCount: tasks.length,

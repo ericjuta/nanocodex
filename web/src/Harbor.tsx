@@ -79,10 +79,17 @@ type ComparisonJob = {
   branch: string;
   finishedAt: string;
   durationMs: number | null;
+  agentDurationMs: number;
   passed: number;
   score: number | null;
   model: string | null;
   effort: string | null;
+  modelCalls: number;
+  tokens: {
+    input: number;
+    cached: number;
+    output: number;
+  };
 };
 
 type ComparisonTask = {
@@ -190,7 +197,7 @@ function comparisonScore(value: number | null) {
 }
 
 function runnerLabel(runner: Runner) {
-  return runner === "harness" ? "Harness" : "Codex";
+  return runner === "harness" ? "NanoCodex" : "Codex";
 }
 
 export function Harbor() {
@@ -334,7 +341,7 @@ export function Harbor() {
             <strong>{comparisonScore(comparison?.codex.score ?? null)}</strong>
           </div>
           <div>
-            <span>Harness experiment</span>
+            <span>NanoCodex experiment</span>
             <strong>{comparisonScore(comparison?.harness.score ?? null)}</strong>
           </div>
           <div>
@@ -364,7 +371,7 @@ export function Harbor() {
               <tr>
                 <th>Task</th>
                 <th>Codex</th>
-                <th>Harness</th>
+                <th>NanoCodex</th>
               </tr>
             </thead>
             <tbody>

@@ -47,8 +47,8 @@ development instrument, not a general product ranking. The comparison links
 each disagreement back to its retained trial so compatibility gaps can be
 inspected directly.
 
-Navigation stays available whenever an input is not active: `H`, `A`, `T`, `C`, `R`,
-and `E` switch between Home, Architecture, Code, Commits, Requests, and Evals. The repository
+Navigation stays available whenever an input is not active: `H`, `T`, `C`, `R`,
+and `E` switch between Home, Code, Commits, Requests, and Evals. The repository
 homepage is the root route. In Code, `Ctrl+P` searches the left tree and `Ctrl+F` opens the
 fuzzy all-file jumper. In Commits, `F` searches history. Code and commit
 scrolling are left to Pierre CodeView and the browser's native input behavior.

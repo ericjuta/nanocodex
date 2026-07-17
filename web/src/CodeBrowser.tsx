@@ -16,10 +16,7 @@ import {
   useState,
 } from "react";
 import { fuzzyScore } from "./fuzzy";
-import {
-  usePierreMainHighlighter,
-  usePierreRenderer,
-} from "./PierreWorkerProvider";
+import { usePierreRenderer } from "./PierreWorkerProvider";
 import { CODE_VIEW_CUSTOM_CSS, CODE_VIEW_LAYOUT } from "./pierreCodeView";
 import { syntaxLanguageForFile } from "./syntax";
 
@@ -82,9 +79,6 @@ export const CodeBrowser = forwardRef<CodeBrowserHandle, CodeBrowserProps>(funct
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
   const fileViewerRef = useRef<HTMLElement>(null);
   const renderer = usePierreRenderer();
-  const mainHighlighterReady = usePierreMainHighlighter();
-  const renderReady =
-    renderer.ready && (!renderer.disableWorkerPool || mainHighlighterReady);
   const { model } = useFileTree({
     preparedInput: treeInput as unknown as FileTreePreparedInput,
     flattenEmptyDirectories: true,
@@ -104,7 +98,7 @@ export const CodeBrowser = forwardRef<CodeBrowserHandle, CodeBrowserProps>(funct
     contents !== null &&
     loadedObjectId === selected.objectId &&
     !fileError &&
-    renderReady;
+    renderer.ready;
   const fileSearchResults = useMemo(() => {
     const tokens = fileQuery.trim().split(/\s+/).filter(Boolean);
     const matches = files
