@@ -138,7 +138,7 @@ async fn code_mode_notify_adds_a_named_exec_output_to_the_next_request() -> Resu
 }
 
 #[tokio::test]
-async fn prepares_images_and_strips_detail_before_lite_request() -> Result<()> {
+async fn prepares_images_and_recovers_from_invalid_image_requests() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -177,14 +177,42 @@ async fn prepares_images_and_strips_detail_before_lite_request() -> Result<()> {
                 .is_some_and(|url| url.starts_with("data:image/png;base64,"))
         );
         assert!(image.get("detail").is_none());
+
+        send_json(
+            &mut socket,
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-invalid-image",
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_image",
+                        "message": "The image data you provided does not represent a valid image"
+                    }
+                }
+            }),
+        )
+        .await?;
+
+        let retry = next_json(&mut socket).await?;
+        assert_eq!(retry["previous_response_id"], "resp-image");
+        let output = retry["input"][0]["output"]
+            .as_array()
+            .ok_or_else(|| eyre!("sanitized image tool output was not content"))?;
+        assert!(output.iter().all(|item| item["type"] != "input_image"));
+        assert!(output.iter().any(|item| {
+            item["type"] == "input_text" && item["text"].as_str() == Some("Invalid image")
+        }));
         send_final(&mut socket, "resp-final").await
     });
 
     let workspace = temporary_workspace("images")?;
-    run_model(&endpoint, &workspace, "inspect images").await?;
+    let output = run_model(&endpoint, &workspace, "inspect images").await?;
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert!(output.contains("\"model_calls\":3"));
+    assert!(output.contains("\"run.completed\""));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }

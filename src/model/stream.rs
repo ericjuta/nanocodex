@@ -13,6 +13,8 @@ use crate::{
     responses::{ResponsesSocket, decode_event, parse_raw_json},
 };
 
+const INVALID_IMAGE_ERROR: &str = "The image data you provided does not represent a valid image";
+
 pub(super) struct TurnResult {
     pub(super) id: String,
     pub(super) status: String,
@@ -205,6 +207,12 @@ async fn next_event<W: Write>(
         event,
         ServerEvent::Error | ServerEvent::Failed | ServerEvent::Incomplete
     ) {
+        if raw_event.get().contains(INVALID_IMAGE_ERROR) {
+            return Err(ResponsesError::InvalidImageRequest {
+                event: raw_event.get().to_owned(),
+            }
+            .into());
+        }
         return Err(ResponsesError::Api {
             event: raw_event.get().to_owned(),
         }

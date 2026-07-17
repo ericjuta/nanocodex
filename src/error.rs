@@ -59,6 +59,9 @@ pub enum ResponsesError {
 
     #[error("Responses API returned an error event: {event}")]
     Api { event: String },
+
+    #[error("Responses API rejected invalid image data: {event}")]
+    InvalidImageRequest { event: String },
 }
 
 impl ResponsesError {

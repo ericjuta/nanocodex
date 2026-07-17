@@ -1,7 +1,7 @@
 use std::{io::Write, path::Path, time::Instant};
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use super::{
     ApiEvent, AssistantMessage, ModelConfig, RunError, RunStarted, RunStats, TRANSPORT,
@@ -209,6 +209,39 @@ impl ConversationState {
         self.delta_start = None;
         self.previous_response_id = None;
     }
+
+    fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
+        for item in self.history.iter_mut().rev() {
+            if item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+            {
+                return false;
+            }
+            if !matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("custom_tool_call_output" | "function_call_output")
+            ) {
+                continue;
+            }
+            let Some(output) = item.get_mut("output").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let mut replaced = false;
+            for content in output {
+                if content.get("type").and_then(Value::as_str) == Some("input_image") {
+                    *content = json!({
+                        "type": "input_text",
+                        "text": placeholder,
+                    });
+                    replaced = true;
+                }
+            }
+            if replaced {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl<'a, W: Write> ModelRun<'a, W> {
@@ -295,9 +328,18 @@ impl<'a, W: Write> ModelRun<'a, W> {
 
         loop {
             let call_index = self.stats.model_calls + 1;
-            let response = self
+            let response = match self
                 .perform_model_call(&mut socket, call_index, &conversation, &profile)
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(HarnessError::Responses(ResponsesError::InvalidImageRequest { .. }))
+                    if conversation.replace_last_turn_images("Invalid image") =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             conversation.previous_response_id = Some(response.id.clone());
             let end_turn = response.end_turn;
             let final_message = response.final_message;
