@@ -32,7 +32,7 @@
 - Copy relevant invariants and operational behavior, not Codex compatibility
   surface. Expose only tool fields and lifecycle behavior implemented here.
 - The upstream review checkpoint is
-  `openai/codex@3a067484584861606ad842de5bc4ac735a865ddf`. When asked to keep
+  `openai/codex@3ac476bed22a7b7322a710a6ca79a0dbe917d604`. When asked to keep
   pace with Codex, fetch its `origin/main` and review every commit after this
   checkpoint, prioritizing supported model changes, defaults, prompts, API
   semantics, tools, and lifecycle behavior. Present candidates as port,
