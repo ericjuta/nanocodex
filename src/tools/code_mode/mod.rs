@@ -55,7 +55,6 @@ pub(crate) struct CodeModeExecution {
     pub(crate) nested_calls: Vec<NestedToolCall>,
 }
 
-#[derive(Clone)]
 pub(crate) struct NestedToolCall {
     pub(crate) call_id: String,
     pub(crate) name: String,
@@ -115,6 +114,17 @@ enum RuntimeEvent {
         #[serde(default)]
         stored: HashMap<String, Value>,
     },
+}
+
+impl RuntimeEvent {
+    fn cell_id(&self) -> u64 {
+        match self {
+            Self::ToolCall { cell_id, .. }
+            | Self::Yielded { cell_id, .. }
+            | Self::Done { cell_id, .. }
+            | Self::Error { cell_id, .. } => *cell_id,
+        }
+    }
 }
 
 struct CompletedNestedCall {
@@ -537,9 +547,12 @@ impl NodeHost {
                         continue;
                     };
                     let id = completed.id;
-                    let call = self
-                        .send_completed_call(cell_id, completed, &completed_calls)
-                        .await?;
+                    let call = match self.send_completed_call(cell_id, completed).await {
+                        Ok(call) => call,
+                        Err(failure) => {
+                            return Err(failure.with_calls(completed_calls));
+                        }
+                    };
                     completed_calls.push((id, call));
                 }
                 () = &mut yield_timer, if pending_calls.is_empty() => {
@@ -549,31 +562,36 @@ impl NodeHost {
                         nested_calls: ordered_calls(completed_calls),
                     });
                 }
-                event = self.read_event(&completed_calls) => {
-                    let event = event?;
+                event = self.read_event() => {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(failure) => {
+                            return Err(failure.with_calls(completed_calls));
+                        }
+                    };
+                    let event_cell_id = event.cell_id();
+                    if event_cell_id != cell_id {
+                        return Err(HostFailure::new(format!(
+                            "local code-mode host returned cell {event_cell_id} while executing cell {cell_id}"
+                        )).with_calls(completed_calls));
+                    }
                     match event {
                         RuntimeEvent::ToolCall {
-                            cell_id: event_cell_id,
-                            id,
-                            name,
-                            input,
+                            id, name, input, ..
                         } => {
-                            validate_cell_id(cell_id, event_cell_id, &completed_calls)?;
                             pending_calls.push(
                                 execute_nested_call(tools, id, name, input, context).boxed(),
                             );
                         }
                         RuntimeEvent::Yielded {
-                            cell_id: event_cell_id,
                             content,
                             stored,
+                            ..
                         } => {
-                            validate_cell_id(cell_id, event_cell_id, &completed_calls)?;
                             if !pending_calls.is_empty() {
-                                return Err(HostFailure::with_calls(
+                                return Err(HostFailure::new(
                                     "exec cell yielded while nested tool calls were pending".to_owned(),
-                                    &completed_calls,
-                                ));
+                                ).with_calls(completed_calls));
                             }
                             return Ok(CellOutcome::Yielded {
                                 content,
@@ -582,11 +600,10 @@ impl NodeHost {
                             });
                         }
                         RuntimeEvent::Done {
-                            cell_id: event_cell_id,
                             content,
                             stored,
+                            ..
                         } => {
-                            validate_cell_id(cell_id, event_cell_id, &completed_calls)?;
                             return Ok(CellOutcome::Completed {
                                 content,
                                 stored,
@@ -594,11 +611,10 @@ impl NodeHost {
                             });
                         }
                         RuntimeEvent::Error {
-                            cell_id: event_cell_id,
                             message,
                             stored,
+                            ..
                         } => {
-                            validate_cell_id(cell_id, event_cell_id, &completed_calls)?;
                             return Ok(CellOutcome::ScriptFailed {
                                 message,
                                 stored,
@@ -611,31 +627,25 @@ impl NodeHost {
         }
     }
 
-    async fn read_event(
-        &mut self,
-        completed_calls: &[(u64, NestedToolCall)],
-    ) -> Result<RuntimeEvent, HostFailure> {
+    async fn read_event(&mut self) -> Result<RuntimeEvent, HostFailure> {
         let line = match read_protocol_line(&mut self.stdout).await {
             Ok(Some(line)) => line,
             Ok(None) => {
                 let status = self.child.wait().await;
-                return Err(HostFailure::with_calls(
-                    format!("local code-mode host ended before a result: {status:?}"),
-                    completed_calls,
-                ));
+                return Err(HostFailure::new(format!(
+                    "local code-mode host ended before a result: {status:?}"
+                )));
             }
             Err(error) => {
-                return Err(HostFailure::with_calls(
-                    format!("failed to read local code-mode host: {error}"),
-                    completed_calls,
-                ));
+                return Err(HostFailure::new(format!(
+                    "failed to read local code-mode host: {error}"
+                )));
             }
         };
         serde_json::from_slice::<RuntimeEvent>(&line).map_err(|error| {
-            HostFailure::with_calls(
-                format!("local code-mode host emitted invalid JSON: {error}"),
-                completed_calls,
-            )
+            HostFailure::new(format!(
+                "local code-mode host emitted invalid JSON: {error}"
+            ))
         })
     }
 
@@ -643,7 +653,6 @@ impl NodeHost {
         &mut self,
         cell_id: u64,
         completed: CompletedNestedCall,
-        prior_calls: &[(u64, NestedToolCall)],
     ) -> Result<NestedToolCall, HostFailure> {
         let response = ToolResultMessage {
             kind: "tool_result",
@@ -655,10 +664,7 @@ impl NodeHost {
         write_json_line(&mut self.stdin, &response)
             .await
             .map_err(|error| {
-                HostFailure::with_calls(
-                    format!("failed to return a nested tool result: {error}"),
-                    prior_calls,
-                )
+                HostFailure::new(format!("failed to return a nested tool result: {error}"))
             })?;
         Ok(completed.call)
     }
@@ -677,28 +683,10 @@ impl HostFailure {
         }
     }
 
-    fn with_calls(message: String, calls: &[(u64, NestedToolCall)]) -> Self {
-        Self {
-            message,
-            nested_calls: ordered_calls(calls.to_vec()),
-        }
+    fn with_calls(mut self, calls: Vec<(u64, NestedToolCall)>) -> Self {
+        self.nested_calls = ordered_calls(calls);
+        self
     }
-}
-
-fn validate_cell_id(
-    expected: u64,
-    actual: u64,
-    calls: &[(u64, NestedToolCall)],
-) -> Result<(), HostFailure> {
-    if expected == actual {
-        return Ok(());
-    }
-    Err(HostFailure {
-        message: format!(
-            "local code-mode host returned cell {actual} while executing cell {expected}"
-        ),
-        nested_calls: ordered_calls(calls.to_vec()),
-    })
 }
 
 fn ordered_calls(mut calls: Vec<(u64, NestedToolCall)>) -> Vec<NestedToolCall> {

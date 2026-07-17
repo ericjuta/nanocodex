@@ -14,14 +14,14 @@ use crate::shell::ShellSessions;
 
 pub(crate) use code_mode::{CodeModeExecution, NestedToolCall};
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum ToolOutputBody {
     Text(String),
     Content(Vec<ToolOutputContent>),
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ToolOutputContent {
     InputText {
