@@ -172,7 +172,7 @@ pub(super) struct ModelRun<'a, W> {
 struct ConversationState {
     initial_context: Value,
     history: Vec<Value>,
-    delta: Vec<Value>,
+    delta_start: Option<usize>,
     previous_response_id: Option<String>,
 }
 
@@ -186,20 +186,24 @@ impl ConversationState {
             })?;
         Ok(Self {
             initial_context,
-            delta: history.clone(),
             history,
+            delta_start: Some(0),
             previous_response_id: None,
         })
     }
 
-    fn install_compaction(&mut self, item: Value, profile: &RequestProfile) {
+    fn delta(&self) -> &[Value] {
+        &self.history[self.delta_start.unwrap_or(0)..]
+    }
+
+    fn install_compaction(&mut self, item: Value) {
         self.history = compaction::install_history(&self.history, &self.initial_context, item);
-        self.delta = profile.full_input(&self.history);
+        self.delta_start = None;
         self.previous_response_id = None;
     }
 
-    fn reset_for_full_request(&mut self, profile: &RequestProfile) {
-        self.delta = profile.full_input(&self.history);
+    fn reset_for_full_request(&mut self) {
+        self.delta_start = None;
         self.previous_response_id = None;
     }
 }
@@ -279,14 +283,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         loop {
             let call_index = self.stats.model_calls + 1;
             let response = self
-                .perform_model_call(
-                    &mut socket,
-                    call_index,
-                    &conversation.delta,
-                    &conversation.history,
-                    conversation.previous_response_id.as_deref(),
-                    &profile,
-                )
+                .perform_model_call(&mut socket, call_index, &conversation, &profile)
                 .await?;
             conversation.previous_response_id = Some(response.id.clone());
             let final_message = response.final_message;
@@ -309,13 +306,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 .into());
             }
 
-            conversation.delta = Vec::with_capacity(code_calls.len());
+            conversation.delta_start = Some(conversation.history.len());
             for call in code_calls {
                 let output = self
                     .execute_model_tool(&tools, call_index, call, &conversation.history)
                     .await?;
-                conversation.history.push(output.clone());
-                conversation.delta.push(output);
+                conversation.history.push(output);
             }
             self.maybe_compact(
                 &mut socket,
@@ -404,14 +400,14 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 Err(HarnessError::Responses(_)) => {
                     self.capture_turn_state(&socket);
                     drop(socket);
-                    conversation.reset_for_full_request(profile);
+                    conversation.reset_for_full_request();
                     self.stats.last_response_id = None;
                     self.connect(ConnectionPurpose::WarmupFallback).await?
                 }
                 Err(error) => return Err(error),
             },
             Err(HarnessError::Responses(_)) => {
-                conversation.reset_for_full_request(profile);
+                conversation.reset_for_full_request();
                 self.stats.last_response_id = None;
                 self.connect(ConnectionPurpose::WarmupFallback).await?
             }
@@ -433,7 +429,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         else {
             return Ok(());
         };
-        let active_context_tokens = compaction::active_context_tokens(usage, &conversation.delta);
+        let active_context_tokens = compaction::active_context_tokens(usage, conversation.delta());
         if active_context_tokens < auto_compact_token_limit {
             return Ok(());
         }
@@ -448,7 +444,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
             .perform_compaction(
                 socket,
                 after_model_call_index,
-                &conversation.delta,
+                conversation.delta(),
                 &conversation.history,
                 previous_response_id,
                 active_context_tokens,
@@ -456,7 +452,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 profile,
             )
             .await?;
-        conversation.install_compaction(item, profile);
+        conversation.install_compaction(item);
         Ok(())
     }
 
@@ -655,15 +651,19 @@ impl<'a, W: Write> ModelRun<'a, W> {
         &mut self,
         socket: &mut ResponsesSocket,
         call_index: u32,
-        delta: &[Value],
-        history: &[Value],
-        previous_response_id: Option<&str>,
+        conversation: &ConversationState,
         profile: &RequestProfile,
     ) -> Result<super::stream::TurnResult> {
         self.capture_turn_state(socket);
+        let full_input = conversation
+            .delta_start
+            .is_none()
+            .then(|| profile.full_input(&conversation.history));
+        let input = full_input.as_deref().unwrap_or(conversation.delta());
+        let previous_response_id = conversation.previous_response_id.as_deref();
         let request = EncodedRequest::new(&ResponseCreate::generation(
             self.config,
-            delta,
+            input,
             previous_response_id,
             profile,
             self.turn_state.as_deref(),
@@ -696,7 +696,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
             )?;
             self.capture_turn_state(socket);
             *socket = self.connect(ConnectionPurpose::Reconnect).await?;
-            let full_input = profile.full_input(history);
+            let full_input = profile.full_input(&conversation.history);
             let replay = EncodedRequest::new(&ResponseCreate::generation(
                 self.config,
                 &full_input,
