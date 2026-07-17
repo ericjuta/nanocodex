@@ -105,6 +105,10 @@ impl ShellSessions {
         }
     }
 
+    pub(crate) const fn default_shell_name(&self) -> &'static str {
+        self.default_shell.name()
+    }
+
     pub(crate) async fn execute(
         &self,
         command: ExecCommand,

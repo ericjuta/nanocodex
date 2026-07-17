@@ -135,12 +135,14 @@ pub(crate) struct WebSearchConfig {
 pub(crate) struct ToolRuntime {
     handlers: Vec<Box<dyn ToolHandler>>,
     code_mode: code_mode::CodeModeRuntime,
+    default_shell_name: &'static str,
 }
 
 impl ToolRuntime {
     pub(crate) fn new(workspace: impl Into<PathBuf>, web_search: WebSearchConfig) -> Self {
         let workspace = workspace.into();
         let sessions = Arc::new(ShellSessions::new());
+        let default_shell_name = sessions.default_shell_name();
         let handlers: Vec<Box<dyn ToolHandler>> = vec![
             Box::new(shell::ExecCommandHandler::new(
                 workspace.clone(),
@@ -155,7 +157,12 @@ impl ToolRuntime {
         Self {
             handlers,
             code_mode: code_mode::CodeModeRuntime::new(),
+            default_shell_name,
         }
+    }
+
+    pub(crate) const fn default_shell_name(&self) -> &'static str {
+        self.default_shell_name
     }
 
     pub(crate) fn model_specs(&self) -> Vec<Value> {

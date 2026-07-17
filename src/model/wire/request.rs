@@ -54,12 +54,14 @@ impl RequestProfile {
 pub(in crate::model) fn task_input(
     task: &Task,
     workspace: &str,
+    shell: &str,
     project_instructions: Option<&str>,
 ) -> Vec<Value> {
     let (current_date, timezone) = local_time_context();
     task_input_with_time_context(
         task,
         workspace,
+        shell,
         project_instructions,
         &current_date,
         &timezone,
@@ -69,6 +71,7 @@ pub(in crate::model) fn task_input(
 fn task_input_with_time_context(
     task: &Task,
     workspace: &str,
+    shell: &str,
     project_instructions: Option<&str>,
     current_date: &str,
     timezone: &str,
@@ -84,7 +87,7 @@ fn task_input_with_time_context(
     }
     context.push(json!({
         "type": "input_text",
-        "text": environment_context(workspace, current_date, timezone),
+        "text": environment_context(workspace, shell, current_date, timezone),
     }));
     vec![
         json!({
@@ -113,10 +116,12 @@ fn local_time_context() -> (String, String) {
     }
 }
 
-fn environment_context(workspace: &str, current_date: &str, timezone: &str) -> String {
+fn environment_context(workspace: &str, shell: &str, current_date: &str, timezone: &str) -> String {
     let mut context = String::from("<environment_context>\n  <cwd>");
     push_xml_escaped_text(&mut context, workspace);
-    context.push_str("</cwd>\n  <shell>sh</shell>\n  <current_date>");
+    context.push_str("</cwd>\n  <shell>");
+    push_xml_escaped_text(&mut context, shell);
+    context.push_str("</shell>\n  <current_date>");
     push_xml_escaped_text(&mut context, current_date);
     context.push_str("</current_date>\n  <timezone>");
     push_xml_escaped_text(&mut context, timezone);
@@ -313,6 +318,7 @@ mod tests {
             task_input_with_time_context(
                 &task,
                 "/workspace/a&b",
+                "bash",
                 Some("Follow the project formatter."),
                 "2026-07-17",
                 "America/Los_Angeles",
@@ -328,7 +334,7 @@ mod tests {
                         },
                         {
                             "type": "input_text",
-                            "text": "<environment_context>\n  <cwd>/workspace/a&amp;b</cwd>\n  <shell>sh</shell>\n  <current_date>2026-07-17</current_date>\n  <timezone>America/Los_Angeles</timezone>\n  <filesystem><workspace_roots><root>/workspace/a&amp;b</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>",
+                            "text": "<environment_context>\n  <cwd>/workspace/a&amp;b</cwd>\n  <shell>bash</shell>\n  <current_date>2026-07-17</current_date>\n  <timezone>America/Los_Angeles</timezone>\n  <filesystem><workspace_roots><root>/workspace/a&amp;b</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>",
                         },
                     ],
                 }),

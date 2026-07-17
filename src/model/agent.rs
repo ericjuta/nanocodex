@@ -277,7 +277,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
             },
         );
         let profile = RequestProfile::new(self.events.request_id(), &tools);
-        let history = task_input(self.task, &workspace, project_instructions.as_deref());
+        let history = task_input(
+            self.task,
+            &workspace,
+            tools.default_shell_name(),
+            project_instructions.as_deref(),
+        );
         let mut conversation = ConversationState::new(history)?;
         let mut socket = self
             .connect_with_warmup_fallback(&mut conversation, &profile)

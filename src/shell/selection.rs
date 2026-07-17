@@ -26,6 +26,16 @@ impl Shell {
         &self.path
     }
 
+    pub(super) const fn name(&self) -> &'static str {
+        match self.shell_type {
+            ShellType::Zsh => "zsh",
+            ShellType::Bash => "bash",
+            ShellType::PowerShell => "powershell",
+            ShellType::Sh => "sh",
+            ShellType::Cmd => "cmd",
+        }
+    }
+
     pub(super) fn args(&self, script: &str, login: bool) -> Vec<String> {
         match self.shell_type {
             ShellType::Zsh | ShellType::Bash | ShellType::Sh => vec![
