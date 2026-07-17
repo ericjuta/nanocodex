@@ -105,10 +105,19 @@ struct UsageTotals {
 impl UsageTotals {
     fn add(&mut self, usage: &Usage) {
         self.input_tokens += usage.input_tokens;
-        self.cached_input_tokens += usage.input_tokens_details.cached_tokens;
-        self.cache_write_input_tokens += usage.input_tokens_details.cache_write_tokens;
+        self.cached_input_tokens += usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens);
+        self.cache_write_input_tokens += usage
+            .input_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cache_write_tokens);
         self.output_tokens += usage.output_tokens;
-        self.reasoning_output_tokens += usage.output_tokens_details.reasoning_tokens;
+        self.reasoning_output_tokens += usage
+            .output_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.reasoning_tokens);
         self.total_tokens += usage.total_tokens;
     }
 }

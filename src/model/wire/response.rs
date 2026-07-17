@@ -6,11 +6,11 @@ pub(in crate::model) struct Usage {
     #[serde(default)]
     pub(in crate::model) input_tokens: u64,
     #[serde(default)]
-    pub(in crate::model) input_tokens_details: InputTokenDetails,
+    pub(in crate::model) input_tokens_details: Option<InputTokenDetails>,
     #[serde(default)]
     pub(in crate::model) output_tokens: u64,
     #[serde(default)]
-    pub(in crate::model) output_tokens_details: OutputTokenDetails,
+    pub(in crate::model) output_tokens_details: Option<OutputTokenDetails>,
     #[serde(default)]
     pub(in crate::model) total_tokens: u64,
 }
