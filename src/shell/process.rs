@@ -1,10 +1,10 @@
 use std::{
     env,
     ffi::{OsStr, OsString},
-    io,
-    os::unix::process::ExitStatusExt,
+    io::{self, Read, Write},
     path::Path,
-    process::{ExitStatus, Stdio},
+    process::Stdio,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use nix::{
@@ -12,7 +12,9 @@ use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 
 const SENSITIVE_ENV_PARTS: [&str; 11] = [
     "AUTH",
@@ -29,14 +31,81 @@ const SENSITIVE_ENV_PARTS: [&str; 11] = [
 ];
 
 pub(super) struct SpawnedProcess {
-    pub(super) child: Child,
-    pub(super) stdin: Option<ChildStdin>,
-    pub(super) stdout: Option<ChildStdout>,
-    pub(super) stderr: Option<ChildStderr>,
+    pub(super) child: ProcessChild,
+    pub(super) stdin: Option<ProcessStdin>,
+    pub(super) output: ProcessOutput,
     pub(super) process_group: ProcessGroupGuard,
 }
 
+pub(super) enum ProcessChild {
+    Pipes(Child),
+    Pty(JoinHandle<io::Result<i32>>),
+}
+
+impl ProcessChild {
+    pub(super) async fn wait(&mut self) -> io::Result<i32> {
+        match self {
+            Self::Pipes(child) => child.wait().await.map(exit_code),
+            Self::Pty(wait) => wait
+                .await
+                .map_err(|error| io::Error::other(format!("PTY wait task failed: {error}")))?,
+        }
+    }
+}
+
+pub(super) enum ProcessStdin {
+    Pipes(ChildStdin),
+    Pty(Arc<StdMutex<Box<dyn Write + Send>>>),
+}
+
+impl ProcessStdin {
+    pub(super) async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Pipes(stdin) => {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(bytes).await?;
+                stdin.flush().await
+            }
+            Self::Pty(writer) => {
+                let writer = Arc::clone(writer);
+                let bytes = bytes.to_vec();
+                tokio::task::spawn_blocking(move || {
+                    let mut writer = writer
+                        .lock()
+                        .map_err(|_| io::Error::other("PTY writer lock poisoned"))?;
+                    writer.write_all(&bytes)?;
+                    writer.flush()
+                })
+                .await
+                .map_err(|error| io::Error::other(format!("PTY write task failed: {error}")))?
+            }
+        }
+    }
+}
+
+pub(super) enum ProcessOutput {
+    Pipes {
+        stdout: Option<ChildStdout>,
+        stderr: Option<ChildStderr>,
+    },
+    Pty(Box<dyn Read + Send>),
+}
+
 pub(super) fn spawn(
+    script: &str,
+    workspace: &Path,
+    login: bool,
+    tty: bool,
+    environment: &[(OsString, OsString)],
+) -> io::Result<SpawnedProcess> {
+    if tty {
+        return spawn_pty(script, workspace, login, environment);
+    }
+
+    spawn_pipes(script, workspace, login, environment)
+}
+
+fn spawn_pipes(
     script: &str,
     workspace: &Path,
     login: bool,
@@ -59,15 +128,67 @@ pub(super) fn spawn(
         .id()
         .ok_or_else(|| io::Error::other("spawned /bin/sh without a process identifier"))?;
     Ok(SpawnedProcess {
-        stdin: child.stdin.take(),
-        stdout: child.stdout.take(),
-        stderr: child.stderr.take(),
-        child,
+        stdin: child.stdin.take().map(ProcessStdin::Pipes),
+        output: ProcessOutput::Pipes {
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+        },
+        child: ProcessChild::Pipes(child),
         process_group: ProcessGroupGuard::new(pid),
     })
 }
 
-pub(super) fn exit_code(status: ExitStatus) -> i32 {
+fn spawn_pty(
+    script: &str,
+    workspace: &Path,
+    login: bool,
+    environment: &[(OsString, OsString)],
+) -> io::Result<SpawnedProcess> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(pty_error)?;
+    let mut command = CommandBuilder::new("/bin/sh");
+    command.arg(if login { "-lc" } else { "-c" });
+    command.arg(script);
+    command.cwd(workspace);
+    command.env_clear();
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+
+    let mut child = pair.slave.spawn_command(command).map_err(pty_error)?;
+    let pid = child
+        .process_id()
+        .ok_or_else(|| io::Error::other("spawned PTY command without a process identifier"))?;
+    let reader = pair.master.try_clone_reader().map_err(pty_error)?;
+    let writer = pair.master.take_writer().map_err(pty_error)?;
+    let wait = tokio::task::spawn_blocking(move || {
+        child
+            .wait()
+            .map(|status| i32::try_from(status.exit_code()).unwrap_or(i32::MAX))
+    });
+
+    Ok(SpawnedProcess {
+        child: ProcessChild::Pty(wait),
+        stdin: Some(ProcessStdin::Pty(Arc::new(StdMutex::new(writer)))),
+        output: ProcessOutput::Pty(reader),
+        process_group: ProcessGroupGuard::new(pid),
+    })
+}
+
+fn pty_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+
     status
         .code()
         .or_else(|| status.signal().map(|signal| 128_i32.saturating_add(signal)))

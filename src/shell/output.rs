@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::Read, sync::Arc};
 
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
@@ -44,6 +44,27 @@ pub(super) async fn drain(
             }
         }
     }
+}
+
+pub(super) fn drain_blocking(
+    mut pipe: Box<dyn Read + Send>,
+    captured: Arc<Mutex<CapturedOutput>>,
+    capture_limit: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut buffer = [0_u8; READ_BUFFER_LENGTH];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(length) => captured
+                    .blocking_lock()
+                    .push(&buffer[..length], capture_limit),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                // PTY masters commonly report EIO when their slave closes.
+                Err(_) => return,
+            }
+        }
+    })
 }
 
 pub(super) fn redact_and_limit(

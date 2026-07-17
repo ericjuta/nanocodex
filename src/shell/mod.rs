@@ -12,13 +12,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::{
-    io::AsyncWriteExt,
-    process::{Child, ChildStdin},
-    sync::Mutex,
-    task::JoinHandle,
-    time::timeout,
-};
+use tokio::{sync::Mutex, task::JoinHandle, time::timeout};
 
 const DEFAULT_EXEC_YIELD_MS: u64 = 10_000;
 const DEFAULT_WRITE_YIELD_MS: u64 = 250;
@@ -30,6 +24,7 @@ pub(crate) struct ExecCommand {
     script: String,
     workdir: Option<String>,
     login: Option<bool>,
+    tty: bool,
     yield_time_ms: Option<i64>,
     max_output_tokens: Option<i64>,
 }
@@ -39,6 +34,7 @@ impl ExecCommand {
         script: String,
         workdir: Option<String>,
         login: Option<bool>,
+        tty: bool,
         yield_time_ms: Option<i64>,
         max_output_tokens: Option<i64>,
     ) -> Self {
@@ -46,6 +42,7 @@ impl ExecCommand {
             script,
             workdir,
             login,
+            tty,
             yield_time_ms,
             max_output_tokens,
         }
@@ -115,6 +112,7 @@ impl ShellSessions {
             &command.script,
             &workdir,
             command.login.unwrap_or(true),
+            command.tty,
             &environment,
         ) {
             Ok(spawned) => spawned,
@@ -180,8 +178,8 @@ impl ShellSessions {
 
 struct Session {
     id: i64,
-    child: Mutex<Child>,
-    stdin: Mutex<Option<ChildStdin>>,
+    child: Mutex<process::ProcessChild>,
+    stdin: Mutex<Option<process::ProcessStdin>>,
     process_group: Mutex<process::ProcessGroupGuard>,
     drains: Mutex<Option<Vec<JoinHandle<()>>>>,
     captured: Arc<Mutex<CapturedOutput>>,
@@ -192,18 +190,25 @@ struct Session {
 impl Session {
     fn new(id: i64, spawned: process::SpawnedProcess, secrets: Vec<String>) -> Arc<Self> {
         let captured = Arc::new(Mutex::new(CapturedOutput::default()));
-        let drains = vec![
-            tokio::spawn(output::drain(
-                spawned.stdout,
+        let drains = match spawned.output {
+            process::ProcessOutput::Pipes { stdout, stderr } => vec![
+                tokio::spawn(output::drain(
+                    stdout,
+                    Arc::clone(&captured),
+                    MAX_CAPTURE_BYTES,
+                )),
+                tokio::spawn(output::drain(
+                    stderr,
+                    Arc::clone(&captured),
+                    MAX_CAPTURE_BYTES,
+                )),
+            ],
+            process::ProcessOutput::Pty(reader) => vec![output::drain_blocking(
+                reader,
                 Arc::clone(&captured),
                 MAX_CAPTURE_BYTES,
-            )),
-            tokio::spawn(output::drain(
-                spawned.stderr,
-                Arc::clone(&captured),
-                MAX_CAPTURE_BYTES,
-            )),
-        ];
+            )],
+        };
         Arc::new(Self {
             id,
             child: Mutex::new(spawned.child),
@@ -221,8 +226,7 @@ impl Session {
         let stdin = stdin.as_mut().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin is closed")
         })?;
-        stdin.write_all(chars.as_bytes()).await?;
-        stdin.flush().await
+        stdin.write(chars.as_bytes()).await
     }
 
     async fn wait_for_output(
@@ -236,10 +240,10 @@ impl Session {
             timeout(yield_time, child.wait()).await
         };
         let exit_code = match status {
-            Ok(Ok(status)) => {
+            Ok(Ok(exit_code)) => {
                 let _ = self.process_group.lock().await.terminate_and_disarm();
                 self.finish_drains().await;
-                Some(process::exit_code(status))
+                Some(exit_code)
             }
             Ok(Err(error)) => {
                 let _ = self.process_group.lock().await.terminate_and_disarm();
@@ -434,6 +438,7 @@ mod tests {
                     "read value; printf 'got:%s' \"$value\"".to_owned(),
                     None,
                     Some(false),
+                    false,
                     Some(250),
                     None,
                 ),
@@ -447,5 +452,34 @@ mod tests {
             .await;
         assert_eq!(second.exit_code, Some(0));
         assert_eq!(second.output, "got:hello");
+    }
+
+    #[tokio::test]
+    async fn tty_command_has_a_terminal_and_accepts_stdin() {
+        let sessions = ShellSessions::new();
+        let first = sessions
+            .execute(
+                ExecCommand::new(
+                    "test -t 0 && test -t 1 && test -t 2; stty -echo; printf ready; read value; printf 'got:%s' \"$value\""
+                        .to_owned(),
+                    None,
+                    Some(false),
+                    true,
+                    Some(1_000),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(first.session_id, Some(1));
+
+        let second = sessions
+            .write_stdin(WriteStdin::new(1, "hello\n".to_owned(), Some(1_000), None))
+            .await;
+        assert_eq!(second.exit_code, Some(0));
+        assert_eq!(
+            format!("{}{}", first.output, second.output),
+            "readygot:hello"
+        );
     }
 }

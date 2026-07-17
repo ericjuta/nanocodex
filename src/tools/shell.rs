@@ -43,6 +43,10 @@ impl ToolHandler for ExecCommandHandler {
                         "type": "boolean",
                         "description": "True runs with login-shell semantics; false disables them. Defaults to true."
                     },
+                    "tty": {
+                        "type": "boolean",
+                        "description": "True allocates a PTY for the command; false or omitted uses plain pipes."
+                    },
                     "yield_time_ms": {
                         "type": "integer",
                         "description": "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
@@ -73,6 +77,7 @@ impl ToolHandler for ExecCommandHandler {
                 arguments.cmd,
                 arguments.workdir,
                 arguments.login,
+                arguments.tty,
                 arguments.yield_time_ms,
                 arguments.max_output_tokens,
             );
@@ -160,6 +165,8 @@ struct ExecCommandArguments {
     workdir: Option<String>,
     #[serde(default)]
     login: Option<bool>,
+    #[serde(default)]
+    tty: bool,
     #[serde(default)]
     yield_time_ms: Option<i64>,
     #[serde(default)]
