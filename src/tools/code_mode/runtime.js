@@ -11,6 +11,8 @@ const invalidImageOutput =
   "Tool call failed: invalid image output. Pass a base64 data URI instead";
 const remoteImageOutput =
   "Tool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead";
+const jsonParse = JSON.parse;
+const jsonStringify = JSON.stringify;
 let wakeExecution;
 let currentCell;
 
@@ -68,6 +70,31 @@ function stringify(value) {
   if (typeof value === "string") return value;
   if (value === undefined) return "undefined";
   try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+function errorText(error) {
+  return error && (error.stack || error.message) || String(error);
+}
+
+function storageKey(value, helper) {
+  try {
+    return `${value}`;
+  } catch {
+    throw `${helper} key must be a string`;
+  }
+}
+
+function storedValue(key, value) {
+  let encoded;
+  try {
+    encoded = jsonStringify(value);
+  } catch (error) {
+    throw errorText(error);
+  }
+  if (encoded === undefined) {
+    throw `Unable to store ${jsonStringify(key)}. Only plain serializable objects can be stored.`;
+  }
+  return jsonParse(encoded);
 }
 
 // Node 12 leaves import.meta.url undefined for --eval modules. Anchor require
@@ -166,12 +193,13 @@ async function runCell(init) {
   }
 
   function store(key, value) {
-    if (typeof key !== "string") throw new TypeError("store key must be a string");
-    stored.set(key, cloneValue(value));
+    const normalizedKey = storageKey(key, "store");
+    stored.set(normalizedKey, storedValue(normalizedKey, value));
   }
 
   function load(key) {
-    return stored.has(key) ? cloneValue(stored.get(key)) : undefined;
+    const normalizedKey = storageKey(key, "load");
+    return stored.has(normalizedKey) ? cloneValue(stored.get(normalizedKey)) : undefined;
   }
 
   async function yield_control() {
@@ -230,7 +258,7 @@ async function runCell(init) {
       stored: Object.fromEntries(stored),
     });
   } catch (error) {
-    const message = error && (error.stack || error.message) || String(error);
+    const message = errorText(error);
     send({
       type: "error",
       cell_id: init.cell_id,

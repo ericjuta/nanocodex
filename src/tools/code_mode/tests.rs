@@ -213,6 +213,68 @@ async fn notify_serializes_values_and_rejects_empty_text() -> Result<()> {
 }
 
 #[tokio::test]
+async fn store_normalizes_json_values_and_coerces_keys() -> Result<()> {
+    let workspace = temporary_workspace("code-mode-store-json")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let write = tools
+        .execute_code(
+            r"
+const value = { kept: 1, dropped: undefined, array: [undefined, NaN] };
+store(42, value);
+value.kept = 99;
+",
+            test_context(&history),
+        )
+        .await;
+    assert!(write.success, "{}", execution_output(&write));
+
+    let read = tools
+        .execute_code(
+            r"text(load(42));",
+            test_context_with_call(&history, "call-read"),
+        )
+        .await;
+    assert!(read.success, "{}", execution_output(&read));
+    assert_eq!(
+        serde_json::from_str::<Value>(emitted_text(&read)?)?,
+        serde_json::json!({ "kept": 1, "array": [null, null] })
+    );
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn store_rejects_non_serializable_values_at_the_call_boundary() -> Result<()> {
+    let workspace = temporary_workspace("code-mode-store-errors")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(r#"store("candidate", undefined);"#, test_context(&history))
+        .await;
+
+    assert!(!execution.success);
+    let output = execution_output(&execution);
+    assert!(output.contains(
+        "Script error:\nUnable to store \"candidate\". Only plain serializable objects can be stored."
+    ));
+    assert!(!output.contains("at store"));
+
+    let read = tools
+        .execute_code(
+            r#"text(load("candidate"));"#,
+            test_context_with_call(&history, "call-read"),
+        )
+        .await;
+    assert!(read.success, "{}", execution_output(&read));
+    assert_eq!(emitted_text(&read)?, "undefined");
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn yielded_cell_completes_through_wait() -> Result<()> {
     let workspace = temporary_workspace("yielded-cell")?;
     let tools = test_tools(&workspace);
