@@ -1,5 +1,6 @@
 mod output;
 mod process;
+mod selection;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -23,6 +24,7 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 pub(crate) struct ExecCommand {
     script: String,
     workdir: Option<String>,
+    shell: Option<String>,
     login: Option<bool>,
     tty: bool,
     yield_time_ms: Option<i64>,
@@ -33,6 +35,7 @@ impl ExecCommand {
     pub(crate) const fn new(
         script: String,
         workdir: Option<String>,
+        shell: Option<String>,
         login: Option<bool>,
         tty: bool,
         yield_time_ms: Option<i64>,
@@ -41,6 +44,7 @@ impl ExecCommand {
         Self {
             script,
             workdir,
+            shell,
             login,
             tty,
             yield_time_ms,
@@ -89,6 +93,7 @@ pub(crate) struct ExecCommandResult {
 pub(crate) struct ShellSessions {
     sessions: Mutex<HashMap<i64, Arc<Session>>>,
     next_session_id: AtomicI64,
+    default_shell: selection::Shell,
 }
 
 impl ShellSessions {
@@ -96,6 +101,7 @@ impl ShellSessions {
         Self {
             sessions: Mutex::new(HashMap::new()),
             next_session_id: AtomicI64::new(1),
+            default_shell: selection::default_user_shell(),
         }
     }
 
@@ -107,10 +113,15 @@ impl ShellSessions {
         let started_at = Instant::now();
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let workdir = resolve_workdir(workspace, command.workdir.as_deref());
+        let shell = command.shell.as_deref().map_or_else(
+            || self.default_shell.clone(),
+            selection::get_shell_by_model_provided_path,
+        );
         let (environment, secrets) = process::sanitized_environment();
         let spawned = match process::spawn(
             &command.script,
             &workdir,
+            &shell,
             command.login.unwrap_or(true),
             command.tty,
             &environment,
@@ -119,7 +130,7 @@ impl ShellSessions {
             Err(error) => {
                 return ExecCommandResult::failed(
                     started_at.elapsed(),
-                    format!("failed to spawn /bin/sh: {error}"),
+                    format!("failed to spawn {}: {error}", shell.path().display()),
                 );
             }
         };
@@ -247,7 +258,7 @@ impl Session {
             }
             Ok(Err(error)) => {
                 let _ = self.process_group.lock().await.terminate_and_disarm();
-                let message = format!("failed to wait for /bin/sh: {error}");
+                let message = format!("failed to wait for shell command: {error}");
                 self.captured
                     .lock()
                     .await
@@ -437,6 +448,7 @@ mod tests {
                 ExecCommand::new(
                     "read value; printf 'got:%s' \"$value\"".to_owned(),
                     None,
+                    None,
                     Some(false),
                     false,
                     Some(250),
@@ -467,6 +479,7 @@ mod tests {
                         ready.display()
                     ),
                     None,
+                    None,
                     Some(false),
                     true,
                     Some(1_000),
@@ -493,5 +506,30 @@ mod tests {
             format!("{}{}", first.output, second.output),
             "readygot:hello"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_shell_runs_bash_syntax() {
+        if !std::path::Path::new("/bin/bash").is_file() {
+            return;
+        }
+        let sessions = ShellSessions::new();
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    "[[ codex == codex ]] && printf bash".to_owned(),
+                    None,
+                    Some("/bin/bash".to_owned()),
+                    Some(false),
+                    false,
+                    Some(1_000),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output, "bash");
     }
 }

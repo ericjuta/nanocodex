@@ -16,6 +16,8 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 
+use super::selection::Shell;
+
 const SENSITIVE_ENV_PARTS: [&str; 11] = [
     "AUTH",
     "AUTHORIZATION",
@@ -94,26 +96,28 @@ pub(super) enum ProcessOutput {
 pub(super) fn spawn(
     script: &str,
     workspace: &Path,
+    shell: &Shell,
     login: bool,
     tty: bool,
     environment: &[(OsString, OsString)],
 ) -> io::Result<SpawnedProcess> {
     if tty {
-        return spawn_pty(script, workspace, login, environment);
+        return spawn_pty(script, workspace, shell, login, environment);
     }
 
-    spawn_pipes(script, workspace, login, environment)
+    spawn_pipes(script, workspace, shell, login, environment)
 }
 
 fn spawn_pipes(
     script: &str,
     workspace: &Path,
+    shell: &Shell,
     login: bool,
     environment: &[(OsString, OsString)],
 ) -> io::Result<SpawnedProcess> {
-    let mut command = Command::new("/bin/sh");
+    let mut command = Command::new(shell.path());
     command
-        .args([if login { "-lc" } else { "-c" }, script])
+        .args(shell.args(script, login))
         .current_dir(workspace)
         .env_clear()
         .envs(environment.iter().cloned())
@@ -126,7 +130,7 @@ fn spawn_pipes(
     let mut child = command.spawn()?;
     let pid = child
         .id()
-        .ok_or_else(|| io::Error::other("spawned /bin/sh without a process identifier"))?;
+        .ok_or_else(|| io::Error::other("spawned shell without a process identifier"))?;
     Ok(SpawnedProcess {
         stdin: child.stdin.take().map(ProcessStdin::Pipes),
         output: ProcessOutput::Pipes {
@@ -141,6 +145,7 @@ fn spawn_pipes(
 fn spawn_pty(
     script: &str,
     workspace: &Path,
+    shell: &Shell,
     login: bool,
     environment: &[(OsString, OsString)],
 ) -> io::Result<SpawnedProcess> {
@@ -153,9 +158,10 @@ fn spawn_pty(
             pixel_height: 0,
         })
         .map_err(pty_error)?;
-    let mut command = CommandBuilder::new("/bin/sh");
-    command.arg(if login { "-lc" } else { "-c" });
-    command.arg(script);
+    let mut command = CommandBuilder::new(shell.path());
+    for argument in shell.args(script, login) {
+        command.arg(argument);
+    }
     command.cwd(workspace);
     command.env_clear();
     for (name, value) in environment {

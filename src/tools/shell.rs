@@ -39,6 +39,10 @@ impl ToolHandler for ExecCommandHandler {
                         "type": "string",
                         "description": "Working directory for the command. Defaults to the task workspace."
                     },
+                    "shell": {
+                        "type": "string",
+                        "description": "Shell binary to launch. Defaults to the user's default shell."
+                    },
                     "login": {
                         "type": "boolean",
                         "description": "True runs with login-shell semantics; false disables them. Defaults to true."
@@ -76,6 +80,7 @@ impl ToolHandler for ExecCommandHandler {
             let command = ExecCommand::new(
                 arguments.cmd,
                 arguments.workdir,
+                arguments.shell,
                 arguments.login,
                 arguments.tty,
                 arguments.yield_time_ms,
@@ -164,6 +169,8 @@ struct ExecCommandArguments {
     #[serde(default)]
     workdir: Option<String>,
     #[serde(default)]
+    shell: Option<String>,
+    #[serde(default)]
     login: Option<bool>,
     #[serde(default)]
     tty: bool,
@@ -217,4 +224,24 @@ fn unified_exec_output_schema() -> Value {
         "required": ["wall_time_seconds", "output"],
         "additionalProperties": false
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use super::{ExecCommandHandler, ToolHandler};
+    use crate::shell::ShellSessions;
+
+    #[test]
+    fn exec_command_exposes_codex_shell_parameter() {
+        let handler = ExecCommandHandler::new(PathBuf::from("/"), Arc::new(ShellSessions::new()));
+        let spec = handler.spec();
+
+        assert_eq!(
+            spec.pointer("/parameters/properties/shell/type")
+                .and_then(serde_json::Value::as_str),
+            Some("string")
+        );
+    }
 }
