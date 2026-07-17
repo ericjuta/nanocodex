@@ -85,14 +85,14 @@ pub(super) fn install_history(
         object.remove("id");
     }
 
-    let task = history
+    let retained = history
         .iter()
-        .find(|item| is_real_user_message(item, initial_context))
+        .filter(|item| is_real_user_message(item, initial_context))
         .cloned()
-        .map(truncate_task);
-    let mut installed = Vec::with_capacity(usize::from(task.is_some()) + 2);
-    installed.push(initial_context.clone());
-    installed.extend(task);
+        .collect();
+    let mut installed = truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
+    let insertion_index = installed.len().saturating_sub(1);
+    installed.insert(insertion_index, initial_context.clone());
     installed.push(compaction);
     installed
 }
@@ -106,18 +106,78 @@ fn is_user_message(item: &Value) -> bool {
         && item.get("role").and_then(Value::as_str) == Some("user")
 }
 
-fn truncate_task(mut task: Value) -> Value {
-    let Some(text) = task.pointer("/content/0/text").and_then(Value::as_str) else {
-        return task;
-    };
-    if approx_tokens(text.len()) <= RETAINED_MESSAGE_TOKEN_BUDGET {
-        return task;
+fn truncate_retained_messages(items: Vec<Value>, max_tokens: usize) -> Vec<Value> {
+    let mut remaining = max_tokens;
+    let mut retained = Vec::with_capacity(items.len());
+    for item in items.into_iter().rev() {
+        if remaining == 0 {
+            continue;
+        }
+        let tokens = message_text_token_count(&item).max(1);
+        if tokens <= remaining {
+            retained.push(item);
+            remaining = remaining.saturating_sub(tokens);
+        } else if let Some(item) = truncate_message_text(item, remaining) {
+            retained.push(item);
+            remaining = 0;
+        }
     }
-    let text = truncate_middle_with_token_budget(text, RETAINED_MESSAGE_TOKEN_BUDGET);
-    if let Some(slot) = task.pointer_mut("/content/0/text") {
-        *slot = Value::String(text);
+    retained.reverse();
+    retained
+}
+
+fn message_text_token_count(item: &Value) -> usize {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(
+            |content| match content.get("type").and_then(Value::as_str) {
+                Some("input_text" | "output_text") => {
+                    content.get("text").and_then(Value::as_str).map(str::len)
+                }
+                _ => None,
+            },
+        )
+        .map(approx_tokens)
+        .sum()
+}
+
+fn truncate_message_text(mut item: Value, max_tokens: usize) -> Option<Value> {
+    let content = item.get_mut("content")?.as_array_mut()?;
+    let mut remaining = max_tokens;
+    let mut truncated = Vec::with_capacity(content.len());
+    for mut content_item in std::mem::take(content) {
+        match content_item.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text") => {
+                if remaining == 0 {
+                    continue;
+                }
+                let Some(text) = content_item.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                let tokens = approx_tokens(text.len());
+                if tokens <= remaining {
+                    remaining = remaining.saturating_sub(tokens);
+                } else {
+                    let text = truncate_middle_with_token_budget(text, remaining);
+                    let Some(slot) = content_item.get_mut("text") else {
+                        continue;
+                    };
+                    *slot = Value::String(text);
+                    remaining = 0;
+                }
+                truncated.push(content_item);
+            }
+            Some("input_image") => truncated.push(content_item),
+            _ => {}
+        }
     }
-    task
+    if truncated.is_empty() {
+        return None;
+    }
+    *content = truncated;
+    Some(item)
 }
 
 fn truncate_middle_with_token_budget(text: &str, max_tokens: usize) -> String {
@@ -251,15 +311,17 @@ mod tests {
     }
 
     #[test]
-    fn installed_history_retains_user_input_and_reinjects_initial_context() {
+    fn installed_history_retains_user_inputs_and_reinjects_initial_context() {
         let initial = message("initial context");
-        let task = message("do the task");
+        let first = message("do the task");
+        let latest = message("and preserve the tests");
         let history = vec![
             initial.clone(),
-            task.clone(),
+            first.clone(),
             json!({ "type": "reasoning", "encrypted_content": "old" }),
             json!({ "type": "custom_tool_call", "call_id": "call-1", "name": "exec", "input": "text(1)" }),
             json!({ "type": "custom_tool_call_output", "call_id": "call-1", "output": "done" }),
+            latest.clone(),
         ];
 
         assert_eq!(
@@ -269,10 +331,47 @@ mod tests {
                 json!({ "id": "cmp-id", "type": "compaction", "encrypted_content": "opaque" }),
             ),
             vec![
+                first,
                 initial,
-                task,
+                latest,
                 json!({ "type": "compaction", "encrypted_content": "opaque" }),
             ]
+        );
+    }
+
+    #[test]
+    fn retained_history_truncation_keeps_newest_messages_first() {
+        let retained = vec![message("old-old"), message("middle1234"), message("new")];
+
+        assert_eq!(
+            truncate_retained_messages(retained, 3),
+            vec![message("midd…1 tokens truncated…1234"), message("new")]
+        );
+    }
+
+    #[test]
+    fn retained_history_truncation_preserves_images() {
+        let item = json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": "abcdef" },
+                { "type": "input_image", "image_url": "data:image/png;base64,abc" },
+                { "type": "output_text", "text": "uvwxyz" },
+            ],
+        });
+
+        assert_eq!(
+            truncate_retained_messages(vec![item], 3),
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "abcdef" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,abc" },
+                    { "type": "output_text", "text": "uv…1 tokens truncated…yz" },
+                ],
+            })]
         );
     }
 
