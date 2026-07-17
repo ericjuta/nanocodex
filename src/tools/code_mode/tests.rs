@@ -52,6 +52,31 @@ text({ first: first.exit_code, second: second.exit_code });
 }
 
 #[tokio::test]
+async fn failed_nested_tool_rejects_its_javascript_promise() -> Result<()> {
+    let workspace = temporary_workspace("nested-tool-rejection")?;
+    let tools = ToolRuntime::new(&workspace);
+    let execution = tools
+        .execute_code(
+            r#"
+try {
+  await tools.view_image({ path: "missing.png" });
+  text("unexpected success");
+} catch (error) {
+  text(error);
+}
+"#,
+        )
+        .await;
+
+    assert!(execution.success);
+    assert!(emitted_text(&execution)?.contains("unable to locate image"));
+    assert_eq!(execution.nested_calls.len(), 1);
+    assert!(!execution.nested_calls[0].success);
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn yielded_cell_completes_through_wait() -> Result<()> {
     let workspace = temporary_workspace("yielded-cell")?;
     let tools = ToolRuntime::new(&workspace);
