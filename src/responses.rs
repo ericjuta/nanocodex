@@ -26,6 +26,7 @@ const EVENT_IDLE_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(300)
 };
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
+const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -90,6 +91,9 @@ impl ResponsesSocket {
             "OpenAI-Beta",
             HeaderValue::from_static(RESPONSES_WEBSOCKETS_BETA),
         );
+        request
+            .headers_mut()
+            .insert(RESPONSES_LITE_HEADER, HeaderValue::from_static("true"));
         for name in ["session-id", "thread-id", "x-client-request-id"] {
             request.headers_mut().insert(
                 name,
@@ -372,6 +376,13 @@ mod tests {
                         .get("OpenAI-Beta")
                         .and_then(|v| v.to_str().ok()),
                     Some("responses_websockets=2026-02-06")
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("x-openai-internal-codex-responses-lite")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("true")
                 );
                 Ok(response)
             })
