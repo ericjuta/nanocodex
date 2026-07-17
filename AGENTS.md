@@ -95,6 +95,8 @@
 - Tasks run YOLO inside their eval container; there is no approval subsystem.
 - Do not add provider portability, backwards compatibility, a TUI, JJ, graders,
   or local subagent orchestration before their planned milestone.
+- Skills are out of scope for this project. Do not add skill discovery, skill
+  catalogs, `SKILL.md` injection, bundled skills, or plugin-provided skills.
 - Model execution is the only runtime mode. Do not restore milestone positive
   controls, compatibility modes, or duplicate shell implementations.
 - Do not add event buses, collector traits, shared mutable run state, or generic
