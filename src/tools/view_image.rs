@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io::Cursor,
+    path::{Path, PathBuf},
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
@@ -99,11 +102,12 @@ impl ToolHandler for ViewImageHandler {
                     ));
                 }
             };
+            let (mime, bytes) = match prompt_image_bytes(&path, bytes) {
+                Ok(image) => image,
+                Err(error) => return ToolExecution::error(error),
+            };
             let detail = arguments.detail.unwrap_or(ImageDetailArgument::High).into();
-            let image_url = format!(
-                "data:application/octet-stream;base64,{}",
-                STANDARD.encode(bytes)
-            );
+            let image_url = format!("data:{mime};base64,{}", STANDARD.encode(bytes));
             ToolExecution {
                 output: ToolOutputBody::Content(vec![ToolOutputContent::InputImage {
                     image_url: image_url.clone(),
@@ -117,6 +121,29 @@ impl ToolHandler for ViewImageHandler {
             }
         })
     }
+}
+
+fn prompt_image_bytes(path: &Path, bytes: Vec<u8>) -> Result<(&'static str, Vec<u8>), String> {
+    let format = image::guess_format(&bytes)
+        .map_err(|error| format!("unable to decode image at `{}`: {error}", path.display()))?;
+    let mime = match format {
+        image::ImageFormat::Png => Some("image/png"),
+        image::ImageFormat::Jpeg => Some("image/jpeg"),
+        image::ImageFormat::Gif => Some("image/gif"),
+        image::ImageFormat::WebP => Some("image/webp"),
+        _ => None,
+    };
+    if let Some(mime) = mime {
+        return Ok((mime, bytes));
+    }
+
+    let decoded = image::load_from_memory_with_format(&bytes, format)
+        .map_err(|error| format!("unable to decode image at `{}`: {error}", path.display()))?;
+    let mut encoded = Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .map_err(|error| format!("unable to encode image at `{}`: {error}", path.display()))?;
+    Ok(("image/png", encoded.into_inner()))
 }
 
 #[derive(Deserialize)]
@@ -148,5 +175,21 @@ fn resolve(workspace: &Path, path: &Path) -> PathBuf {
         path.to_owned()
     } else {
         workspace.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_image_bytes;
+    use std::path::Path;
+
+    #[test]
+    fn converts_portable_pixmap_to_supported_png() {
+        let ppm = b"P6\n1 1\n255\n\xff\x00\x00".to_vec();
+        let (mime, bytes) = prompt_image_bytes(Path::new("screen.ppm"), ppm)
+            .expect("the regression fixture should decode");
+
+        assert_eq!(mime, "image/png");
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }
