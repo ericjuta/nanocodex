@@ -171,7 +171,9 @@ fn render_object(map: &serde_json::Map<String, Value>) -> String {
     });
     let mut lines = Vec::new();
     for (name, value) in properties {
-        if multiline && let Some(description) = value.get("description").and_then(Value::as_str) {
+        if let (true, Some(description)) =
+            (multiline, value.get("description").and_then(Value::as_str))
+        {
             for line in description
                 .lines()
                 .map(str::trim)
