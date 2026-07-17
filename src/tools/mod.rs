@@ -1,5 +1,6 @@
 mod apply_patch;
 mod code_mode;
+mod image;
 mod plan;
 mod shell;
 mod view_image;
@@ -13,6 +14,7 @@ use serde_json::{Value, json};
 use crate::shell::ShellSessions;
 
 pub(crate) use code_mode::{CodeModeExecution, NestedToolCall};
+pub(crate) use image::prepare_output_images;
 
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
@@ -33,7 +35,7 @@ pub(crate) enum ToolOutputContent {
     },
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ImageDetail {
     Auto,

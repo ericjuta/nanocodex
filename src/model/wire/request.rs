@@ -148,7 +148,7 @@ pub(in crate::model) struct ResponseCreate<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_response_id: Option<&'a str>,
-    input: &'a [Value],
+    input: Vec<Value>,
     tool_choice: &'static str,
     parallel_tool_calls: bool,
     reasoning: ReasoningControls,
@@ -207,7 +207,7 @@ impl<'a> ResponseCreate<'a> {
             kind: "response.create",
             model: &config.model,
             previous_response_id,
-            input,
+            input: responses_lite_input(input),
             tool_choice: "auto",
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
@@ -228,6 +228,33 @@ impl<'a> ResponseCreate<'a> {
                 turn_state,
             },
         }
+    }
+}
+
+fn responses_lite_input(input: &[Value]) -> Vec<Value> {
+    let mut input = input.to_vec();
+    for item in &mut input {
+        strip_image_details(item);
+    }
+    input
+}
+
+fn strip_image_details(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                strip_image_details(value);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("input_image") {
+                object.remove("detail");
+            }
+            for value in object.values_mut() {
+                strip_image_details(value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -350,5 +377,43 @@ mod tests {
         assert_eq!(request["reasoning"]["summary"], "auto");
         assert!(request["reasoning"].get("mode").is_none());
         assert!(request.get("context_management").is_none());
+    }
+
+    #[test]
+    fn responses_lite_request_copy_strips_image_details() {
+        let config = ModelConfig {
+            model: "test-model".to_owned(),
+            api_key: "test-key".to_owned(),
+            effort: ReasoningEffort::Low,
+            websocket_url: "ws://localhost".to_owned(),
+            api_base_url: "http://localhost/v1".to_owned(),
+        };
+        let runtime = ToolRuntime::new(
+            ".",
+            crate::tools::WebSearchConfig {
+                endpoint: config.search_endpoint(),
+                api_key: config.api_key.clone(),
+            },
+        );
+        let profile = RequestProfile::new("session-a", &runtime);
+        let input = vec![json!({
+            "type": "custom_tool_call_output",
+            "call_id": "call-1",
+            "output": [
+                {"type": "input_text", "text": "before"},
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,a",
+                    "detail": "original"
+                }
+            ]
+        })];
+        let original = input.clone();
+
+        let request = ResponseCreate::generation(&config, &input, None, &profile, None);
+        let request = serde_json::to_value(request).expect("request should serialize");
+
+        assert!(request["input"][0]["output"][1].get("detail").is_none());
+        assert_eq!(input, original);
     }
 }

@@ -18,7 +18,10 @@ use crate::{
     AgentError, HarnessError, ResponsesError, Result,
     protocol::{EventWriter, Task},
     responses::{EncodedRequest, ResponsesSocket, decode_event, parse_raw_json},
-    tools::{NestedToolCall, ToolContext, ToolOutputBody, ToolRuntime, WebSearchConfig},
+    tools::{
+        NestedToolCall, ToolContext, ToolOutputBody, ToolRuntime, WebSearchConfig,
+        prepare_output_images,
+    },
 };
 
 #[derive(Serialize)]
@@ -359,11 +362,12 @@ impl<'a, W: Write> ModelRun<'a, W> {
             session_id: self.events.request_id(),
             history,
         };
-        let execution = if call.name == "exec" {
+        let mut execution = if call.name == "exec" {
             tools.execute_code(&call.input, context).await
         } else {
             tools.wait_for_code(&call.input, context).await
         };
+        prepare_output_images(&mut execution.output).await;
         let duration_ns = elapsed_ns(started_at);
         self.stats.tool_wall_duration_ns += duration_ns;
         for nested in &execution.nested_calls {

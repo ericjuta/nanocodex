@@ -85,6 +85,64 @@ async fn store_false_local_code_mode_round_trip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn prepares_images_and_strips_detail_before_lite_request() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-image",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-image",
+                    "name": "exec",
+                    "input": "image(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\", \"original\"); image(\"https://example.com/image.png\", \"high\");"
+                })],
+            ),
+        )
+        .await?;
+
+        let continuation = next_json(&mut socket).await?;
+        let output = continuation["input"][0]["output"]
+            .as_array()
+            .ok_or_else(|| eyre!("image tool output was not content"))?;
+        let image = output
+            .iter()
+            .find(|item| item["type"] == "input_image")
+            .ok_or_else(|| eyre!("prepared image was missing"))?;
+        assert!(
+            image["image_url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
+        assert!(image.get("detail").is_none());
+        assert!(
+            output.iter().any(|item| {
+                item["text"] == "image content omitted because remote image URLs are not supported"
+            }),
+            "remote image placeholder was missing"
+        );
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("images")?;
+    run_model(&endpoint, &workspace, "inspect images").await?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn yielded_exec_cell_continues_through_direct_wait_tool() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
