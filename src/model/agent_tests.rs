@@ -85,6 +85,59 @@ async fn store_false_local_code_mode_round_trip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn code_mode_notify_adds_a_named_exec_output_to_the_next_request() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-notify",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "notify({phase: \"working\"}); text(\"done\");"
+                })],
+            ),
+        )
+        .await?;
+
+        let continuation = next_json(&mut socket).await?;
+        assert_eq!(continuation["previous_response_id"], "resp-notify");
+        let input = continuation["input"]
+            .as_array()
+            .ok_or_else(|| eyre!("continuation input was not an array"))?;
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "custom_tool_call_output");
+        assert_eq!(input[0]["call_id"], "call-exec");
+        assert!(input[0].get("name").is_none());
+        assert!(input[0].to_string().contains("done"));
+        assert_eq!(input[1]["type"], "custom_tool_call_output");
+        assert_eq!(input[1]["call_id"], "call-exec");
+        assert_eq!(input[1]["name"], "exec");
+        assert_eq!(input[1]["output"], r#"{"phase":"working"}"#);
+        assert!(input[1].get("success").is_none());
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("code-mode-notify")?;
+    run_model(&endpoint, &workspace, "send a progress notification").await?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn prepares_images_and_strips_detail_before_lite_request() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);

@@ -10,8 +10,8 @@ use super::{
     stream::{CodeCall, CodeCallKind},
     terminal_payload,
     wire::{
-        RequestProfile, ResponseCreate, Usage, WarmupServerEvent, custom_tool_output,
-        function_tool_output, task_input,
+        RequestProfile, ResponseCreate, Usage, WarmupServerEvent, custom_tool_notification,
+        custom_tool_output, function_tool_output, task_input,
     },
 };
 use crate::{
@@ -332,7 +332,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 let output = self
                     .execute_model_tool(&tools, call_index, call, &conversation.history)
                     .await?;
-                conversation.history.push(output);
+                conversation.history.extend(output);
             }
             self.maybe_compact(
                 &mut socket,
@@ -351,7 +351,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         call_index: u32,
         call: CodeCall,
         history: &[Value],
-    ) -> Result<Value> {
+    ) -> Result<Vec<Value>> {
         if !matches!(call.name.as_str(), "exec" | "wait") {
             return Err(AgentError::UnsupportedFunction {
                 name: call.name,
@@ -378,6 +378,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         let context = ToolContext {
             model: &self.config.model,
             session_id: self.events.request_id(),
+            call_id: &call.call_id,
             history,
         };
         let mut execution = if call.name == "exec" {
@@ -402,10 +403,16 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 metadata: None,
             },
         )?;
-        Ok(match call.kind {
+        let output = match call.kind {
             CodeCallKind::Custom => custom_tool_output(&call.call_id, &execution.output),
             CodeCallKind::Function => function_tool_output(&call.call_id, &execution.output),
-        })
+        };
+        let mut outputs = Vec::with_capacity(execution.notifications.len() + 1);
+        outputs.push(output);
+        outputs.extend(execution.notifications.into_iter().map(|notification| {
+            custom_tool_notification(&notification.call_id, &notification.text)
+        }));
+        Ok(outputs)
     }
 
     async fn connect_with_warmup_fallback(

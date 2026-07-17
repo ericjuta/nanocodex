@@ -271,6 +271,15 @@ pub(in crate::model) fn custom_tool_output(call_id: &str, output: &ToolOutputBod
     })
 }
 
+pub(in crate::model) fn custom_tool_notification(call_id: &str, text: &str) -> Value {
+    json!({
+        "type": "custom_tool_call_output",
+        "call_id": call_id,
+        "name": "exec",
+        "output": text,
+    })
+}
+
 pub(in crate::model) fn function_tool_output(call_id: &str, output: &ToolOutputBody) -> Value {
     json!({
         "type": "function_call_output",

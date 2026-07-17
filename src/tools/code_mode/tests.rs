@@ -185,6 +185,34 @@ async fn image_helper_normalizes_detail_and_honors_override() -> Result<()> {
 }
 
 #[tokio::test]
+async fn notify_serializes_values_and_rejects_empty_text() -> Result<()> {
+    let workspace = temporary_workspace("code-mode-notify")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"notify({ phase: "working" }); text("done");"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(execution.notifications.len(), 1);
+    assert_eq!(execution.notifications[0].call_id, "call-exec");
+    assert_eq!(execution.notifications[0].text, r#"{"phase":"working"}"#);
+
+    let empty = tools
+        .execute_code(r#"notify("  ");"#, test_context(&history))
+        .await;
+    assert!(!empty.success);
+    assert!(execution_output(&empty).contains("Script error:\nnotify expects non-empty text"));
+    assert!(!execution_output(&empty).contains("at notify"));
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn yielded_cell_completes_through_wait() -> Result<()> {
     let workspace = temporary_workspace("yielded-cell")?;
     let tools = test_tools(&workspace);
@@ -214,6 +242,40 @@ text("after");
     assert!(completed.success);
     assert!(execution_output(&completed).contains("Script completed"));
     assert!(execution_output(&completed).contains("after"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_cell_notifications_keep_the_original_exec_call_id() -> Result<()> {
+    let workspace = temporary_workspace("resumed-cell-notify")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+await yield_control();
+notify("after yield");
+text("done");
+"#,
+            test_context_with_call(&history, "call-original-exec"),
+        )
+        .await;
+
+    assert!(execution.success);
+    assert!(execution.notifications.is_empty());
+
+    let completed = tools
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":1000}"#,
+            test_context_with_call(&history, "call-wait"),
+        )
+        .await;
+    assert!(completed.success, "{}", execution_output(&completed));
+    assert_eq!(completed.notifications.len(), 1);
+    assert_eq!(completed.notifications[0].call_id, "call-original-exec");
+    assert_eq!(completed.notifications[0].text, "after yield");
+
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -358,9 +420,14 @@ fn test_tools(workspace: &std::path::Path) -> ToolRuntime {
 }
 
 fn test_context(history: &[Value]) -> ToolContext<'_> {
+    test_context_with_call(history, "call-exec")
+}
+
+fn test_context_with_call<'a>(history: &'a [Value], call_id: &'a str) -> ToolContext<'a> {
     ToolContext {
         model: "test-model",
         session_id: "test-session",
+        call_id,
         history,
     }
 }

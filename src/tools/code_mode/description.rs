@@ -21,6 +21,7 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - `image(imageUrlOrItem: string | { image_url: string; detail?: "auto" | "low" | "high" | "original" | null }, detail?: "auto" | "low" | "high" | "original" | null)`: Appends an image item. `image_url` must be a base64-encoded `data:` URL. When provided, the second `detail` argument overrides the detail embedded in the first argument.
 - `store(key: string, value: any)`: stores a serializable value under a string key for later `exec` calls in the same session.
 - `load(key: string)`: returns the stored value for a string key, or `undefined` if it is missing.
+- `notify(value: string | number | boolean | undefined | null)`: immediately injects an extra `custom_tool_call_output` for the current `exec` call. Values are stringified like `text(...)`.
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description, kind }` entries.

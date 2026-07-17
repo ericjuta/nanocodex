@@ -108,6 +108,7 @@ type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolExecution> + Send + 'a>>;
 pub(crate) struct ToolContext<'a> {
     pub(crate) model: &'a str,
     pub(crate) session_id: &'a str,
+    pub(crate) call_id: &'a str,
     pub(crate) history: &'a [Value],
 }
 

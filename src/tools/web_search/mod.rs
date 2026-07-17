@@ -179,6 +179,7 @@ mod tests {
                 ToolContext {
                     model: "gpt-5.6-sol",
                     session_id: "search-session",
+                    call_id: "call-search",
                     history: &history,
                 },
             )

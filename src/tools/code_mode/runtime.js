@@ -108,6 +108,16 @@ async function runCell(init) {
     content.push({ type: "input_text", text: stringify(value) });
   }
 
+  function notify(value) {
+    const notification = stringify(value);
+    if (!notification.trim()) throw "notify expects non-empty text";
+    send({
+      type: "notify",
+      cell_id: init.cell_id,
+      text: notification,
+    });
+  }
+
   function image(value, detail) {
     let imageUrl;
     let embeddedDetail;
@@ -187,6 +197,7 @@ async function runCell(init) {
       "ALL_TOOLS",
       "text",
       "image",
+      "notify",
       "store",
       "load",
       "yield_control",
@@ -201,6 +212,7 @@ async function runCell(init) {
         allTools,
         text,
         image,
+        notify,
         store,
         load,
         yield_control,
