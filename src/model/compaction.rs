@@ -6,8 +6,8 @@ const SOL_CONTEXT_WINDOW: u64 = 372_000;
 const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 
-pub(super) const fn auto_compact_token_limit(model: &str) -> Option<u64> {
-    if const_str_eq(model, "gpt-5.6-sol") {
+pub(super) fn auto_compact_token_limit(model: &str) -> Option<u64> {
+    if model == "gpt-5.6-sol" {
         Some((SOL_CONTEXT_WINDOW * 9) / 10)
     } else {
         None
@@ -41,17 +41,14 @@ pub(super) fn install_history(
         object.remove("id");
     }
 
-    let retained = history
+    let task = history
         .iter()
-        .filter(|item| is_real_user_message(item, initial_context))
+        .find(|item| is_real_user_message(item, initial_context))
         .cloned()
-        .collect();
-    let mut installed = truncate_retained_messages(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
-    let insertion = installed
-        .iter()
-        .rposition(is_user_message)
-        .unwrap_or(installed.len());
-    installed.insert(insertion, initial_context.clone());
+        .map(truncate_task);
+    let mut installed = Vec::with_capacity(usize::from(task.is_some()) + 2);
+    installed.push(initial_context.clone());
+    installed.extend(task);
     installed.push(compaction);
     installed
 }
@@ -65,79 +62,18 @@ fn is_user_message(item: &Value) -> bool {
         && item.get("role").and_then(Value::as_str) == Some("user")
 }
 
-fn truncate_retained_messages(items: Vec<Value>, max_tokens: usize) -> Vec<Value> {
-    let mut remaining = max_tokens;
-    let mut reversed = Vec::with_capacity(items.len());
-    for item in items.into_iter().rev() {
-        if remaining == 0 {
-            continue;
-        }
-        let cost = message_text_token_count(&item).max(1);
-        if cost <= remaining {
-            reversed.push(item);
-            remaining = remaining.saturating_sub(cost);
-        } else if let Some(item) = truncate_message(item, remaining) {
-            reversed.push(item);
-            remaining = 0;
-        }
+fn truncate_task(mut task: Value) -> Value {
+    let Some(text) = task.pointer("/content/0/text").and_then(Value::as_str) else {
+        return task;
+    };
+    if approx_tokens(text.len()) <= RETAINED_MESSAGE_TOKEN_BUDGET {
+        return task;
     }
-    reversed.reverse();
-    reversed
-}
-
-fn message_text_token_count(item: &Value) -> usize {
-    item.get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
-            Some("input_text" | "output_text") => part.get("text").and_then(Value::as_str),
-            _ => None,
-        })
-        .map(|text| approx_tokens(text.len()))
-        .sum()
-}
-
-fn truncate_message(mut item: Value, max_tokens: usize) -> Option<Value> {
-    let content = item.get_mut("content")?.as_array_mut()?;
-    let mut remaining = max_tokens;
-    let mut truncated = Vec::with_capacity(content.len());
-    for mut part in std::mem::take(content) {
-        match part.get("type").and_then(Value::as_str) {
-            Some("input_text" | "output_text") => {
-                if remaining == 0 {
-                    continue;
-                }
-                let Some(text) = part.get("text").and_then(Value::as_str) else {
-                    continue;
-                };
-                let cost = approx_tokens(text.len());
-                if cost <= remaining {
-                    remaining = remaining.saturating_sub(cost);
-                } else {
-                    let text = truncate_middle_with_token_budget(text, remaining);
-                    let Some(object) = part.as_object_mut() else {
-                        continue;
-                    };
-                    object.insert("text".to_owned(), Value::String(text));
-                    remaining = 0;
-                }
-                if part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-                {
-                    truncated.push(part);
-                }
-            }
-            _ => truncated.push(part),
-        }
+    let text = truncate_middle_with_token_budget(text, RETAINED_MESSAGE_TOKEN_BUDGET);
+    if let Some(slot) = task.pointer_mut("/content/0/text") {
+        *slot = Value::String(text);
     }
-    if truncated.is_empty() {
-        return None;
-    }
-    *content = truncated;
-    Some(item)
+    task
 }
 
 fn truncate_middle_with_token_budget(text: &str, max_tokens: usize) -> String {
@@ -184,22 +120,6 @@ fn serialized_len(item: &Value) -> usize {
 
 const fn approx_tokens(bytes: usize) -> usize {
     bytes.saturating_add(APPROX_BYTES_PER_TOKEN - 1) / APPROX_BYTES_PER_TOKEN
-}
-
-const fn const_str_eq(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut index = 0;
-    while index < left.len() {
-        if left[index] != right[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
 }
 
 #[cfg(test)]
