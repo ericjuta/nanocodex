@@ -379,6 +379,42 @@ async fn explicit_end_turn_false_continues_without_a_tool_call() -> Result<()> {
 }
 
 #[tokio::test]
+async fn completed_response_accepts_null_usage() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        let mut response = completed_response(
+            "resp-final",
+            &[json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "done" }]
+            })],
+        );
+        response["response"]["usage"] = Value::Null;
+        send_json(&mut socket, response).await
+    });
+
+    let workspace = temporary_workspace("null-usage")?;
+    let output = run_model(&endpoint, &workspace, "accept missing usage").await?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert!(output.contains("\"model.call.completed\""));
+    assert!(output.contains("\"usage\":null"));
+    assert!(output.contains("\"run.completed\""));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconnect_drops_previous_response_id_and_replays_full_history() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);

@@ -20,7 +20,7 @@ pub(super) struct TurnResult {
     pub(super) final_message: Option<String>,
     pub(super) output_items: Vec<Value>,
     pub(super) code_calls: Vec<CodeCall>,
-    pub(super) usage: Usage,
+    pub(super) usage: Option<Usage>,
     pub(super) time_to_first_event_ns: u64,
     pub(super) time_to_first_output_ns: Option<u64>,
 }
@@ -29,7 +29,7 @@ pub(super) struct CompactionResult {
     pub(super) id: String,
     pub(super) status: String,
     pub(super) item: Value,
-    pub(super) usage: Usage,
+    pub(super) usage: Option<Usage>,
     pub(super) time_to_first_event_ns: u64,
     pub(super) time_to_first_output_ns: Option<u64>,
 }

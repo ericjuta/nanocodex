@@ -107,7 +107,7 @@ struct ModelCallCompleted<'a> {
     time_to_first_event_ns: u64,
     time_to_first_output_ns: Option<u64>,
     tool_calls: usize,
-    usage: &'a Usage,
+    usage: Option<&'a Usage>,
 }
 
 #[derive(Serialize)]
@@ -134,7 +134,7 @@ struct CompactionCompleted<'a> {
     duration_ns: u64,
     time_to_first_event_ns: u64,
     time_to_first_output_ns: Option<u64>,
-    usage: &'a Usage,
+    usage: Option<&'a Usage>,
 }
 
 #[derive(Serialize)]
@@ -307,7 +307,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                     self.maybe_compact(
                         &mut socket,
                         call_index,
-                        &response.usage,
+                        response.usage.as_ref(),
                         &mut conversation,
                         &profile,
                     )
@@ -337,7 +337,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
             self.maybe_compact(
                 &mut socket,
                 call_index,
-                &response.usage,
+                response.usage.as_ref(),
                 &mut conversation,
                 &profile,
             )
@@ -442,10 +442,13 @@ impl<'a, W: Write> ModelRun<'a, W> {
         &mut self,
         socket: &mut ResponsesSocket,
         after_model_call_index: u32,
-        usage: &Usage,
+        usage: Option<&Usage>,
         conversation: &mut ConversationState,
         profile: &RequestProfile,
     ) -> Result<()> {
+        let Some(usage) = usage else {
+            return Ok(());
+        };
         let Some(auto_compact_token_limit) =
             compaction::auto_compact_token_limit(&self.config.model)
         else {
@@ -739,7 +742,9 @@ impl<'a, W: Write> ModelRun<'a, W> {
             };
         let duration_ns = elapsed_ns(started_at);
         self.stats.model_duration_ns += duration_ns;
-        self.stats.usage.add(&response.usage);
+        if let Some(usage) = &response.usage {
+            self.stats.usage.add(usage);
+        }
         self.stats.last_response_id = Some(response.id.clone());
         self.events.emit(
             "model.call.completed",
@@ -752,7 +757,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 time_to_first_event_ns: response.time_to_first_event_ns,
                 time_to_first_output_ns: response.time_to_first_output_ns,
                 tool_calls: response.code_calls.len(),
-                usage: &response.usage,
+                usage: response.usage.as_ref(),
             },
         )?;
         Ok(response)
@@ -840,7 +845,9 @@ impl<'a, W: Write> ModelRun<'a, W> {
         };
         let duration_ns = elapsed_ns(started_at);
         self.stats.model_duration_ns += duration_ns;
-        self.stats.usage.add(&response.usage);
+        if let Some(usage) = &response.usage {
+            self.stats.usage.add(usage);
+        }
         self.stats.last_response_id = Some(response.id.clone());
         self.events.emit(
             "model.compaction.completed",
@@ -851,7 +858,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 duration_ns,
                 time_to_first_event_ns: response.time_to_first_event_ns,
                 time_to_first_output_ns: response.time_to_first_output_ns,
-                usage: &response.usage,
+                usage: response.usage.as_ref(),
             },
         )?;
         Ok(response.item)
