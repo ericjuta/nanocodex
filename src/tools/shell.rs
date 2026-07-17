@@ -29,7 +29,7 @@ impl ToolHandler for ExecCommandHandler {
         json!({
             "type": "function",
             "name": self.name(),
-            "description": "Runs a shell command, returning output or a session ID for ongoing interaction.",
+            "description": "Runs a shell command, returning output or a session ID for ongoing interaction. Live sessions are terminated when the agent ends; detach services that must remain running afterward.",
             "strict": false,
             "parameters": {
                 "type": "object",
@@ -234,10 +234,17 @@ mod tests {
     use crate::shell::ShellSessions;
 
     #[test]
-    fn exec_command_exposes_codex_shell_parameter() {
+    fn exec_command_exposes_shell_parameter_and_session_lifecycle() {
         let handler = ExecCommandHandler::new(PathBuf::from("/"), Arc::new(ShellSessions::new()));
         let spec = handler.spec();
 
+        assert_eq!(
+            spec.pointer("/description")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                "Runs a shell command, returning output or a session ID for ongoing interaction. Live sessions are terminated when the agent ends; detach services that must remain running afterward."
+            )
+        );
         assert_eq!(
             spec.pointer("/parameters/properties/shell/type")
                 .and_then(serde_json::Value::as_str),

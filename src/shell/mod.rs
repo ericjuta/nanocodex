@@ -256,7 +256,7 @@ impl Session {
         };
         let exit_code = match status {
             Ok(Ok(exit_code)) => {
-                let _ = self.process_group.lock().await.terminate_and_disarm();
+                self.process_group.lock().await.disarm();
                 self.finish_drains().await;
                 Some(exit_code)
             }
@@ -428,6 +428,8 @@ fn duration_ms(requested: Option<i64>, default: u64, minimum: u64, maximum: u64)
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::{CapturedOutput, ExecCommand, ShellSessions, WriteStdin};
 
     #[test]
@@ -468,6 +470,53 @@ mod tests {
             .await;
         assert_eq!(second.exit_code, Some(0));
         assert_eq!(second.output, "got:hello");
+    }
+
+    #[tokio::test]
+    async fn successful_command_leaves_background_process_running()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "harness-background-process-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let marker = directory.join("survived");
+        let sessions = ShellSessions::new();
+
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    format!(
+                        "(sleep 1; printf survived > '{}') >/dev/null 2>&1 &",
+                        marker.display()
+                    ),
+                    None,
+                    None,
+                    Some(false),
+                    false,
+                    Some(1_000),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.is_file() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("background process should survive successful shell exit");
+        let contents = std::fs::read_to_string(&marker)?;
+        std::fs::remove_dir_all(directory)?;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(contents, "survived");
+        Ok(())
     }
 
     #[tokio::test]
