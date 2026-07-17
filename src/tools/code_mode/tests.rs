@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eyre::{Result, eyre};
 use serde_json::Value;
 
-use super::{CodeModeExecution, NestedToolCall};
+use super::{CodeModeExecution, NestedToolCall, parse_exec_source};
 use crate::tools::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime, WebSearchConfig};
 
 #[tokio::test]
@@ -114,6 +114,102 @@ text("after");
     assert!(execution_output(&completed).contains("after"));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
+}
+
+#[tokio::test]
+async fn freeform_apply_patch_accepts_a_string() -> Result<()> {
+    let workspace = temporary_workspace("freeform-apply-patch")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+await tools.apply_patch("*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch");
+text("done");
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(execution.nested_calls.len(), 1);
+    assert_eq!(
+        execution.nested_calls[0].input,
+        Value::String(
+            "*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("created.txt"))?,
+        "created by patch\n"
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
+    let workspace = temporary_workspace("code-output-limits")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            "// @exec: {\"max_output_tokens\": 2}\ntext(\"abcdefghijklmnop\")",
+            test_context(&history),
+        )
+        .await;
+    assert!(execution.success);
+    assert!(execution_output(&execution).contains("Warning: truncated output"));
+
+    let yielded = tools
+        .execute_code(
+            r#"
+await yield_control();
+text("abcdefghijklmnop");
+"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(yielded.success);
+    let completed = tools
+        .wait_for_code(
+            r#"{"cell_id":"2","yield_time_ms":1000,"max_tokens":2}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(completed.success);
+    assert!(execution_output(&completed).contains("Warning: truncated output"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[test]
+fn exec_pragma_rejects_unknown_fields() {
+    let error = parse_exec_source("// @exec: {\"unknown\": 1}\ntext('hi')")
+        .err()
+        .expect("unknown pragma fields should fail");
+    assert!(error.contains("only supports"));
+}
+
+#[test]
+fn model_description_uses_codex_style_declarations() {
+    let workspace = temporary_workspace("code-mode-description")
+        .expect("temporary test workspace should be available");
+    let tools = test_tools(&workspace);
+    let specs = tools.model_specs();
+    let description = specs[0]["description"]
+        .as_str()
+        .expect("exec should have a description");
+    assert!(description.contains("// @exec:"));
+    assert!(description.contains("apply_patch(input: string): Promise<unknown>"));
+    assert!(description.contains("exec_command(args: {"));
+    assert!(!description.contains("Input schema:"));
+    assert_eq!(
+        specs[1]["parameters"]["properties"]["max_tokens"]["type"],
+        "number"
+    );
+    std::fs::remove_dir_all(workspace).expect("temporary workspace should be removable");
 }
 
 fn emitted_text(execution: &CodeModeExecution) -> Result<&str> {

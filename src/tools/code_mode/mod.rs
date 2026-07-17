@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fmt::Write as _, process::Stdio, time::Instant};
+mod description;
+mod output;
+
+use std::{collections::HashMap, process::Stdio, time::Instant};
 
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
@@ -20,7 +23,8 @@ const INITIAL_YIELD: Duration = if cfg!(test) {
     Duration::from_secs(10)
 };
 const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
-const MAX_WAIT_YIELD: Duration = Duration::from_secs(60);
+const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
 const GRAMMAR: &str = r"start: pragma_source | plain_source
 pragma_source: PRAGMA_LINE NEWLINE SOURCE
 plain_source: SOURCE
@@ -161,6 +165,10 @@ impl CodeModeRuntime {
         context: ToolContext<'_>,
     ) -> CodeModeExecution {
         let started_at = Instant::now();
+        let source = match parse_exec_source(source) {
+            Ok(source) => source,
+            Err(message) => return failed_execution(started_at, &message, Vec::new()),
+        };
         let mut state = self.state.lock().await;
         if let Some(cell_id) = state.live_cell {
             return failed_execution(
@@ -182,10 +190,12 @@ impl CodeModeRuntime {
 
         let stored = state.stored.clone();
         let result = if let Some(host) = state.host.as_mut() {
-            match host.start_cell(cell_id, source, stored, tools).await {
+            match host.start_cell(cell_id, &source.code, stored, tools).await {
                 Ok(()) => {
-                    host.drive_cell(cell_id, tools, context, INITIAL_YIELD)
-                        .await
+                    let yield_after = source
+                        .yield_time_ms
+                        .map_or(INITIAL_YIELD, Duration::from_millis);
+                    host.drive_cell(cell_id, tools, context, yield_after).await
                 }
                 Err(error) => Err(error),
             }
@@ -196,7 +206,14 @@ impl CodeModeRuntime {
                 Vec::new(),
             );
         };
-        finish_cell(&mut state, cell_id, started_at, result).await
+        finish_cell(
+            &mut state,
+            cell_id,
+            started_at,
+            result,
+            source.max_output_tokens,
+        )
+        .await
     }
 
     pub(super) async fn wait(
@@ -249,8 +266,7 @@ impl CodeModeRuntime {
             arguments
                 .yield_time_ms
                 .unwrap_or(u64::try_from(DEFAULT_WAIT_YIELD.as_millis()).unwrap_or(u64::MAX)),
-        )
-        .min(MAX_WAIT_YIELD);
+        );
         let result = if let Some(host) = state.host.as_mut() {
             host.drive_cell(cell_id, tools, context, yield_time).await
         } else {
@@ -258,8 +274,105 @@ impl CodeModeRuntime {
                 "local Node.js code-mode host was unavailable".to_owned(),
             ))
         };
-        finish_cell(&mut state, cell_id, started_at, result).await
+        finish_cell(
+            &mut state,
+            cell_id,
+            started_at,
+            result,
+            arguments.max_tokens,
+        )
+        .await
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecPragma {
+    #[serde(default)]
+    yield_time_ms: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
+}
+
+struct ParsedExecSource {
+    code: String,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+}
+
+fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
+    if input.trim().is_empty() {
+        return Err(
+            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`."
+                .to_owned(),
+        );
+    }
+    let mut source = ParsedExecSource {
+        code: input.to_owned(),
+        yield_time_ms: None,
+        max_output_tokens: None,
+    };
+    let mut lines = input.splitn(2, '\n');
+    let first_line = lines.next().unwrap_or_default();
+    let rest = lines.next().unwrap_or_default();
+    let Some(pragma) = first_line.trim_start().strip_prefix(EXEC_PRAGMA_PREFIX) else {
+        return Ok(source);
+    };
+    if rest.trim().is_empty() {
+        return Err(
+            "exec pragma must be followed by JavaScript source on subsequent lines".to_owned(),
+        );
+    }
+    let directive = pragma.trim();
+    if directive.is_empty() {
+        return Err(
+            "exec pragma must be a JSON object with supported fields `yield_time_ms` and `max_output_tokens`"
+                .to_owned(),
+        );
+    }
+    let value: Value = serde_json::from_str(directive).map_err(|error| {
+        format!(
+            "exec pragma must be valid JSON with supported fields `yield_time_ms` and `max_output_tokens`: {error}"
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        "exec pragma must be a JSON object with supported fields `yield_time_ms` and `max_output_tokens`"
+            .to_owned()
+    })?;
+    if let Some(key) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "yield_time_ms" | "max_output_tokens"))
+    {
+        return Err(format!(
+            "exec pragma only supports `yield_time_ms` and `max_output_tokens`; got `{key}`"
+        ));
+    }
+    let pragma: ExecPragma = serde_json::from_value(value).map_err(|error| {
+        format!(
+            "exec pragma fields `yield_time_ms` and `max_output_tokens` must be non-negative safe integers: {error}"
+        )
+    })?;
+    if pragma
+        .yield_time_ms
+        .is_some_and(|yield_time_ms| yield_time_ms > MAX_JS_SAFE_INTEGER)
+    {
+        return Err(
+            "exec pragma field `yield_time_ms` must be a non-negative safe integer".to_owned(),
+        );
+    }
+    if pragma.max_output_tokens.is_some_and(|max_output_tokens| {
+        u64::try_from(max_output_tokens)
+            .map(|max_output_tokens| max_output_tokens > MAX_JS_SAFE_INTEGER)
+            .unwrap_or(true)
+    }) {
+        return Err(
+            "exec pragma field `max_output_tokens` must be a non-negative safe integer".to_owned(),
+        );
+    }
+    rest.clone_into(&mut source.code);
+    source.yield_time_ms = pragma.yield_time_ms;
+    source.max_output_tokens = pragma.max_output_tokens;
+    Ok(source)
 }
 
 #[derive(Deserialize)]
@@ -269,6 +382,8 @@ struct WaitArguments {
     #[serde(default)]
     yield_time_ms: Option<u64>,
     #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
     terminate: bool,
 }
 
@@ -277,6 +392,7 @@ async fn finish_cell(
     cell_id: u64,
     started_at: Instant,
     result: Result<CellOutcome, HostFailure>,
+    max_output_tokens: Option<usize>,
 ) -> CodeModeExecution {
     let wall_time = started_at.elapsed().as_secs_f64();
     match result {
@@ -289,6 +405,7 @@ async fn finish_cell(
                 state.stored = stored;
             }
             state.live_cell = Some(cell_id);
+            let content = output::truncate_content(content, max_output_tokens);
             CodeModeExecution {
                 output: with_status(
                     &format!("Script running with cell ID {cell_id}"),
@@ -306,6 +423,7 @@ async fn finish_cell(
         }) => {
             state.live_cell = None;
             state.stored = stored;
+            let content = output::truncate_content(content, max_output_tokens);
             CodeModeExecution {
                 output: with_status("Script completed", wall_time, content),
                 success: true,
@@ -319,21 +437,26 @@ async fn finish_cell(
         }) => {
             state.live_cell = None;
             state.stored = stored;
+            let content = output::truncate_content(
+                vec![ToolOutputContent::InputText { text: message }],
+                max_output_tokens,
+            );
             CodeModeExecution {
-                output: ToolOutputBody::Text(format!(
-                    "Script failed\nWall time {wall_time:.1} seconds\nOutput:\n{message}"
-                )),
+                output: with_status("Script failed", wall_time, content),
                 success: false,
                 nested_calls,
             }
         }
         Err(failure) => {
             terminate_host(state).await;
+            let content = output::truncate_content(
+                vec![ToolOutputContent::InputText {
+                    text: failure.message,
+                }],
+                max_output_tokens,
+            );
             CodeModeExecution {
-                output: ToolOutputBody::Text(format!(
-                    "Script failed\nWall time {wall_time:.1} seconds\nOutput:\n{}",
-                    failure.message
-                )),
+                output: with_status("Script failed", wall_time, content),
                 success: false,
                 nested_calls: failure.nested_calls,
             }
@@ -637,37 +760,10 @@ fn failed_execution(
 }
 
 pub(super) fn exec_spec(handlers: &[Box<dyn ToolHandler>]) -> Value {
-    let mut description = String::from(
-        "Run JavaScript code to orchestrate and compose tool calls.\n\
-- Evaluates raw JavaScript as a cell in one local Node.js host reused for the session.\n\
-- Nested tools are available on the global `tools` object, for example `await tools.exec_command({cmd: \"pwd\"})`.\n\
-- Nested function tools take one object argument and return an object or string.\n\
-- Independent nested calls made with `Promise.all` execute concurrently.\n\
-- Normal Node.js capabilities are available, including `process`, `require`, dynamic `import()`, the file system, and the network.\n\
-- Use `text(value)` or `image(value)` to append output for the model.\n\
-- `store(key, value)` and `load(key)` persist serializable values between exec calls.\n\
-- `await yield_control()` yields accumulated output while the cell keeps running.\n\
-- `ALL_TOOLS` lists the enabled nested tools.\n\
-- Runs raw JavaScript, not JSON, quoted strings, or Markdown code fences.\n\nNested tools:\n",
-    );
-    for handler in handlers {
-        let spec = handler.spec();
-        let parameters = spec
-            .get("parameters")
-            .map_or_else(|| "{}".to_owned(), Value::to_string);
-        let _ = write!(
-            description,
-            "\n- `{}`: {}\n  Input schema: `{parameters}`\n",
-            handler.name(),
-            spec.get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        );
-    }
     json!({
         "type": "custom",
         "name": "exec",
-        "description": description,
+        "description": description::exec_description(handlers),
         "format": {
             "type": "grammar",
             "syntax": "lark",
@@ -680,7 +776,7 @@ pub(super) fn wait_spec() -> Value {
     json!({
         "type": "function",
         "name": "wait",
-        "description": "Waits on a yielded exec cell and returns new output or completion.",
+        "description": "Waits on a yielded `exec` cell and returns new output or completion.\n- Use `wait` only after `exec` returns `Script running with cell ID ...`.\n- `cell_id` identifies the running `exec` cell to resume.\n- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.\n- `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.\n- `terminate: true` stops the running cell; false or omitted waits for output.\n- `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.\n- If the cell is still running, `wait` may yield again with the same `cell_id`.\n- If the cell has already finished, `wait` returns the completed result and closes the cell.",
         "strict": false,
         "parameters": {
             "type": "object",
@@ -690,8 +786,12 @@ pub(super) fn wait_spec() -> Value {
                     "description": "Identifier of the running exec cell."
                 },
                 "yield_time_ms": {
-                    "type": "integer",
+                    "type": "number",
                     "description": "Wait before yielding more output. Defaults to 10000 ms."
+                },
+                "max_tokens": {
+                    "type": "number",
+                    "description": "Output token budget for this wait call. Defaults to 10000 tokens."
                 },
                 "terminate": {
                     "type": "boolean",

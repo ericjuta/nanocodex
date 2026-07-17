@@ -3,10 +3,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{ToolContext, ToolExecution, ToolFuture, ToolHandler};
+use super::{ToolContext, ToolExecution, ToolFuture, ToolHandler, ToolKind};
+
+const GRAMMAR: &str = include_str!("apply_patch.lark");
 
 pub(super) struct ApplyPatchHandler {
     workspace: PathBuf,
@@ -23,22 +24,19 @@ impl ToolHandler for ApplyPatchHandler {
         "apply_patch"
     }
 
+    fn kind(&self) -> ToolKind {
+        ToolKind::Freeform
+    }
+
     fn spec(&self) -> Value {
         json!({
-            "type": "function",
+            "type": "custom",
             "name": self.name(),
-            "description": "Applies a patch to files in the task workspace.",
-            "strict": false,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patch": {
-                        "type": "string",
-                        "description": "Patch text beginning with `*** Begin Patch` and ending with `*** End Patch`."
-                    }
-                },
-                "required": ["patch"],
-                "additionalProperties": false
+            "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": GRAMMAR,
             }
         })
     }
@@ -46,27 +44,13 @@ impl ToolHandler for ApplyPatchHandler {
     fn execute<'a>(&'a self, input: String, _context: ToolContext<'a>) -> ToolFuture<'a> {
         let workspace = self.workspace.clone();
         Box::pin(async move {
-            let arguments = match serde_json::from_str::<ApplyPatchArguments>(&input) {
-                Ok(arguments) => arguments,
-                Err(error) => {
-                    return ToolExecution::error(format!(
-                        "failed to parse apply_patch arguments: {error}"
-                    ));
-                }
-            };
-            match tokio::task::spawn_blocking(move || apply(&arguments.patch, &workspace)).await {
+            match tokio::task::spawn_blocking(move || apply(&input, &workspace)).await {
                 Ok(Ok(output)) => ToolExecution::text(output).with_code_mode_value(json!({})),
                 Ok(Err(error)) => ToolExecution::error(error),
                 Err(error) => ToolExecution::error(format!("apply_patch task failed: {error}")),
             }
         })
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ApplyPatchArguments {
-    patch: String,
 }
 
 const BEGIN_PATCH: &str = "*** Begin Patch";

@@ -111,8 +111,18 @@ pub(crate) struct ToolContext<'a> {
 
 trait ToolHandler: Send + Sync {
     fn name(&self) -> &'static str;
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function
+    }
     fn spec(&self) -> Value;
     fn execute<'a>(&'a self, input: String, context: ToolContext<'a>) -> ToolFuture<'a>;
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolKind {
+    Function,
+    Freeform,
 }
 
 pub(crate) struct WebSearchConfig {
@@ -175,15 +185,28 @@ impl ToolRuntime {
         let Some(handler) = self.handlers.iter().find(|handler| handler.name() == name) else {
             return ToolExecution::error(format!("unsupported nested tool call: {name}"));
         };
-        if !input.is_object() {
-            return ToolExecution::error(format!(
-                "nested function tool {name} requires an object argument"
-            ));
-        }
-        match serde_json::to_string(&input) {
-            Ok(input) => handler.execute(input, context).await,
-            Err(error) => ToolExecution::error(format!("failed to encode {name} input: {error}")),
-        }
+        let input = match handler.kind() {
+            ToolKind::Function if !input.is_object() => {
+                return ToolExecution::error(format!(
+                    "nested function tool {name} requires an object argument"
+                ));
+            }
+            ToolKind::Function => match serde_json::to_string(&input) {
+                Ok(input) => input,
+                Err(error) => {
+                    return ToolExecution::error(format!("failed to encode {name} input: {error}"));
+                }
+            },
+            ToolKind::Freeform => match input.as_str() {
+                Some(input) => input.to_owned(),
+                None => {
+                    return ToolExecution::error(format!(
+                        "nested freeform tool {name} requires a string argument"
+                    ));
+                }
+            },
+        };
+        handler.execute(input, context).await
     }
 
     fn nested_tool_metadata(&self) -> Vec<Value> {
@@ -194,6 +217,7 @@ impl ToolRuntime {
                 json!({
                     "name": handler.name(),
                     "description": spec.get("description").and_then(Value::as_str).unwrap_or_default(),
+                    "kind": handler.kind(),
                 })
             })
             .collect()
