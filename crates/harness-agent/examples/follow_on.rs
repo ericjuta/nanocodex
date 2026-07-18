@@ -8,10 +8,16 @@ async fn main() -> Result<()> {
         .web_search(false)
         .image_generation(false)
         .build();
-    let (agent, _events) = Agent::builder(api_key)
+    let (agent, events) = Agent::builder(api_key)
         .thinking(Thinking::Low)
         .tools(tools)
         .build()?;
+    drop(tokio::spawn(async move {
+        let mut events = events;
+        while let Some(event) = events.recv().await {
+            eprintln!("event: {:?}", event.kind);
+        }
+    }));
 
     let first = agent
         .prompt("Reply with exactly one lowercase word: cobalt.")
