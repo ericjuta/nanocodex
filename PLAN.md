@@ -237,6 +237,35 @@ erase opportunistically:
    any eventual coordination belongs to the session owner and must preserve
    concurrency across independent session IDs.
 
+## Milestone 1.2: library and Tower foundation
+
+Status: complete pending the current post-rebase validation gate.
+
+1. Make the root a virtual workspace, keep the executable under `bin/harness`,
+   and expose independently usable `harness-core`, `harness-service`,
+   `harness-tools`, and `harness-agent` crates. Delete obsolete root and former
+   crate paths rather than keeping compatibility modules.
+2. Follow the Alloy-style boundary: core owns the typed Responses request,
+   event, item, tool, usage, prompt, and public event model; service owns
+   WebSocket/Tower behavior, retry middleware, telemetry, and typed transport
+   errors; agent is the ergonomic composition/re-export layer.
+3. Use an owned, generic `ResponsesClient<S>` and builder-injected
+   `Service<ResponsesAttempt>`. The default builder installs the persistent
+   WebSocket and retry policy; callers may compose timeouts, limits, shedding,
+   tracing, metrics, bulkheads, or circuit breaking without changing agent
+   orchestration.
+4. Preserve `store: false`, the stable prompt-cache prefix/key, delta requests,
+   turn state, full replay after reconnect, and queued follow-on prompt reuse.
+5. Keep known protocol history strictly typed. Use named open-JSON wrappers or
+   raw JSON only at canonical extensibility/retention boundaries, and benchmark
+   serde, sonic, simd-json, container choices, clone behavior, request encoding,
+   and Tower dispatch before retaining an optimization.
+6. Gate the result with formatting, Clippy with warnings denied, all Rust and
+   adapter tests, rustdoc, Docker artifact construction, a retained real JSONL
+   Criterion trace, and only two or three representative hard/quick Harbor
+   evals. Inspect their JSONL, trajectory, result, and verifier output; do not
+   run the full eval suite for this maintenance phase.
+
 ## Milestone 2: eval-driven tuning
 
 Status: in progress. Thirty-seven public tasks are active under the current

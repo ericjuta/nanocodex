@@ -212,6 +212,14 @@ Without that variable, the portable synthetic groups still run and the
 retained-trace group is skipped. Use a quiet target machine before treating a
 smaller difference as actionable.
 
+An immediate post-rebase confirmation under variable CPU load measured direct
+dispatch at 14.0 ns, the generic Tower service at 15.9 ns, and the
+concurrency-limit plus timeout stack at 101 ns. The retained 622 KiB trace
+measured raw/`Value` payload decode at 0.706/1.831 ms and encode at 0.117/0.923
+ms. The absolute figures moved with the direct control, but the conclusions did
+not: generic Tower dispatch remains negligible, while retaining raw event
+payloads avoids material DOM parsing and re-encoding cost.
+
 A live repeated-prompt probe used the same 128 KiB prompt three times on one
 agent session. The first turn wrote 35,085 cache tokens; turns two and three
 each reported 35,085 cached tokens and zero cache writes (99.991% of their
@@ -219,10 +227,13 @@ input), while retaining one WebSocket and recording no retry or reconnect.
 Full turn times were 1.44, 2.58, and 1.82 seconds, so model/network variance
 dominated the local dispatch costs.
 
-Three focused Harbor gates also passed with reward 1.0: `db-wal-recovery`
-(7/7 checks), `merge-diff-arc-agi-task` (5/5), and `prove-plus-comm` (4/4).
-Each used one socket with no retry/reconnect, and their retained stderr streams
-were empty.
+Earlier in this worktree, three focused Harbor gates passed with reward 1.0:
+`db-wal-recovery` (7/7 checks), `merge-diff-arc-agi-task` (5/5), and
+`prove-plus-comm` (4/4). Each used one socket with no retry/reconnect, and their
+retained stderr streams were empty. After the final rebase onto `master`, all
+82 Rust tests, warnings-denied Clippy and rustdoc, formatting, and the native
+Linux artifact build passed. The user waived another Harbor run, so the three
+focused results are retained evidence rather than post-rebase eval claims.
 
 ## Validation invariants
 
