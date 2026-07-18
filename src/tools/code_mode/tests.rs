@@ -548,6 +548,7 @@ fn test_context_with_call<'a>(history: &'a [Value], call_id: &'a str) -> ToolCon
         session_id: "test-session",
         call_id,
         history,
+        output_token_budget: crate::tools::DEFAULT_TOOL_OUTPUT_TOKENS,
     }
 }
 

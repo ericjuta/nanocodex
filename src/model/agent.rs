@@ -1,16 +1,14 @@
 use std::{io::Write, path::Path, time::Instant};
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{
     ApiEvent, AssistantMessage, ModelConfig, RunError, RunStarted, RunStats, TRANSPORT,
     agents_md::load_project_instructions,
     compaction,
     context_manager::ContextManager,
-    display_endpoint, elapsed_ns,
-    execution_guidance::{ExecutionGuidance, GuidanceNote},
-    resolve_workspace,
+    display_endpoint, elapsed_ns, resolve_workspace,
     stream::{CodeCall, CodeCallKind},
     terminal_payload,
     wire::{
@@ -27,9 +25,6 @@ use crate::{
         WebSearchConfig, prepare_output_images, prepare_user_input,
     },
 };
-
-const FINALIZATION_REVIEW: &str = "<finalization_review>\nBefore finalizing, perform one last evaluator-facing audit of the current publish state. Re-read the literal acceptance contract: exact paths, working directory, public interfaces, ports, output formats, lifecycle requirements, and forbidden extras. If an evaluator-shaped check already passed, preserve that state and only remove explicitly forbidden temporary artifacts. Otherwise, use the cheapest decisive inspection or check and correct any discrepancy. Do not merely describe this audit; use tools when inspection or correction is needed.\n</finalization_review>";
-const MAX_FINALIZATION_REVIEWS: u8 = 3;
 
 #[derive(Serialize)]
 struct ConnectionStarted<'a> {
@@ -187,19 +182,6 @@ struct ToolResultEvent<'a> {
     metadata: Option<&'a Value>,
 }
 
-#[derive(Serialize)]
-struct GuidanceReminderEvent<'a> {
-    model_call_index: u32,
-    notes: &'a [GuidanceNote],
-}
-
-#[derive(Serialize)]
-struct FinalizationReviewEvent {
-    after_model_call_index: u32,
-    review: u8,
-    max_reviews: u8,
-}
-
 pub(super) struct ModelRun<'a, W> {
     events: &'a mut EventWriter<W>,
     task: &'a Task,
@@ -208,9 +190,6 @@ pub(super) struct ModelRun<'a, W> {
     stats: RunStats,
     server_reasoning_included: bool,
     turn_state: Option<String>,
-    guidance: ExecutionGuidance,
-    finalization_reviews: u8,
-    tool_calls_at_finalization_review: u32,
 }
 
 struct ConversationState {
@@ -297,9 +276,6 @@ impl<'a, W: Write> ModelRun<'a, W> {
             stats: RunStats::default(),
             server_reasoning_included: false,
             turn_state: None,
-            guidance: ExecutionGuidance::default(),
-            finalization_reviews: 0,
-            tool_calls_at_finalization_review: 0,
         }
     }
 
@@ -372,8 +348,6 @@ impl<'a, W: Write> ModelRun<'a, W> {
 
         loop {
             let call_index = self.stats.model_calls + 1;
-            self.guidance.observe_elapsed(self.started_at.elapsed());
-            self.record_pending_guidance(call_index, &mut conversation)?;
             let response = match self
                 .perform_model_call(&mut socket, call_index, &conversation, &profile)
                 .await
@@ -401,11 +375,6 @@ impl<'a, W: Write> ModelRun<'a, W> {
                     continue;
                 }
                 if let Some(message) = final_message {
-                    if self.request_finalization_review(call_index, &mut conversation)? {
-                        self.maybe_compact(&mut socket, call_index, &mut conversation, &profile)
-                            .await?;
-                        continue;
-                    }
                     return Ok(if message.trim().is_empty() {
                         "The model completed without emitting assistant text.".to_owned()
                     } else {
@@ -476,6 +445,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
             session_id: self.events.request_id(),
             call_id: &call.call_id,
             history,
+            output_token_budget: crate::tools::DEFAULT_TOOL_OUTPUT_TOKENS,
         };
         let mut execution = if call.name == "exec" {
             tools.execute_code(&call.input, context).await
@@ -485,7 +455,6 @@ impl<'a, W: Write> ModelRun<'a, W> {
         prepare_output_images(&mut execution.output).await;
         let duration_ns = elapsed_ns(started_at);
         self.stats.tool_wall_duration_ns += duration_ns;
-        self.guidance.observe(&execution.nested_calls);
         for nested in &execution.nested_calls {
             self.emit_nested_tool(call_index, &call.call_id, nested)?;
         }
@@ -510,60 +479,6 @@ impl<'a, W: Write> ModelRun<'a, W> {
             custom_tool_notification(&notification.call_id, &notification.text)
         }));
         Ok(outputs)
-    }
-
-    fn request_finalization_review(
-        &mut self,
-        after_model_call_index: u32,
-        conversation: &mut ConversationState,
-    ) -> Result<bool> {
-        if self.stats.tool_calls == 0
-            || self.finalization_reviews >= MAX_FINALIZATION_REVIEWS
-            || (self.finalization_reviews > 0
-                && self.stats.tool_calls == self.tool_calls_at_finalization_review)
-        {
-            return Ok(false);
-        }
-        self.finalization_reviews += 1;
-        self.tool_calls_at_finalization_review = self.stats.tool_calls;
-        conversation.delta_start = Some(conversation.history_len());
-        conversation.record_items([json!({
-            "type": "message",
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": FINALIZATION_REVIEW,
-            }],
-        })]);
-        self.events.emit(
-            "lifecycle.finalization_review",
-            FinalizationReviewEvent {
-                after_model_call_index,
-                review: self.finalization_reviews,
-                max_reviews: MAX_FINALIZATION_REVIEWS,
-            },
-        )?;
-        Ok(true)
-    }
-
-    fn record_pending_guidance(
-        &mut self,
-        model_call_index: u32,
-        conversation: &mut ConversationState,
-    ) -> Result<()> {
-        let Some(reminder) = self.guidance.pending_reminder() else {
-            return Ok(());
-        };
-        conversation.record_items([reminder.developer_message()]);
-        self.events.emit(
-            "guidance.reminder",
-            GuidanceReminderEvent {
-                model_call_index,
-                notes: reminder.notes(),
-            },
-        )?;
-        self.guidance.mark_delivered(&reminder);
-        Ok(())
     }
 
     async fn connect_with_warmup_fallback(

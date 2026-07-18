@@ -1,13 +1,12 @@
-use crate::tools::ToolOutputContent;
+use crate::tools::{DEFAULT_TOOL_OUTPUT_TOKENS, ToolOutputContent};
 
-const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 
 pub(super) fn truncate_content(
     content: Vec<ToolOutputContent>,
     max_output_tokens: Option<usize>,
 ) -> Vec<ToolOutputContent> {
-    let max_output_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+    let max_output_tokens = max_output_tokens.unwrap_or(DEFAULT_TOOL_OUTPUT_TOKENS);
     let text = content
         .iter()
         .filter_map(|item| match item {

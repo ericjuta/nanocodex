@@ -39,6 +39,7 @@ async fn generation_uses_codex_images_request_and_persists_result() -> Result<()
                 session_id: "session/one",
                 call_id: "code:1",
                 history: &history,
+                output_token_budget: crate::tools::DEFAULT_TOOL_OUTPUT_TOKENS,
             },
         )
         .await;

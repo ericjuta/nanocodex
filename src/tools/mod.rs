@@ -17,6 +17,8 @@ use crate::{protocol::ImageDetail, shell::ShellSessions};
 pub(crate) use code_mode::{CodeModeExecution, NestedToolCall};
 pub(crate) use image::{prepare_output_images, prepare_user_input};
 
+pub(crate) const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 10_000;
+
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum ToolOutputBody {
@@ -102,6 +104,7 @@ pub(crate) struct ToolContext<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) call_id: &'a str,
     pub(crate) history: &'a [Value],
+    pub(crate) output_token_budget: usize,
 }
 
 trait ToolHandler: Send + Sync {

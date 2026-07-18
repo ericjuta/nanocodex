@@ -46,6 +46,7 @@ struct CodeModeState {
 struct LiveCell {
     id: u64,
     call_id: String,
+    output_token_budget: usize,
 }
 
 struct NodeHost {
@@ -202,6 +203,14 @@ impl CodeModeRuntime {
             Ok(source) => source,
             Err(message) => return failed_execution(started_at, &message, Vec::new()),
         };
+        let output_token_budget = source
+            .max_output_tokens
+            .unwrap_or(context.output_token_budget)
+            .max(1);
+        let context = ToolContext {
+            output_token_budget,
+            ..context
+        };
         let mut state = self.state.lock().await;
         if let Some(live_cell) = state.live_cell.as_ref() {
             return failed_execution(
@@ -247,7 +256,8 @@ impl CodeModeRuntime {
             parent_call_id,
             started_at,
             result,
-            source.max_output_tokens,
+            Some(output_token_budget),
+            output_token_budget,
         )
         .await
     }
@@ -295,6 +305,7 @@ impl CodeModeRuntime {
             );
         }
         let parent_call_id = live_cell.call_id.clone();
+        let continued_output_token_budget = live_cell.output_token_budget;
         if arguments.terminate {
             terminate_host(&mut state).await;
             return CodeModeExecution {
@@ -312,6 +323,14 @@ impl CodeModeRuntime {
                 .yield_time_ms
                 .unwrap_or(u64::try_from(DEFAULT_WAIT_YIELD.as_millis()).unwrap_or(u64::MAX)),
         );
+        let output_token_budget = arguments
+            .max_tokens
+            .unwrap_or(continued_output_token_budget)
+            .max(1);
+        let context = ToolContext {
+            output_token_budget,
+            ..context
+        };
         let result = if let Some(host) = state.host.as_mut() {
             host.drive_cell(cell_id, &parent_call_id, tools, context, yield_time)
                 .await
@@ -326,7 +345,8 @@ impl CodeModeRuntime {
             parent_call_id,
             started_at,
             result,
-            arguments.max_tokens,
+            Some(output_token_budget),
+            continued_output_token_budget,
         )
         .await
     }
@@ -441,6 +461,7 @@ async fn finish_cell(
     started_at: Instant,
     result: Result<CellOutcome, HostFailure>,
     max_output_tokens: Option<usize>,
+    continued_output_token_budget: usize,
 ) -> CodeModeExecution {
     let wall_time = started_at.elapsed().as_secs_f64();
     match result {
@@ -456,6 +477,7 @@ async fn finish_cell(
             state.live_cell = Some(LiveCell {
                 id: cell_id,
                 call_id: parent_call_id,
+                output_token_budget: continued_output_token_budget,
             });
             let content = output::truncate_content(content, max_output_tokens);
             CodeModeExecution {
