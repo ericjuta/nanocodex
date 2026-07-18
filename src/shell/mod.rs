@@ -20,6 +20,7 @@ const DEFAULT_WRITE_YIELD_MS: u64 = 250;
 const DEFAULT_POLL_YIELD_MS: u64 = 5_000;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+const MAX_LIVE_SESSIONS: usize = 64;
 
 pub(crate) struct ExecCommand {
     script: String,
@@ -91,7 +92,7 @@ pub(crate) struct ExecCommandResult {
 }
 
 pub(crate) struct ShellSessions {
-    sessions: Mutex<HashMap<i64, Arc<Session>>>,
+    sessions: Mutex<SessionStore>,
     next_session_id: AtomicI64,
     default_shell: selection::Shell,
 }
@@ -99,7 +100,7 @@ pub(crate) struct ShellSessions {
 impl ShellSessions {
     pub(crate) fn new() -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(SessionStore::default()),
             next_session_id: AtomicI64::new(1),
             default_shell: selection::default_user_shell(),
         }
@@ -139,24 +140,25 @@ impl ShellSessions {
             }
         };
         let session = Session::new(session_id, spawned, secrets);
-        self.sessions
-            .lock()
-            .await
-            .insert(session_id, Arc::clone(&session));
+        let pruned = self.sessions.lock().await.insert(Arc::clone(&session));
+        if let Some(pruned) = pruned {
+            pruned.terminate().await;
+        }
 
         let yield_time = duration_ms(command.yield_time_ms, DEFAULT_EXEC_YIELD_MS, 250, 30_000);
+        let _interaction = session.begin_interaction();
         let result = session
             .wait_for_output(yield_time, command.max_output_tokens, started_at)
             .await;
         if result.exit_code.is_some() {
-            self.sessions.lock().await.remove(&session_id);
+            self.sessions.lock().await.remove(session_id);
         }
         result
     }
 
     pub(crate) async fn write_stdin(&self, request: WriteStdin) -> ExecCommandResult {
         let started_at = Instant::now();
-        let session = self.sessions.lock().await.get(&request.session_id).cloned();
+        let session = self.sessions.lock().await.get(request.session_id);
         let Some(session) = session else {
             return ExecCommandResult::failed(
                 started_at.elapsed(),
@@ -164,6 +166,7 @@ impl ShellSessions {
             );
         };
 
+        let _interaction = session.begin_interaction();
         if !request.chars.is_empty() {
             if let Err(error) = session.write(&request.chars).await {
                 return ExecCommandResult::failed(
@@ -185,9 +188,57 @@ impl ShellSessions {
             .wait_for_output(yield_time, request.max_output_tokens, started_at)
             .await;
         if result.exit_code.is_some() {
-            self.sessions.lock().await.remove(&request.session_id);
+            self.sessions.lock().await.remove(request.session_id);
         }
         result
+    }
+}
+
+#[derive(Default)]
+struct SessionStore {
+    sessions: HashMap<i64, Arc<Session>>,
+    recency: VecDeque<i64>,
+}
+
+impl SessionStore {
+    fn insert(&mut self, session: Arc<Session>) -> Option<Arc<Session>> {
+        let pruned = (self.sessions.len() >= MAX_LIVE_SESSIONS)
+            .then(|| {
+                let protected_from = self.recency.len().saturating_sub(8);
+                self.recency.iter().take(protected_from).position(|id| {
+                    self.sessions
+                        .get(id)
+                        .is_some_and(|session| !session.is_active())
+                })
+            })
+            .flatten()
+            .and_then(|index| {
+                let id = self.recency.remove(index)?;
+                self.sessions.remove(&id)
+            });
+        self.recency.push_back(session.id);
+        self.sessions.insert(session.id, session);
+        pruned
+    }
+
+    fn get(&mut self, id: i64) -> Option<Arc<Session>> {
+        let session = self.sessions.get(&id).cloned()?;
+        self.touch(id);
+        Some(session)
+    }
+
+    fn remove(&mut self, id: i64) -> Option<Arc<Session>> {
+        if let Some(index) = self.recency.iter().position(|candidate| *candidate == id) {
+            self.recency.remove(index);
+        }
+        self.sessions.remove(&id)
+    }
+
+    fn touch(&mut self, id: i64) {
+        if let Some(index) = self.recency.iter().position(|candidate| *candidate == id) {
+            self.recency.remove(index);
+        }
+        self.recency.push_back(id);
     }
 }
 
@@ -200,6 +251,7 @@ struct Session {
     captured: Arc<Mutex<CapturedOutput>>,
     secrets: Vec<String>,
     next_chunk_id: AtomicU64,
+    active_interactions: AtomicU64,
 }
 
 impl Session {
@@ -233,7 +285,21 @@ impl Session {
             captured,
             secrets,
             next_chunk_id: AtomicU64::new(1),
+            active_interactions: AtomicU64::new(0),
         })
+    }
+
+    fn begin_interaction(&self) -> ActiveInteraction<'_> {
+        self.active_interactions.fetch_add(1, Ordering::AcqRel);
+        ActiveInteraction { session: self }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active_interactions.load(Ordering::Acquire) > 0
+    }
+
+    async fn terminate(&self) {
+        let _ = self.process_group.lock().await.terminate_and_disarm();
     }
 
     async fn write(&self, chars: &str) -> std::io::Result<()> {
@@ -309,6 +375,18 @@ impl Session {
             output,
             was_truncated.then_some(captured.total_bytes.saturating_add(3) / 4),
         )
+    }
+}
+
+struct ActiveInteraction<'a> {
+    session: &'a Session,
+}
+
+impl Drop for ActiveInteraction<'_> {
+    fn drop(&mut self) {
+        self.session
+            .active_interactions
+            .fetch_sub(1, Ordering::AcqRel);
     }
 }
 

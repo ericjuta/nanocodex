@@ -32,6 +32,19 @@ const SENSITIVE_ENV_PARTS: [&str; 11] = [
     "TOKEN",
 ];
 
+const NORMALIZED_ENVIRONMENT: [(&str, &str); 10] = [
+    ("NO_COLOR", "1"),
+    ("TERM", "dumb"),
+    ("LANG", "C.UTF-8"),
+    ("LC_CTYPE", "C.UTF-8"),
+    ("LC_ALL", "C.UTF-8"),
+    ("COLORTERM", ""),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("CODEX_CI", "1"),
+];
+
 pub(super) struct SpawnedProcess {
     pub(super) child: ProcessChild,
     pub(super) stdin: Option<ProcessStdin>,
@@ -251,9 +264,17 @@ pub(super) fn sanitized_environment() -> (Vec<(OsString, OsString)>, Vec<String>
             environment.push((name, value));
         }
     }
+    normalize_environment(&mut environment);
     secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     (environment, secrets)
+}
+
+fn normalize_environment(environment: &mut Vec<(OsString, OsString)>) {
+    for (name, value) in NORMALIZED_ENVIRONMENT {
+        environment.retain(|(candidate, _)| candidate != name);
+        environment.push((name.into(), value.into()));
+    }
 }
 
 fn is_sensitive_name(name: &OsStr) -> bool {
@@ -261,4 +282,34 @@ fn is_sensitive_name(name: &OsStr) -> bool {
         .to_ascii_uppercase()
         .split('_')
         .any(|part| SENSITIVE_ENV_PARTS.contains(&part))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::{NORMALIZED_ENVIRONMENT, normalize_environment};
+
+    #[test]
+    fn normalized_environment_overrides_terminal_and_pager_values() {
+        let mut environment = vec![
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("TERM"), OsString::from("xterm-256color")),
+            (OsString::from("PAGER"), OsString::from("less")),
+        ];
+
+        normalize_environment(&mut environment);
+
+        assert!(environment.contains(&(OsString::from("PATH"), OsString::from("/bin"))));
+        for (name, value) in NORMALIZED_ENVIRONMENT {
+            assert_eq!(
+                environment
+                    .iter()
+                    .filter(|(candidate, _)| candidate == name)
+                    .map(|(_, value)| value)
+                    .collect::<Vec<_>>(),
+                vec![&OsString::from(value)]
+            );
+        }
+    }
 }
