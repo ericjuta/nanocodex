@@ -39,6 +39,7 @@ pub(super) struct CompactionResult {
 pub(super) struct CodeCall {
     pub(super) call_id: String,
     pub(super) name: String,
+    pub(super) namespace: Option<String>,
     pub(super) input: String,
     pub(super) kind: CodeCallKind,
 }
@@ -232,6 +233,7 @@ fn code_calls(items: &[Value]) -> Result<Vec<CodeCall>> {
                 calls.push(CodeCall {
                     call_id,
                     name,
+                    namespace: optional_string(item, "namespace"),
                     input,
                     kind: CodeCallKind::Custom,
                 });
@@ -243,6 +245,7 @@ fn code_calls(items: &[Value]) -> Result<Vec<CodeCall>> {
                 calls.push(CodeCall {
                     call_id,
                     name,
+                    namespace: optional_string(item, "namespace"),
                     input,
                     kind: CodeCallKind::Function,
                 });
@@ -251,6 +254,10 @@ fn code_calls(items: &[Value]) -> Result<Vec<CodeCall>> {
         }
     }
     Ok(calls)
+}
+
+fn optional_string(item: &Value, field: &'static str) -> Option<String> {
+    item.get(field).and_then(Value::as_str).map(str::to_owned)
 }
 
 fn required_string(item: &Value, field: &'static str) -> Result<String> {

@@ -389,17 +389,10 @@ impl<'a, W: Write> ModelRun<'a, W> {
         call: CodeCall,
         history: &[Value],
     ) -> Result<Vec<Value>> {
-        if !matches!(call.name.as_str(), "exec" | "wait") {
-            return Err(AgentError::UnsupportedFunction {
-                name: call.name,
-                call_id: call.call_id,
-            }
-            .into());
-        }
-        let arguments = if call.name == "exec" {
-            Value::String(call.input.clone())
-        } else {
-            serde_json::from_str(&call.input).unwrap_or_else(|_| Value::String(call.input.clone()))
+        let arguments = match &call.kind {
+            CodeCallKind::Custom => Value::String(call.input.clone()),
+            CodeCallKind::Function => serde_json::from_str(&call.input)
+                .unwrap_or_else(|_| Value::String(call.input.clone())),
         };
         self.events.emit(
             "tool.call",
@@ -411,6 +404,24 @@ impl<'a, W: Write> ModelRun<'a, W> {
             },
         )?;
         self.stats.tool_calls += 1;
+        if let Some(message) = unsupported_tool_message(&call) {
+            let output = ToolOutputBody::Text(message);
+            self.events.emit(
+                "tool.result",
+                ToolResultEvent {
+                    call_id: &call.call_id,
+                    tool: &call.name,
+                    status: "failed",
+                    duration_ns: 0,
+                    result: &output,
+                    metadata: None,
+                },
+            )?;
+            return Ok(vec![match &call.kind {
+                CodeCallKind::Custom => custom_tool_output(&call.call_id, &output),
+                CodeCallKind::Function => function_tool_output(&call.call_id, &output),
+            }]);
+        }
         let started_at = Instant::now();
         let context = ToolContext {
             model: &self.config.model,
@@ -983,6 +994,17 @@ impl<'a, W: Write> ModelRun<'a, W> {
             self.turn_state = Some(turn_state.to_owned());
         }
     }
+}
+
+fn unsupported_tool_message(call: &CodeCall) -> Option<String> {
+    if call.namespace.is_none() && matches!(call.name.as_str(), "exec" | "wait") {
+        return None;
+    }
+    let qualified_name = format!("{}{}", call.namespace.as_deref().unwrap_or(""), call.name);
+    Some(match &call.kind {
+        CodeCallKind::Custom => format!("unsupported custom tool call: {qualified_name}"),
+        CodeCallKind::Function => format!("unsupported call: {qualified_name}"),
+    })
 }
 
 fn strip_item_id(mut item: Value) -> Value {

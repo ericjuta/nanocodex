@@ -85,6 +85,81 @@ async fn store_false_local_code_mode_round_trip() -> Result<()> {
 }
 
 #[tokio::test]
+async fn unsupported_direct_tools_return_failed_results_to_the_model() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let generation = next_json(&mut socket).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-unsupported",
+                &[
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": "call-custom",
+                        "name": "missing_custom",
+                        "input": "raw input"
+                    }),
+                    json!({
+                        "type": "function_call",
+                        "call_id": "call-function",
+                        "namespace": "example::",
+                        "name": "missing_function",
+                        "arguments": "not json"
+                    }),
+                ],
+            ),
+        )
+        .await?;
+
+        let continuation = next_json(&mut socket).await?;
+        assert_eq!(continuation["previous_response_id"], "resp-unsupported");
+        let input = continuation["input"]
+            .as_array()
+            .ok_or_else(|| eyre!("continuation input was not an array"))?;
+        assert_eq!(
+            input,
+            &[
+                json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-custom",
+                    "output": "unsupported custom tool call: missing_custom"
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call-function",
+                    "output": "unsupported call: example::missing_function"
+                }),
+            ]
+        );
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("unsupported-tools")?;
+    let output = run_model(&endpoint, &workspace, "recover from unsupported tools").await?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert_eq!(
+        output.matches(r#""status":"failed""#).count(),
+        2,
+        "{output}"
+    );
+    assert!(output.contains("\"tool_calls\":2"));
+    assert!(output.contains("\"run.completed\""));
+    assert!(!output.contains("\"run.failed\""));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn code_mode_notify_adds_a_named_exec_output_to_the_next_request() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
