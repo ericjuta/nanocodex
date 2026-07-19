@@ -24,6 +24,7 @@ async fn starts_each_cell_in_a_fresh_node_host() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn multiple_yielded_cells_continue_and_complete_independently() -> Result<()> {
     let workspace = temporary_workspace("multiple-live-cells")?;
@@ -76,6 +77,7 @@ text(result.output);
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn promise_all_runs_nested_tools_concurrently() -> Result<()> {
     let workspace = temporary_workspace("parallel-nested-tools")?;

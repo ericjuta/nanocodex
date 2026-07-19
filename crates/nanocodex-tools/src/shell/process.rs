@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
+#[cfg(unix)]
 use nix::{
     errno::Errno,
     sys::signal::{Signal, killpg},
@@ -137,8 +138,9 @@ fn spawn_pipes(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = command.spawn()?;
     let pid = child
@@ -205,6 +207,7 @@ fn pty_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+#[cfg(unix)]
 fn exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
 
@@ -214,17 +217,28 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
+#[cfg(not(unix))]
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
 pub(super) struct ProcessGroupGuard {
+    #[cfg(unix)]
     process_group: Option<Pid>,
+    #[cfg(not(unix))]
+    process_group: Option<u32>,
 }
 
 impl ProcessGroupGuard {
     fn new(pid: u32) -> Self {
-        Self {
-            process_group: i32::try_from(pid).ok().map(Pid::from_raw),
-        }
+        #[cfg(unix)]
+        let process_group = i32::try_from(pid).ok().map(Pid::from_raw);
+        #[cfg(not(unix))]
+        let process_group = Some(pid);
+        Self { process_group }
     }
 
+    #[cfg(unix)]
     fn terminate(&self) -> io::Result<()> {
         let Some(process_group) = self.process_group else {
             return Err(io::Error::other("process identifier exceeds i32::MAX"));
@@ -233,6 +247,28 @@ impl ProcessGroupGuard {
             Ok(()) | Err(Errno::ESRCH) => Ok(()),
             Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
         }
+    }
+
+    #[cfg(windows)]
+    fn terminate(&self) -> io::Result<()> {
+        let Some(process_group) = self.process_group else {
+            return Ok(());
+        };
+        // `taskkill /T` is the Windows analogue of killing a Unix process group: it terminates
+        // the child and processes descended from it. A non-zero exit commonly means the child
+        // exited between the wait and cleanup paths, which is equivalent to ESRCH on Unix.
+        std::process::Command::new("taskkill.exe")
+            .args(["/PID", &process_group.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|_| ())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn terminate(&self) -> io::Result<()> {
+        Ok(())
     }
 
     pub(super) fn disarm(&mut self) {

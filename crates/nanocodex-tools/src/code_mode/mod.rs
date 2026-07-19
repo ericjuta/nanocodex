@@ -405,9 +405,9 @@ fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
         );
     }
     if pragma.max_output_tokens.is_some_and(|max_output_tokens| {
-        u64::try_from(max_output_tokens)
-            .map(|max_output_tokens| max_output_tokens > MAX_JS_SAFE_INTEGER)
-            .unwrap_or(true)
+        u64::try_from(max_output_tokens).map_or(true, |max_output_tokens| {
+            max_output_tokens > MAX_JS_SAFE_INTEGER
+        })
     }) {
         return Err(
             "exec pragma field `max_output_tokens` must be a non-negative safe integer".to_owned(),

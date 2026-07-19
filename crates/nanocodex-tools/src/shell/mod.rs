@@ -509,9 +509,12 @@ fn duration_ms(requested: Option<i64>, default: u64, minimum: u64, maximum: u64)
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::time::{Duration, SystemTime};
 
-    use super::{CapturedOutput, ExecCommand, ShellSessions, WriteStdin};
+    #[cfg(unix)]
+    use super::WriteStdin;
+    use super::{CapturedOutput, ExecCommand, ShellSessions};
 
     #[test]
     fn bounded_capture_keeps_head_and_tail_then_accepts_the_next_poll() {
@@ -527,6 +530,7 @@ mod tests {
         assert_eq!(second.with_omission_marker(), b"next");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn yielded_command_accepts_stdin_and_completes() {
         let sessions = ShellSessions::new();
@@ -553,6 +557,7 @@ mod tests {
         assert_eq!(second.output, "got:hello");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn successful_command_leaves_background_process_running()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -600,6 +605,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn tty_command_has_a_terminal_and_accepts_stdin() {
         let ready =
@@ -643,6 +649,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn explicit_shell_runs_bash_syntax() {
         if !std::path::Path::new("/bin/bash").is_file() {
@@ -666,5 +673,28 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(result.output, "bash");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn default_cmd_shell_executes_a_command() {
+        let sessions = ShellSessions::new();
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    "echo windows".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    false,
+                    Some(1_000),
+                    None,
+                ),
+                &std::env::temp_dir(),
+            )
+            .await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.output.trim(), "windows");
     }
 }

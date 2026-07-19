@@ -1,10 +1,13 @@
 use std::{
     env,
-    os::unix::fs::PermissionsExt,
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
 use nix::unistd::{Uid, User};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShellType {
@@ -73,11 +76,22 @@ fn detect_shell_type(shell_path: &Path) -> Option<ShellType> {
     }
 }
 
+#[cfg(unix)]
 fn user_shell_path() -> Option<PathBuf> {
     User::from_uid(Uid::current())
         .ok()
         .flatten()
         .map(|user| user.shell)
+}
+
+#[cfg(windows)]
+fn user_shell_path() -> Option<PathBuf> {
+    env::var_os("COMSPEC").map(PathBuf::from)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn user_shell_path() -> Option<PathBuf> {
+    None
 }
 
 fn file_exists(path: &Path) -> Option<PathBuf> {
@@ -86,16 +100,43 @@ fn file_exists(path: &Path) -> Option<PathBuf> {
         .then(|| path.to_path_buf())
 }
 
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.metadata().is_ok_and(|metadata| metadata.is_file())
+}
+
+fn executable_names(binary: &str) -> Vec<OsString> {
+    #[cfg(windows)]
+    {
+        if Path::new(binary).extension().is_some() {
+            return vec![binary.into()];
+        }
+        let extensions = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+        return extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| format!("{binary}{extension}").into())
+            .collect();
+    }
+    #[cfg(not(windows))]
+    {
+        vec![binary.into()]
+    }
+}
+
 fn find_in_path(binary: &str) -> Option<PathBuf> {
+    let names = executable_names(binary);
     env::var_os("PATH")
         .into_iter()
         .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
-        .map(|directory| directory.join(binary))
-        .find(|candidate| {
-            candidate.metadata().is_ok_and(|metadata| {
-                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-            })
-        })
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
+        .find(|candidate| is_executable(candidate))
 }
 
 fn shell_path(
@@ -142,9 +183,19 @@ fn shell(shell_type: ShellType, provided_path: Option<&Path>) -> Option<Shell> {
 }
 
 fn ultimate_fallback_shell() -> Shell {
-    Shell {
-        shell_type: ShellType::Sh,
-        path: PathBuf::from("/bin/sh"),
+    #[cfg(windows)]
+    {
+        return Shell {
+            shell_type: ShellType::Cmd,
+            path: env::var_os("COMSPEC").map_or_else(|| PathBuf::from("cmd.exe"), PathBuf::from),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        Shell {
+            shell_type: ShellType::Sh,
+            path: PathBuf::from("/bin/sh"),
+        }
     }
 }
 
@@ -165,6 +216,11 @@ fn default_user_shell_from_path(user_shell_path: Option<&Path>) -> Shell {
         .and_then(detect_shell_type)
         .and_then(|shell_type| shell(shell_type, None));
 
+    #[cfg(windows)]
+    let shell_with_fallback = user_default_shell
+        .or_else(|| shell(ShellType::PowerShell, None))
+        .or_else(|| shell(ShellType::Cmd, None));
+    #[cfg(not(windows))]
     let shell_with_fallback = if cfg!(target_os = "macos") {
         user_default_shell
             .or_else(|| shell(ShellType::Zsh, None))
@@ -203,7 +259,12 @@ mod tests {
     #[test]
     fn unavailable_user_shell_uses_codex_platform_fallbacks() {
         let shell = default_user_shell_from_path(Some(Path::new("/missing/fish")));
-        if cfg!(target_os = "macos") && Path::new("/bin/zsh").is_file() {
+        if cfg!(windows) {
+            assert!(matches!(
+                shell.shell_type,
+                ShellType::PowerShell | ShellType::Cmd
+            ));
+        } else if cfg!(target_os = "macos") && Path::new("/bin/zsh").is_file() {
             assert_eq!(shell.shell_type, ShellType::Zsh);
         } else if Path::new("/bin/bash").is_file() {
             assert_eq!(shell.shell_type, ShellType::Bash);
@@ -213,9 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_model_shell_falls_back_to_sh() {
+    fn unknown_model_shell_uses_platform_fallback() {
         let shell = get_shell_by_model_provided_path("/definitely/missing/fish");
-        assert_eq!(shell.shell_type, ShellType::Sh);
-        assert_eq!(shell.path, Path::new("/bin/sh"));
+        if cfg!(windows) {
+            assert_eq!(shell.shell_type, ShellType::Cmd);
+        } else {
+            assert_eq!(shell.shell_type, ShellType::Sh);
+            assert_eq!(shell.path, Path::new("/bin/sh"));
+        }
     }
 }
