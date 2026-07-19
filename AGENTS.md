@@ -140,8 +140,9 @@
 
 - No app server, JSON-RPC daemon, provider abstraction, approval subsystem,
   compatibility layer, skills/plugins framework, or alternate runtime mode.
-- Do not build Python/Node/WASM bindings, a TUI, browser/computer use, JJ review
+- Do not build Python/Node/WASM bindings, browser/computer use, JJ review
   provenance, graders, or local multi-agent scheduling until promoted into the
-  active plan by a concrete consumer.
+  active plan by a concrete consumer. Keep the promoted Ratatui client in
+  `bin/nanocodex`; it must consume, not reshape, the library API.
 - Do not expose turn IDs, steering, or branching in the default prompt API
   before those behaviors are implemented end to end.

@@ -59,7 +59,7 @@ Crate ownership is fixed:
   lifecycle, and bounded tool output.
 - `nanocodex`: builders and the owned stateful agent lifecycle.
 - `nanocodex-macros`: the `#[tool]` implementation.
-- `bin/nanocodex`: the minimal positional-prompt CLI adapter.
+- `bin/nanocodex`: the Ratatui daily-driver and headless JSONL adapter.
 
 Lower crates must remain usable without importing higher orchestration crates.
 Socket tasks and mutable driver details stay private.
@@ -166,11 +166,12 @@ Gate:
 
 ### Phase 3: bindings and richer consumers
 
-Deferred until the Rust lifecycle and event policy are stable. A Python, Node,
-WASM, TUI, or embedded server consumer should wrap the same Rust handle/events
-contract in-process; it must not require a Nanocodex-owned app server. Promote
-one binding only with a concrete consumer, an ownership model for its runtime,
-and end-to-end cancellation/event tests.
+The first richer consumer is now the Ratatui client under `bin/nanocodex`. It
+wraps the same Rust handle/events contract in-process and leaves presentation,
+prompt history, queue display, and terminal lifecycle outside the library.
+Python, Node, WASM, or an embedded server remain deferred until promoted by a
+concrete consumer with an ownership model for its runtime and end-to-end
+cancellation/event tests.
 
 ## Performance policy
 
@@ -237,7 +238,6 @@ advancing this checkpoint.
 - Provider/model abstraction and backwards compatibility.
 - A Nanocodex-owned app server, JSON-RPC protocol, or daemon.
 - Python/Node/WASM bindings without a concrete embedded consumer.
-- TUI implementation; a TUI should consume the library rather than alter it.
 - Browser/computer-use runtimes until a deterministic eval and consumer justify
   the capability.
 - Skills/plugins, approval machinery, alternate runtime modes, or duplicate

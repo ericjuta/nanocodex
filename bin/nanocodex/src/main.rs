@@ -1,13 +1,27 @@
+mod config;
 mod run;
+mod tui;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, builder::NonEmptyStringValueParser};
 use eyre::Result;
 
+use config::AgentArgs;
+
 #[derive(Parser)]
-#[command(version, about = "A small Harbor-first OpenAI coding agent")]
+#[command(
+    version,
+    about = "An interactive coding agent and headless JSONL runner"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+
+    #[command(flatten)]
+    agent: AgentArgs,
+
+    /// Submit an initial prompt immediately after the TUI opens.
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    prompt: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -22,7 +36,9 @@ async fn main() -> Result<()> {
     // requiring shell-specific syntax to load the repository's `.env` file.
     let _ = dotenvy::dotenv();
 
-    match Cli::parse().command {
-        Command::Run(command) => command.run().await,
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Run(command)) => command.run(cli.agent).await,
+        None => tui::run(cli.agent, cli.prompt).await,
     }
 }

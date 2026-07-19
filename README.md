@@ -13,6 +13,33 @@ follow-on prompts, and exposes its transport as a caller-composable Tower
 service. Model-generated code mode runs in local Node.js and calls the Rust tool
 registry.
 
+## Use the daily-driver CLI
+
+Install the repository binary and launch it from the workspace you want the
+agent to edit:
+
+```sh
+cargo install --path bin/nanocodex
+export OPENAI_API_KEY=...
+nanocodex
+```
+
+The Ratatui interface keeps one agent and WebSocket alive across follow-on
+prompts, streams assistant output, shows tool activity, accepts prompts while a
+turn is running, and retains prompt history and scrollback for the session.
+Press Enter to submit, Ctrl+J or Shift+Enter for a newline, Up/Down for prompt
+history, PageUp/PageDown or the mouse wheel to scroll, Esc to clear the
+composer, and Ctrl+C to exit. Use `--cwd`, `--thinking`, `--system-prompt`,
+`--web-search`, and `--image-generation` to configure the session; `--prompt`
+submits an initial turn immediately.
+
+The headless adapter remains available for scripts and evals. Its stdout is
+flushed JSONL only:
+
+```sh
+nanocodex run "Inspect this repository and summarize it."
+```
+
 ## Use it as a library
 
 Until the crates are published, depend on the repository directly:
@@ -224,8 +251,9 @@ just eval-hosted    # same pinned suite in hosted Daytona sandboxes
 just view           # inspect retained Harbor jobs
 ```
 
-The native CLI accepts one positional prompt and streams flushed JSONL to
-stdout. It demonstrates the process adapter; it is not required by the library.
+The native CLI defaults to the interactive Ratatui client. Its `run` subcommand
+accepts one positional prompt and streams flushed JSONL to stdout for Harbor and
+other process integrations. Neither adapter is required by the library.
 
 Harbor builds a static Linux binary, installs it in an unchanged task container,
 and derives ATIF from the retained JSONL. Python owns upload/process lifecycle
