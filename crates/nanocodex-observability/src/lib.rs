@@ -245,6 +245,7 @@ mod tests {
         let server = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
+                assert!(Instant::now() < deadline, "OTLP exporter did not connect");
                 match listener.accept() {
                     Ok((mut stream, _)) => {
                         stream
@@ -262,19 +263,20 @@ mod tests {
                                 break;
                             }
                         }
-                        let is_trace_request = request
-                            .windows(b"POST /v1/traces".len())
-                            .any(|window| window == b"POST /v1/traces");
+                        // The HTTP client may open and close an empty warm-up
+                        // connection before it sends the export request.
+                        if request.is_empty() {
+                            continue;
+                        }
                         stream
                             .write_all(
                                 b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
                             )
                             .unwrap();
-                        request_seen.send(is_trace_request).unwrap();
+                        request_seen.send(request).unwrap();
                         return;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < deadline, "OTLP exporter did not connect");
                         thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => panic!("loopback OTLP listener failed: {error}"),
@@ -298,10 +300,16 @@ mod tests {
             tracing::info!("test event");
         }
         guard.shutdown();
+        let request = request_received
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
         assert!(
-            request_received
-                .recv_timeout(Duration::from_secs(10))
-                .unwrap()
+            request.starts_with(b"POST ")
+                && request
+                    .windows(b"/v1/traces".len())
+                    .any(|window| window == b"/v1/traces"),
+            "unexpected OTLP request headers: {}",
+            String::from_utf8_lossy(&request)
         );
         server.join().unwrap();
         drop(guard);
