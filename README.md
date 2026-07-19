@@ -134,8 +134,27 @@ For dynamic state, freeform inputs, multimodal outputs, metadata, or custom
 decoding, implement the public `Tool` trait directly and register the value with
 the same `.tool(...)` method. Internal and external tools use the same
 heterogeneous registry. See
-[`custom_tool.rs`](crates/nanocodex/examples/custom_tool.rs) for a runnable
+[`custom_tool.rs`](examples/custom_tool.rs) for a runnable
 example.
+
+Runnable examples live in the top-level [`examples`](examples) package:
+
+```sh
+cargo run -p nanocodex-examples --bin minimal
+cargo run -p nanocodex-examples --bin follow-on
+cargo run -p nanocodex-examples --bin custom-tool
+cargo run -p nanocodex-examples --bin subagents
+```
+
+[`subagents.rs`](examples/subagents.rs) shows that delegation does not require a
+multi-agent subsystem in the library. Its application-defined `spawn_agent`
+tool builds an independent `Nanocodex` for each task; the parent can invoke
+several of them concurrently from code mode with `Promise.all`. The example
+keeps delegation one level deep by leaving `spawn_agent` out of each child's
+tool registry. It also routes every parent and child `AgentEvent` through one
+host-owned writer, producing a unified JSONL stream with a global `stream_seq`
+and a tagged `source` while retaining each event's session-local `request_id`
+and `seq`.
 
 ### Configure the agent and Tower stack
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-service", "crates/nanocodex-tools"]
+members = ["bin/nanocodex", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-service", "crates/nanocodex-tools", "examples"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
