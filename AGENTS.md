@@ -1,113 +1,147 @@
 # Development instructions
 
+## Product direction
+
+- Nanocodex is a headless, library-first Rust agents SDK. The public product is
+  the embeddable API; the CLI and Harbor adapter are examples and evaluation
+  boundaries.
+- Keep the scope narrow: one supported OpenAI model family, the Responses
+  WebSocket API, one owned agent lifecycle, and caller-defined tools. Do not
+  introduce provider/model portability or a generic app-server protocol.
+- A normal consumer builds an agent, receives `(Nanocodex, AgentEvents)`, sends
+  prompts through the cheap handle, and awaits typed `TurnResult`s. Events are
+  optional and independent from results.
+- Follow-on prompts reuse the session's retained history automatically. Never
+  require callers to pass prior messages, response IDs, or tool results back
+  into the agent.
+- Builders expose deliberate policy. Queue capacities, socket tasks, mutable
+  run state, replay bookkeeping, and similar mechanics stay private.
+
 ## Workflow
 
-- Follow `PLAN.md` in order and build vertical CLI slices.
-- Prefer `just run` and a real `just eval` over mocks or speculative layers.
-- Inspect the JSONL stream, Harbor result, trajectory, and verifier output.
-- Measure cold bootstrap separately from warm source-edit iteration.
-- End-to-end Harbor trials are the milestone gates. Do not add tests merely for
-  coverage or during cleanup; add a focused deterministic test only when the
-  plan calls for one or a demonstrated regression justifies it.
-- Prefer deleting obsolete paths and data flow over introducing abstractions.
-  A cleanup should produce a material net reduction in production LOC.
+- Follow the active work in `PLAN.md` in order. Build vertical library slices
+  with a real consumer; do not accumulate speculative abstractions.
+- Prefer deletion and direct ownership over adapters that merely move data.
+  Cleanup should materially reduce production or planning surface.
+- Use existing project tooling and patterns. Add a dependency only for a
+  concrete need in the current slice.
+- Add focused deterministic tests for public contracts and demonstrated
+  regressions, not for coverage. Compile public examples as part of validation.
+- Use `just run` for a live native smoke. Use focused Harbor trials while
+  iterating and the full configured `just eval` only for milestone/release
+  gates. Never modify benchmark tasks or verifiers to make Nanocodex pass.
+- Inspect the exact JSONL, Harbor result, trajectory, and verifier output for an
+  eval claim. Separate cold image/bootstrap time from warm agent work.
+- Preserve unrelated work. Never commit `.env`, caches, retained jobs, build
+  output, or another user's untracked files.
 
-## Codex reference implementation
+## Codex reference
 
-- Do not invoke the OpenAI docs skill, fetch the Codex manual, use the OpenAI
-  Docs MCP server, or browse the web for Codex/OpenAI behavior unless the user
-  explicitly asks. Use the local Codex checkout and retained runtime/eval
-  traces as the default sources in this repository. This repository rule
-  overrides automatic skill-trigger matching, including when a request would
-  otherwise match the `openai-docs` skill description.
-- For agent architecture and implementation decisions, first inspect how the
-  locally cloned OpenAI Codex repository handles the comparable concern. The
-  expected checkout is `~/github/openai/codex`, with Rust code under
-  `codex-rs/`.
-- Use the checked-out source rather than memory or general descriptions. Refer
-  to concrete Codex files and types when explaining the comparison.
-- Treat Codex as a reference, not a requirement to copy its abstractions.
-  Preserve this repository's `PLAN.md`, runtime boundary, milestone order, and
-  deliberately narrower scope when the designs differ.
-- Copy relevant invariants and operational behavior, not Codex compatibility
-  surface. Expose only tool fields and lifecycle behavior implemented here.
-- The upstream review checkpoint is
-  `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`. When asked to keep
-  pace with Codex, fetch its `origin/main` and review every commit after this
-  checkpoint, prioritizing supported model changes, defaults, prompts, API
-  semantics, tools, and lifecycle behavior. Present candidates as port,
-  evaluate, defer, or out of scope before implementing unless the user asks to
-  implement directly. Advance the checkpoint only after the full range is
-  reviewed; retain material deferred work in `PLAN.md`, and cite the exact
-  upstream commit for behavior that is adopted.
+- Use the local checkout at `~/github/openai/codex/codex-rs` before making an
+  architecture or behavior claim about Codex. Do not browse the web or invoke
+  OpenAI documentation tooling unless the user explicitly asks.
+- Codex is evidence, not an API requirement. Copy relevant invariants and
+  operational behavior while keeping Nanocodex's smaller public surface.
+- The reviewed upstream checkpoint is
+  `openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`. A parity review must
+  inspect every later commit, classify it as port/evaluate/defer/out-of-scope,
+  and cite adopted behavior before advancing the checkpoint.
 
-## Runtime boundary
+## Workspace boundaries
 
-- `just run` is native `cargo run`; it must not require Harbor or Docker.
-- `just eval` builds a static Linux artifact for the Docker daemon's native
-  architecture. Do not force amd64 on Apple Silicon.
-- Harbor owns task containers and verifiers. The Rust executable is uploaded
-  as an InstalledAgent and runs inside `/app`.
-- Python may upload/run the process and derive ATIF. Model decisions, API calls,
-  tools, and mutations belong in Rust; never add a per-tool Python bridge.
-- Do not modify benchmark tasks or compile Rust inside their images.
-- Eval selection belongs in `evals/*.yaml`, not the Justfile.
-- Local artifacts default to Cargo `dev`; honor `NANOCODEX_BUILD_PROFILE` and use
-  `profiling` for optimized builds with debug symbols.
+- `nanocodex-core` owns dependency-light public data: prompts, events, model
+  configuration, and complete typed Responses wire/domain types.
+- `nanocodex-service` owns behavior at the API boundary: the persistent
+  WebSocket, stream processing, retry policy, telemetry, and generic Tower
+  service/client.
+- `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
+  and the public `Tool` trait.
+- `nanocodex` composes those crates into the owned agent lifecycle and exports
+  the ergonomic builders and common types.
+- `nanocodex-macros` implements `#[tool]`. Keep the executable under
+  `bin/nanocodex`; do not move CLI behavior into the library.
+- Each lower crate must remain useful without importing the higher orchestration
+  crate. Avoid circular concepts and leaky socket/runtime types.
 
-## JSONL contract
+## Runtime invariants
+
+- The private spawned driver is the sole owner of mutable conversation, model,
+  tool-runtime, and Tower service state. It runs until all command handles are
+  dropped.
+- One agent reuses its WebSocket, typed history, code-mode runtime, shell
+  sessions, stable cache key, and response chain across sequential turns.
+- `prompt().await` waits only for command acceptance and returns an independently
+  awaitable `Turn`. Prompt queueing order is owned by the driver.
+- Client-owned typed history is authoritative. Healthy turns send only the new
+  delta with `previous_response_id`; a replacement socket drops that ID and
+  replays complete committed history.
+- Commit only completed responses. A failed partial response must not execute a
+  tool or enter history.
+- Preserve `store: false`, stable prompt/cache identity, and byte-stable shared
+  prefixes across turns, retries, compaction, and reconnects.
+- Cancellation and process cleanup are explicit. Timeout or cancellation must
+  terminate subprocess groups and descendants.
+
+## Tower boundary
+
+- One Tower call is one complete streamed Responses attempt, through
+  `response.completed` or a typed failure. Do not return success after merely
+  sending the WebSocket frame.
+- `ResponsesClient<S>` remains generic over the caller's concrete
+  `Service<ResponsesAttempt>`; do not box or globalize the service stack.
+- The SDK owns one typed retry/reconnect policy. Caller middleware may wrap it
+  with deadlines, concurrency, load shedding, tracing, metrics, circuit
+  breaking, or error mapping without becoming a second retry owner.
+- An attempt is replayable owned state. Large history remains shared; retrying
+  must not duplicate side effects.
+
+## Events and observability
+
+- Typed events are a public library stream. JSONL is only the process adapter's
+  encoding of that stream, not the internal transport.
+- Tracing is diagnostic and belongs on stderr or in the embedding application's
+  subscriber. It must never replace contractual events.
+- Do not add a generic event bus, shared mutable collector state, or callback
+  framework without a concrete library consumer and an explicit lifecycle.
+- Never emit secrets, `.env` contents, hidden chain of thought, or full prompt
+  bodies into logs or tracing. Retain only API-visible reasoning summaries.
+
+## JSONL adapter contract
 
 - Stdout is flushed JSONL only; diagnostics go to stderr.
-- Every event has protocol version, request ID, monotonic sequence, type, and
-  object payload.
-- Emit exactly one terminal event for each accepted request.
-- Preserve exact input/output streams before deriving ATIF.
-- Contractual events are emitted explicitly through the JSONL protocol.
-  Tracing is for stderr diagnostics and must not become the protocol transport.
-- Use typed serde messages for repeated protocol shapes. Compact `json!` values
-  are appropriate for one-off static request or tool schemas when dedicated
-  types would only duplicate the JSON structure.
-- Never print secrets or `.env` contents.
+- Every event contains protocol version, stable request/session ID, monotonic
+  sequence, type, and object payload.
+- Emit exactly one terminal event for every accepted prompt and preserve exact
+  input/output streams before deriving ATIF.
+- Harbor owns task containers, verification, and retained eval records. Python
+  may install/run the binary and derive ATIF, but model decisions, API calls,
+  tools, and mutations stay in Rust.
 
 ## Rust practices
 
-- Follow Alloy-style Rust: small typed components and explicit data flow.
-- Construct required configuration into owning types near `main`; do not retain
-  required values as `Option` or repeatedly validate them after construction.
-- Put stateful asynchronous lifecycle operations on owning structs and `impl`
-  blocks. Reserve free functions for stateless transformations and utilities.
-- Let the model run own its client session, event writer, task context, timing,
-  and statistics. Avoid threading mutable statistics or long context argument
-  lists through the call graph.
-- Keep repeated wire types at protocol boundaries and domain types internally.
-  Avoid types for one-use static JSON whose only purpose is increasing ceremony.
-- Prefer moving owned tool and protocol values over cloning them to satisfy an
-  unnecessarily borrowed interface.
-- Return errors with context; avoid `unwrap`, `expect`, and silent fallback in
-  runtime paths.
-- Keep subprocess output memory-bounded while it is produced; post-exit
-  truncation is not a memory bound.
-- Keep cancellation and process cleanup explicit. Timeout or cancellation must
-  terminate the subprocess group and descendants, following the relevant Codex
-  implementation where applicable.
-- Keep `eyre` for top-level application error reporting; use focused typed
-  errors where callers need to distinguish runtime failures.
-- Run rustfmt and Clippy with warnings denied before handoff.
-- Add dependencies only for a concrete need in the current vertical slice.
+- Follow Alloy-style Rust: small typed components, explicit ownership, and
+  builder APIs for policy.
+- Put stateful async lifecycle operations on owning structs. Reserve free
+  functions for stateless transformations.
+- Keep repeated wire shapes typed. Use `RawValue` for intentionally retained
+  opaque payloads and `Value` only at genuinely dynamic boundaries; do not turn
+  known history into a DOM for convenience.
+- Prefer moving owned protocol/tool values over cloning them to satisfy a
+  borrowed interface. Keep hot-path allocations and subprocess output bounded
+  while data is produced.
+- Return errors with context. Avoid `unwrap`, `expect`, and silent fallback in
+  runtime paths. Use focused typed errors where callers distinguish policy or
+  retry classes; keep `eyre` at application boundaries.
+- Before handoff run rustfmt, Clippy with warnings denied, relevant tests, and
+  public-example checks. Benchmark performance claims on representative retained
+  traces, not synthetic microbenchmarks alone.
 
-## Scope
+## Current non-goals
 
-- Harbor results and ATIF are the eval record; do not create another journal or
-  artifact database.
-- Record only API-visible reasoning summaries, never purported hidden chain of
-  thought.
-- Tasks run YOLO inside their eval container; there is no approval subsystem.
-- Do not add provider portability, backwards compatibility, a TUI, JJ, graders,
-  or local subagent orchestration before their planned milestone.
-- Skills are out of scope for this project. Do not add skill discovery, skill
-  catalogs, `SKILL.md` injection, bundled skills, or plugin-provided skills.
-- Model execution is the only runtime mode. Do not restore milestone positive
-  controls, compatibility modes, or duplicate shell implementations.
-- Do not add event buses, collector traits, shared mutable run state, or generic
-  client/provider layers without a concrete current consumer.
-- Preserve unrelated work. Never commit `.env`, caches, jobs, or build output.
+- No app server, JSON-RPC daemon, provider abstraction, approval subsystem,
+  compatibility layer, skills/plugins framework, or alternate runtime mode.
+- Do not build Python/Node/WASM bindings, a TUI, browser/computer use, JJ review
+  provenance, graders, or local multi-agent scheduling until promoted into the
+  active plan by a concrete consumer.
+- Do not expose turn IDs, steering, or branching in the default prompt API
+  before those behaviors are implemented end to end.

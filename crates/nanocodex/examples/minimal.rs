@@ -3,8 +3,7 @@ use nanocodex::Nanocodex;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("OPENAI_API_KEY")?;
-    let (agent, events) = Nanocodex::new(api_key)?;
-    drop(events);
+    let (agent, _) = Nanocodex::new(api_key)?;
 
     let turn = agent
         .prompt("Inspect this repository and summarize it.")
