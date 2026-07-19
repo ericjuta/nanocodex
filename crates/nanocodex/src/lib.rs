@@ -25,6 +25,8 @@ pub use nanocodex_core::{
 };
 #[cfg(not(target_family = "wasm"))]
 pub use nanocodex_macros::tool;
+#[cfg(not(target_family = "wasm"))]
+pub use nanocodex_mcp::{Mcp, McpBuildError, McpBuilder, McpServer};
 pub use nanocodex_service::{
     DefaultResponsesService, ResponsesAttempt, ResponsesAttemptKind, ResponsesClient,
     ResponsesRetryPolicy, ResponsesService, ResponsesServiceError, ResponsesServiceResponse,

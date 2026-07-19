@@ -28,5 +28,9 @@ path = "custom_tool.rs"
 name = "subagents"
 path = "subagents.rs"
 
+[[bin]]
+name = "mcp"
+path = "mcp.rs"
+
 [lints]
 workspace = true

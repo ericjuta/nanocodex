@@ -72,6 +72,21 @@ impl ToolExecution {
         }
     }
 
+    /// Returns a JSON value to Code Mode while retaining a serialized form for
+    /// the model-visible tool result and event stream.
+    #[must_use]
+    pub fn from_json(output: Value, success: bool) -> Self {
+        match serde_json::to_string(&output) {
+            Ok(encoded) => Self {
+                output: ToolOutputBody::Text(encoded),
+                success,
+                code_mode_value: Some(output),
+                metadata: None,
+            },
+            Err(error) => Self::error(format!("failed to encode tool result: {error}")),
+        }
+    }
+
     /// Returns a successful multimodal tool result.
     #[must_use]
     pub fn content(output: Vec<ToolOutputContent>) -> Self {
@@ -191,6 +206,31 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: ToolInput, context: ToolContext<'_>) -> ToolExecution;
 }
 
+/// A lazily populated family of Code Mode tools.
+///
+/// Providers start with the agent driver, advertise only their small direct
+/// tool surface initially, and may make additional tools callable at runtime.
+#[async_trait]
+pub trait DynamicToolProvider: Send + Sync {
+    /// Starts background discovery or connection work. Implementations must be idempotent.
+    fn start(&self);
+
+    /// Returns the provider's always-visible tools, such as `tool_search`.
+    fn direct_tools(&self) -> Vec<Arc<dyn Tool>>;
+
+    /// Returns deferred tools currently activated for new Code Mode cells.
+    fn available_definitions(&self) -> Vec<ToolDefinition>;
+
+    /// Executes an activated deferred tool, or returns `None` when this provider
+    /// does not currently expose `name`.
+    async fn execute(
+        &self,
+        name: &str,
+        input: Value,
+        context: ToolContext<'_>,
+    ) -> Option<ToolExecution>;
+}
+
 pub struct WebSearchConfig {
     pub endpoint: String,
     pub api_key: String,
@@ -208,6 +248,7 @@ pub struct Tools {
     web_search: bool,
     image_generation: bool,
     registered: Vec<Arc<dyn Tool>>,
+    providers: Vec<Arc<dyn DynamicToolProvider>>,
 }
 
 impl Default for Tools {
@@ -216,6 +257,7 @@ impl Default for Tools {
             web_search: true,
             image_generation: true,
             registered: Vec::new(),
+            providers: Vec::new(),
         }
     }
 }
@@ -234,6 +276,7 @@ impl fmt::Debug for Tools {
                     .map(|tool| tool.name())
                     .collect::<Vec<_>>(),
             )
+            .field("provider_count", &self.providers.len())
             .finish()
     }
 }
@@ -254,6 +297,13 @@ impl Tools {
     #[must_use]
     pub const fn image_generation_enabled(&self) -> bool {
         self.image_generation
+    }
+
+    /// Starts all dynamic providers without waiting for their handshakes.
+    pub fn start_providers(&self) {
+        for provider in &self.providers {
+            provider.start();
+        }
     }
 }
 
@@ -306,6 +356,15 @@ impl ToolsBuilder {
     #[must_use]
     pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
         self.tools.registered.push(Arc::new(tool));
+        self
+    }
+
+    /// Adds a dynamic family of Code Mode tools.
+    #[must_use]
+    pub fn provider<P: DynamicToolProvider + 'static>(mut self, provider: P) -> Self {
+        let provider: Arc<dyn DynamicToolProvider> = Arc::new(provider);
+        self.tools.registered.extend(provider.direct_tools());
+        self.tools.providers.push(provider);
         self
     }
 
@@ -392,7 +451,9 @@ impl ToolRuntime {
 
     #[must_use]
     pub fn with_tools(mut self, tools: &Tools) -> Self {
-        Arc::make_mut(&mut self.registry).extend(tools.registered.iter().cloned());
+        let registry = Arc::make_mut(&mut self.registry);
+        registry.extend(tools.registered.iter().cloned());
+        registry.providers.extend(tools.providers.iter().cloned());
         self
     }
 
@@ -424,6 +485,7 @@ pub(crate) struct ToolRegistry {
     ordered: Vec<Arc<dyn Tool>>,
     definitions: Vec<ToolDefinition>,
     by_name: HashMap<Box<str>, usize>,
+    providers: Vec<Arc<dyn DynamicToolProvider>>,
 }
 
 impl ToolRegistry {
@@ -434,6 +496,11 @@ impl ToolRegistry {
         context: ToolContext<'_>,
     ) -> ToolExecution {
         let Some((handler, definition)) = self.get(name) else {
+            for provider in &self.providers {
+                if let Some(execution) = provider.execute(name, input.clone(), context).await {
+                    return execution;
+                }
+            }
             return ToolExecution::error(format!("unsupported nested tool call: {name}"));
         };
         let input = match definition {
@@ -461,19 +528,18 @@ impl ToolRegistry {
     }
 
     pub(crate) fn nested_tool_metadata(&self) -> Vec<Value> {
-        self.entries()
-            .map(|(handler, definition)| {
-                let kind = match definition {
-                    ToolDefinition::Function { .. } => "function",
-                    ToolDefinition::Custom { .. } => "freeform",
-                };
-                json!({
-                    "name": handler.name(),
-                    "description": definition.description(),
-                    "kind": kind,
-                })
-            })
-            .collect()
+        let mut metadata = self
+            .entries()
+            .map(|(handler, definition)| definition_metadata(handler.name(), definition))
+            .collect::<Vec<_>>();
+        for definition in self
+            .providers
+            .iter()
+            .flat_map(|provider| provider.available_definitions())
+        {
+            metadata.push(definition_metadata(definition.name(), &definition));
+        }
+        metadata
     }
     fn from_ordered(workspace: PathBuf, ordered: Vec<Arc<dyn Tool>>) -> Self {
         let definitions = ordered.iter().map(|tool| tool.definition()).collect();
@@ -487,6 +553,7 @@ impl ToolRegistry {
             ordered,
             definitions,
             by_name,
+            providers: Vec::new(),
         }
     }
 
@@ -511,6 +578,18 @@ impl ToolRegistry {
     fn entries(&self) -> impl Iterator<Item = (&Arc<dyn Tool>, &ToolDefinition)> {
         self.ordered.iter().zip(&self.definitions)
     }
+}
+
+fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
+    let kind = match definition {
+        ToolDefinition::Function { .. } => "function",
+        ToolDefinition::Custom { .. } => "freeform",
+    };
+    json!({
+        "name": name,
+        "description": definition.description(),
+        "kind": kind,
+    })
 }
 
 /// Produces the compact JSON Schema shape used for macro-generated tools.
@@ -552,16 +631,30 @@ pub fn schema_for<T: JsonSchema>() -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use nanocodex_core::ToolDefinition;
     use serde::Deserialize;
     use serde_json::json;
 
     use super::{
-        DEFAULT_TOOL_OUTPUT_TOKENS, ImageGenerationConfig, Tool, ToolContext, ToolExecution,
-        ToolInput, ToolOutputBody, ToolRuntime, Tools, WebSearchConfig,
+        DEFAULT_TOOL_OUTPUT_TOKENS, DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext,
+        ToolExecution, ToolInput, ToolOutputBody, ToolRuntime, Tools, WebSearchConfig,
     };
 
     struct Double;
+
+    struct Search {
+        activated: Arc<AtomicBool>,
+    }
+
+    struct DeferredProvider {
+        activated: Arc<AtomicBool>,
+        started: AtomicBool,
+    }
 
     #[derive(Deserialize)]
     struct DoubleInput {
@@ -593,6 +686,68 @@ mod tests {
                 Err(error) => return ToolExecution::error(error.to_string()),
             };
             ToolExecution::text((input.value * 2).to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Search {
+        fn name(&self) -> &'static str {
+            "tool_search"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function(
+                self.name(),
+                "Activates a matching deferred tool.",
+                json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            )
+        }
+
+        async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolExecution {
+            self.activated.store(true, Ordering::Release);
+            ToolExecution::from_json(json!({ "name": "deferred_echo" }), true)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DynamicToolProvider for DeferredProvider {
+        fn start(&self) {
+            self.started.store(true, Ordering::Release);
+        }
+
+        fn direct_tools(&self) -> Vec<Arc<dyn Tool>> {
+            vec![Arc::new(Search {
+                activated: Arc::clone(&self.activated),
+            })]
+        }
+
+        fn available_definitions(&self) -> Vec<ToolDefinition> {
+            self.activated
+                .load(Ordering::Acquire)
+                .then(|| {
+                    ToolDefinition::function(
+                        "deferred_echo",
+                        "Returns its input.",
+                        json!({ "type": "object", "properties": {} }),
+                    )
+                })
+                .into_iter()
+                .collect()
+        }
+
+        async fn execute(
+            &self,
+            name: &str,
+            input: serde_json::Value,
+            _context: ToolContext<'_>,
+        ) -> Option<ToolExecution> {
+            (name == "deferred_echo" && self.activated.load(Ordering::Acquire))
+                .then(|| ToolExecution::from_json(input, true))
         }
     }
 
@@ -679,5 +834,51 @@ mod tests {
             panic!("expected text output");
         };
         assert_eq!(output, "42");
+    }
+
+    #[tokio::test]
+    async fn code_mode_can_search_and_call_a_deferred_tool_in_one_cell() {
+        let tools = Tools::builder()
+            .without_defaults()
+            .provider(DeferredProvider {
+                activated: Arc::new(AtomicBool::new(false)),
+                started: AtomicBool::new(false),
+            })
+            .build()
+            .unwrap();
+        tools.start_providers();
+        let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
+        let execution = runtime
+            .execute_code(
+                r#"
+const found = await tools.tool_search({ query: "echo" });
+const result = await tools[found.name]({ value: 21 });
+text(result.value);
+"#,
+                ToolContext {
+                    model: "test-model",
+                    session_id: "test-session",
+                    call_id: "test-call",
+                    history: &[],
+                    output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
+                },
+            )
+            .await;
+
+        assert!(execution.success);
+        assert_eq!(execution.nested_calls.len(), 2);
+        assert_eq!(execution.nested_calls[0].name, "tool_search");
+        assert_eq!(execution.nested_calls[1].name, "deferred_echo");
+        let ToolOutputBody::Content(content) = execution.output else {
+            panic!("expected content output");
+        };
+        assert_eq!(
+            serde_json::to_value(content)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .last(),
+            Some(&json!({ "type": "input_text", "text": "21" }))
+        );
     }
 }

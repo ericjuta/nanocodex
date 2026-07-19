@@ -116,20 +116,27 @@ async function runCell(init) {
   let nextId = 1;
   currentCell = { cellId: init.cell_id, pending };
 
-  const tools = Object.create(null);
-  for (const definition of init.tools) {
-    tools[definition.name] = (input) => new Promise((resolve, reject) => {
-      const id = nextId++;
-      pending.set(id, { resolve, reject });
-      send({
-        type: "tool_call",
-        cell_id: init.cell_id,
-        id,
-        name: definition.name,
-        input,
-      });
+  const declaredTools = Object.create(null);
+  const invokeTool = (name, input) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    send({
+      type: "tool_call",
+      cell_id: init.cell_id,
+      id,
+      name,
+      input,
     });
+  });
+  for (const definition of init.tools) {
+    declaredTools[definition.name] = (input) => invokeTool(definition.name, input);
   }
+  const tools = new Proxy(declaredTools, {
+    get(target, property) {
+      if (typeof property !== "string") return Reflect.get(target, property);
+      return target[property] || ((input) => invokeTool(property, input));
+    },
+  });
   Object.freeze(tools);
 
   function text(value) {

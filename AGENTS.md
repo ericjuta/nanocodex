@@ -56,6 +56,8 @@
   service/client.
 - `nanocodex-tools` owns code mode, built-in tools, the heterogeneous registry,
   and the public `Tool` trait.
+- `nanocodex-mcp` owns MCP transports, background handshake/discovery,
+  authenticated connection inputs, deferred tool search, and remote dispatch.
 - `nanocodex` composes those crates into the owned agent lifecycle and exports
   the ergonomic builders and common types.
 - `nanocodex-macros` implements `#[tool]`. Keep the executable under

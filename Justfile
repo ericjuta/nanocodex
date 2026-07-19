@@ -37,6 +37,7 @@ bootstrap-bindings:
     uv pip install --python "{{python_binding_bin}}" "maturin>=1.9,<2"
     rustup target add "{{wasm_target}}"
     npm ci --prefix bindings/wasm
+    npm ci --prefix examples/react-vite
 
 # Compile and install the PyO3 extension into its isolated development environment.
 build-python:
@@ -49,7 +50,7 @@ test-python: build-python
 
 # Run the persistent Python follow-on example against the live Responses API.
 smoke-python: build-python
-    "{{python_binding_bin}}" bindings/python/examples/follow_on.py
+    "{{python_binding_bin}}" examples/python/follow_on.py
 
 # Build one Rust/WASM artifact and generate both Node.js and browser bindings.
 build-wasm:
@@ -65,7 +66,15 @@ test-wasm: build-wasm
 
 # Run custom JavaScript tooling and a follow-on through Node-hosted WASM.
 smoke-wasm-node: build-wasm
-    node bindings/wasm/node/example.mjs
+    node examples/node/index.mjs
+
+# Type-check and bundle the React Worker example against the generated web WASM package.
+build-react-example: build-wasm
+    npm run build --prefix examples/react-vite
+
+# Exercise background MCP discovery, Code Mode tool_search, and one MCP call.
+smoke-mcp:
+    cargo run --quiet -p nanocodex-examples --bin mcp
 
 # Tight inner loop: native model process with local code mode, no Harbor or Docker.
 run:

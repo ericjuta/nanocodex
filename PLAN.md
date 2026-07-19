@@ -57,6 +57,9 @@ Crate ownership is fixed:
   telemetry.
 - `nanocodex-tools`: code mode, local tools, custom-tool registry, process
   lifecycle, and bounded tool output.
+- `nanocodex-mcp`: stdio/Streamable HTTP clients, background handshake and tool
+  discovery, authenticated transports, BM25 search, and deferred Code Mode
+  dispatch.
 - `nanocodex`: builders and the owned stateful agent lifecycle.
 - `nanocodex-macros`: the `#[tool]` implementation.
 - `bin/nanocodex`: the Ratatui daily-driver and headless JSONL adapter.
@@ -101,6 +104,23 @@ Socket tasks and mutable driver details stay private.
   or an inline `#[tool]` async function.
 - The public examples cover minimal result-only use, event consumption,
   follow-on prompting, and custom tool registration.
+- Dynamic providers can start work with the owned driver and expose deferred
+  Code Mode tools without inflating the stable prompt prefix.
+- MCP servers handshake and list tools concurrently at startup. `tool_search`
+  activates matching canonical `mcp__server__tool` names, including an
+  immediate dynamic call in the same JavaScript cell. Stdio, Streamable HTTP,
+  bearer tokens, custom headers, environment-resolved secrets, filters, and
+  bounded startup/tool calls are covered by the public API.
+
+### 4. Embedded consumers: complete
+
+- PyO3 and Node/browser WASM bindings preserve the owned handle/turn/event
+  contract without an app server or CLI bridge.
+- Top-level Rust, Python, Node.js, and React/Vite examples are real consumers of
+  the same session semantics. The browser agent runs in a module Worker and
+  leaves its authorized WebSocket boundary to the embedding application.
+- Application-defined subagents remain an example-level tool composition, with
+  optional host-side event multiplexing rather than a core scheduler.
 
 ## Active roadmap
 
@@ -164,7 +184,7 @@ Gate:
   that a reconnect/branch replay preserves the stable cache prefix.
 - The default one-prompt program does not gain lifecycle ceremony.
 
-### Phase 3: bindings and richer consumers
+### Phase 3: bindings and richer consumers (complete foundation)
 
 The Ratatui client, PyO3 extension, and Node/browser WASM packages are promoted
 embedded consumers of the same handle/turn/event contract:

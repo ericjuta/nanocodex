@@ -8,7 +8,7 @@ reuse its WebSocket, retained history, response chain, and prompt-cache key.
 python -m venv bindings/python/.venv
 bindings/python/.venv/bin/pip install maturin
 bindings/python/.venv/bin/maturin develop -m bindings/python/Cargo.toml
-bindings/python/.venv/bin/python bindings/python/examples/follow_on.py
+bindings/python/.venv/bin/python examples/python/follow_on.py
 ```
 
 `prompt()` only accepts the turn and returns a `Turn`; `Turn.result()` does the
@@ -16,3 +16,7 @@ blocking wait while releasing Python's GIL. `AgentEvents.recv_json()` likewise
 releases the GIL, so applications can consume it from a normal Python thread.
 The Rust runtime, tools, transport, retries, history, and event ordering stay
 inside the extension; no app server or per-tool Python bridge is involved.
+
+Runnable consumers live together at the repository boundary under
+[`examples/python`](../../examples/python): `follow_on.py` demonstrates retained
+conversation state and `events.py` consumes the ordered event receiver.

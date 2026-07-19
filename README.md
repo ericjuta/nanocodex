@@ -171,7 +171,49 @@ cargo run -p nanocodex-examples --bin minimal
 cargo run -p nanocodex-examples --bin follow-on
 cargo run -p nanocodex-examples --bin custom-tool
 cargo run -p nanocodex-examples --bin subagents
+cargo run -p nanocodex-examples --bin mcp
 ```
+
+### Add deferred MCP tools
+
+`nanocodex-mcp` implements Streamable HTTP and stdio MCP clients as a dynamic
+Code Mode tool provider. Each configured server initializes and runs
+`tools/list` concurrently when the owned agent starts. Only the compact
+`tool_search` definition is in the initial model prompt; matching tools are
+activated on demand and can be called immediately from the same code cell.
+
+```rust
+use nanocodex::{Mcp, McpServer, Nanocodex, Tools};
+
+# async fn example(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
+let mcp = Mcp::builder()
+    .server(
+        "workspace",
+        McpServer::http("https://mcp.example.com/mcp")
+            .bearer_token_env("WORKSPACE_MCP_TOKEN"),
+    )
+    .server(
+        "local",
+        McpServer::stdio("node").args(["./server.mjs"]),
+    )
+    .build()?;
+let tools = Tools::builder().provider(mcp).build()?;
+let (agent, _) = Nanocodex::builder(api_key).tools(tools).build()?;
+
+let result = agent
+    .prompt("Search the configured MCP tools, use the relevant read-only tool, and summarize.")
+    .await?
+    .result()
+    .await?;
+println!("{}", result.final_message);
+# Ok(())
+# }
+```
+
+HTTP authentication can come from a bearer token or arbitrary fixed/environment
+headers; secret values are resolved only by the background connection task.
+Server/tool filters and startup/tool timeouts are configured per `McpServer`.
+See [`mcp.rs`](examples/mcp.rs) for a runnable example.
 
 ### Embed from Python, Node.js, or a browser Worker
 
@@ -190,8 +232,8 @@ print(second.result())  # no previous result or transcript is passed back
 
 The PyO3 extension owns a native Tokio runtime and exposes `Nanocodex`, `Turn`,
 and the ordered event receiver directly. See
-[`bindings/python`](bindings/python) for build instructions and event/follow-on
-examples.
+[`bindings/python`](bindings/python) for build instructions and the top-level
+[`examples/python`](examples/python) programs.
 
 Node.js and web consumers use one shared Rust/WASM artifact. Node supplies a
 header-capable WebSocket and can define async JavaScript tools; a browser Worker
@@ -204,11 +246,13 @@ const followOn = agent.prompt("Add one to that result.");
 console.log(await followOn.result());
 ```
 
-See [`bindings/wasm/node/example.mjs`](bindings/wasm/node/example.mjs) and
-[`bindings/wasm/browser/worker.mjs`](bindings/wasm/browser/worker.mjs). Browser
-WebSockets cannot set the Responses authorization upgrade header, so Nanocodex
-does not pretend direct browser authentication works and does not ship a relay;
-the embedding application supplies an already-authorized endpoint or custom
+See the top-level [`examples/node`](examples/node) and
+[`examples/react-vite`](examples/react-vite) consumers. The React example runs
+the persistent Rust/WASM agent in a real module Worker, displays the ordered
+event stream, and registers a browser-native custom tool. Browser WebSockets
+cannot set the Responses authorization upgrade header, so Nanocodex does not
+pretend direct browser authentication works and does not ship a relay; the
+embedding application supplies an already-authorized endpoint or custom
 `createWebSocket` implementation.
 
 [`subagents.rs`](examples/subagents.rs) shows that delegation does not require a
@@ -264,7 +308,7 @@ operation boundary, layer ordering, retry safety, and benchmark evidence.
 
 ### Crate boundaries
 
-The workspace exposes four independently useful library layers, following the
+The workspace exposes five independently useful library layers, following the
 same boundary style as `alloy-core` and Alloy's ergonomic top-level crate:
 
 - `nanocodex-core`: dependency-light prompts, events, model configuration, and
@@ -273,6 +317,8 @@ same boundary style as `alloy-core` and Alloy's ergonomic top-level crate:
   typed errors, Tower service/client, retry middleware, and telemetry.
 - `nanocodex-tools`: built-in tools, code mode, heterogeneous tool registry,
   and the public tool trait.
+- `nanocodex-mcp`: background MCP transports, discovery catalog, BM25
+  `tool_search`, authentication inputs, and deferred Code Mode dispatch.
 - `nanocodex`: owned agent lifecycle, builders, and ergonomic re-exports.
 
 `nanocodex-macros` implements `#[tool]`. The `nanocodex-bin` package under

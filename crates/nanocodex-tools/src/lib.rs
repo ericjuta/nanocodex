@@ -28,9 +28,9 @@ pub use image::{prepare_output_images, prepare_user_input};
 pub use nanocodex_core::ImageDetail;
 #[cfg(not(target_family = "wasm"))]
 pub use runtime::{
-    DEFAULT_TOOL_OUTPUT_TOKENS, ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput,
-    ToolInputError, ToolOutputBody, ToolOutputContent, ToolRuntime, Tools, ToolsBuildError,
-    ToolsBuilder, WebSearchConfig, schema_for,
+    DEFAULT_TOOL_OUTPUT_TOKENS, DynamicToolProvider, ImageGenerationConfig, Tool, ToolContext,
+    ToolExecution, ToolInput, ToolInputError, ToolOutputBody, ToolOutputContent, ToolRuntime,
+    Tools, ToolsBuildError, ToolsBuilder, WebSearchConfig, schema_for,
 };
 #[cfg(target_family = "wasm")]
 pub use wasm::*;

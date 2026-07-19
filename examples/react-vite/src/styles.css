@@ -1,0 +1,60 @@
+:root {
+  color: #18201d;
+  background: #edf0e9;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input, select, textarea { font: inherit; }
+
+main {
+  width: min(900px, calc(100% - 32px));
+  margin: 48px auto;
+}
+
+header { margin-bottom: 28px; }
+h1 { margin: 4px 0 8px; font: 600 clamp(2.4rem, 8vw, 5rem)/0.95 Georgia, serif; }
+header > p:last-child { color: #53605b; }
+.eyebrow { margin: 0; color: #b34b2f; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
+
+.connection, .composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 150px auto;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid #c9cec7;
+  border-radius: 16px;
+  background: #f8f9f5;
+  box-shadow: 0 14px 40px rgb(41 52 46 / 8%);
+}
+
+label { display: grid; gap: 6px; color: #53605b; font-size: 0.78rem; font-weight: 700; }
+input, select, textarea { width: 100%; border: 1px solid #b9c0b9; border-radius: 9px; background: white; padding: 10px 12px; color: inherit; }
+button { align-self: end; border: 0; border-radius: 9px; padding: 11px 16px; background: #1f5d49; color: white; font-weight: 750; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: 0.45; }
+
+.status { display: flex; align-items: center; gap: 8px; margin: 16px 4px; color: #66716d; font-size: 0.85rem; }
+.status span { width: 8px; height: 8px; border-radius: 50%; background: #a5aaa6; }
+.status[data-ready="true"] span { background: #30a46c; box-shadow: 0 0 0 4px rgb(48 164 108 / 14%); }
+
+.transcript { min-height: 280px; padding: 22px 0; }
+article { width: min(78%, 650px); margin: 12px 0; padding: 14px 17px; border-radius: 14px; background: white; }
+article.user { margin-left: auto; background: #1f5d49; color: white; }
+article.error { border: 1px solid #e7aaa0; background: #fff4f1; color: #922b1c; }
+article strong { display: block; margin-bottom: 5px; font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.65; }
+article p { margin: 0; white-space: pre-wrap; }
+.empty, .pending { color: #6b7470; text-align: center; }
+
+.composer { grid-template-columns: minmax(0, 1fr) auto; }
+textarea { resize: vertical; }
+details { margin-top: 20px; color: #53605b; }
+summary { cursor: pointer; }
+pre { max-height: 320px; overflow: auto; padding: 14px; border-radius: 10px; background: #17201c; color: #dce8e1; font-size: 0.72rem; white-space: pre-wrap; }
+
+@media (max-width: 700px) {
+  main { margin: 24px auto; }
+  .connection { grid-template-columns: 1fr; }
+  article { width: 92%; }
+}

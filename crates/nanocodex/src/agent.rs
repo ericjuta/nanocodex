@@ -263,6 +263,7 @@ where
     ///
     /// Returns an infrastructure error while receiving or starting a command.
     async fn run(mut self) -> Result<()> {
+        self.tools.start_providers();
         let mut model = ModelRun::new(
             self.events,
             self.config,
