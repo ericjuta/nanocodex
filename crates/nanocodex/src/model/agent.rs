@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc, time::Instant};
+use std::{path::Path, sync::Arc};
 
 use nanocodex_core::{
     AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ToolDefinition, Usage,
@@ -10,6 +10,7 @@ use nanocodex_service::{
 };
 use serde_json::value::RawValue;
 use tower::Service;
+use web_time::Instant;
 
 use super::{
     AssistantMessage, CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted,
@@ -42,6 +43,16 @@ pub(crate) struct ModelRun<S> {
     session: Option<ModelSessionState>,
     tools: Tools,
 }
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) trait AgentSend: Send {}
+#[cfg(not(target_family = "wasm"))]
+impl<T: Send> AgentSend for T {}
+
+#[cfg(target_family = "wasm")]
+pub(crate) trait AgentSend {}
+#[cfg(target_family = "wasm")]
+impl<T> AgentSend for T {}
 
 struct ModelSessionState {
     workspace: String,
@@ -150,9 +161,9 @@ impl<S> ModelRun<S> {
 
 impl<S> ModelRun<S>
 where
-    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
+    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + AgentSend + 'static,
     S::Error: Into<NanocodexError>,
-    S::Future: Send,
+    S::Future: AgentSend,
 {
     pub(crate) async fn execute(&mut self, task: Prompt) -> Result<String> {
         self.started_at = Instant::now();

@@ -1,4 +1,8 @@
 pub(crate) mod agent;
+#[cfg(not(target_family = "wasm"))]
+mod agents_md;
+#[cfg(target_family = "wasm")]
+#[path = "agents_md_wasm.rs"]
 mod agents_md;
 mod compaction;
 mod context_manager;

@@ -1,11 +1,17 @@
 extern crate self as nanocodex;
 
+#[cfg(not(target_family = "wasm"))]
 mod agent;
 mod error;
 mod model;
+#[cfg(not(target_family = "wasm"))]
 mod responses;
+#[cfg(target_family = "wasm")]
+mod wasm;
 
+#[cfg(not(target_family = "wasm"))]
 pub use agent::{Nanocodex, NanocodexBuilder, Turn, TurnResult};
+#[cfg(not(target_family = "wasm"))]
 pub use async_trait::async_trait;
 pub use error::{AgentError, NanocodexError, ResponsesError, Result};
 pub use nanocodex_core::responses::RequestProfile;
@@ -17,20 +23,28 @@ pub use nanocodex_core::{
     Prompt, PromptInput, ReasoningContent, ReasoningSummary, ResponseItem, Thinking, ToolCaller,
     ToolDefinition, Usage, UserInput, WebSearchAction,
 };
+#[cfg(not(target_family = "wasm"))]
 pub use nanocodex_macros::tool;
 pub use nanocodex_service::{
     DefaultResponsesService, ResponsesAttempt, ResponsesAttemptKind, ResponsesClient,
     ResponsesRetryPolicy, ResponsesService, ResponsesServiceError, ResponsesServiceResponse,
 };
+#[cfg(not(target_family = "wasm"))]
 pub use nanocodex_tools::{
     DEFAULT_TOOL_OUTPUT_TOKENS, Tool, ToolContext, ToolExecution, ToolInput, ToolInputError,
     ToolOutputBody, ToolOutputContent, Tools, ToolsBuildError, ToolsBuilder,
 };
+#[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub use responses::{LayeredResponses, StandardResponses};
+#[cfg(not(target_family = "wasm"))]
 pub use responses::{Responses, ResponsesBuilder};
+#[cfg(not(target_family = "wasm"))]
 pub use schemars::JsonSchema as ToolSchema;
+#[cfg(target_family = "wasm")]
+pub use wasm::{WasmNanocodex, WasmTurn};
 
+#[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub mod __private {
     pub use async_trait::async_trait;

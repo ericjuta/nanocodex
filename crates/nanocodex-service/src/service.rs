@@ -3,7 +3,6 @@ use std::{
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
-    time::Instant,
 };
 
 use nanocodex_core::{
@@ -12,6 +11,7 @@ use nanocodex_core::{
 };
 use tokio::sync::Mutex;
 use tower::{Service, retry::Retry};
+use web_time::Instant;
 
 use crate::{
     EncodedRequest, ResponsesError,
@@ -25,6 +25,13 @@ use crate::{
         ConnectionPurpose, ConnectionStarted, TRANSPORT, display_endpoint, duration_ns, elapsed_ns,
     },
 };
+
+#[cfg(not(target_family = "wasm"))]
+type ServiceFuture =
+    Pin<Box<dyn Future<Output = Result<ResponsesServiceResponse, ResponsesServiceError>> + Send>>;
+#[cfg(target_family = "wasm")]
+type ServiceFuture =
+    Pin<Box<dyn Future<Output = Result<ResponsesServiceResponse, ResponsesServiceError>>>>;
 
 struct ConnectionState {
     socket: Option<ResponsesSocket>,
@@ -315,8 +322,7 @@ impl ResponsesService {
 impl Service<ResponsesAttempt> for ResponsesService {
     type Response = ResponsesServiceResponse;
     type Error = ResponsesServiceError;
-    type Future =
-        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+    type Future = ServiceFuture;
 
     fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))

@@ -1,7 +1,8 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Serialize, Serializer};
 use serde_json::{Value, value::RawValue};
+use web_time::Instant;
 
 use crate::{attempt::ResponsesAttemptKind, service_error::FailurePhase};
 

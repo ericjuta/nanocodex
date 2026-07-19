@@ -1,9 +1,17 @@
 mod attempt;
 mod client;
+#[cfg(not(target_family = "wasm"))]
+mod error;
+#[cfg(target_family = "wasm")]
+#[path = "error_wasm.rs"]
 mod error;
 mod middleware;
 mod service;
 mod service_error;
+#[cfg(not(target_family = "wasm"))]
+mod socket;
+#[cfg(target_family = "wasm")]
+#[path = "socket_wasm.rs"]
 mod socket;
 mod stream;
 mod telemetry;

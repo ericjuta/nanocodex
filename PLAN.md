@@ -166,12 +166,22 @@ Gate:
 
 ### Phase 3: bindings and richer consumers
 
-The first richer consumer is now the Ratatui client under `bin/nanocodex`. It
-wraps the same Rust handle/events contract in-process and leaves presentation,
-prompt history, queue display, and terminal lifecycle outside the library.
-Python, Node, WASM, or an embedded server remain deferred until promoted by a
-concrete consumer with an ownership model for its runtime and end-to-end
-cancellation/event tests.
+The Ratatui client, PyO3 extension, and Node/browser WASM packages are promoted
+embedded consumers of the same handle/turn/event contract:
+
+- PyO3 owns one native Tokio runtime per constructed agent and releases the GIL
+  while waiting for turn results or events.
+- Node and web use one shared Rust/WASM model, history, cache, protocol, and
+  Tower implementation. JavaScript owns only WebSocket/code-mode host
+  capabilities and application-defined tools.
+- Browser credentials/endpoints remain application policy. The SDK does not
+  introduce an app server, relay, daemon, or JSON-RPC boundary.
+
+The deterministic binding gate covers construction/error translation, one
+persistent Node WebSocket across follow-on turns, incremental response IDs,
+stable cache/session headers, custom JavaScript tools, unified events, and the
+browser host contract. Full cancellation remains part of Phase 2 rather than a
+binding-specific alternate lifecycle.
 
 ## Performance policy
 
@@ -237,7 +247,7 @@ advancing this checkpoint.
 
 - Provider/model abstraction and backwards compatibility.
 - A Nanocodex-owned app server, JSON-RPC protocol, or daemon.
-- Python/Node/WASM bindings without a concrete embedded consumer.
+- Additional language bindings without a concrete embedded consumer.
 - Browser/computer-use runtimes until a deterministic eval and consumer justify
   the capability.
 - Skills/plugins, approval machinery, alternate runtime modes, or duplicate

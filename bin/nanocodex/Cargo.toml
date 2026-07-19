@@ -15,7 +15,7 @@ nanocodex.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 unicode-width.workspace = true
 
 [[bin]]

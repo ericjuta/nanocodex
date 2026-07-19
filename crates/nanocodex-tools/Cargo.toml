@@ -6,20 +6,27 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+nanocodex-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
 async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
-nanocodex-core.workspace = true
 image.workspace = true
 nix.workspace = true
 portable-pty.workspace = true
 reqwest.workspace = true
 schemars.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 sha1.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
 
 [dev-dependencies]
 eyre.workspace = true

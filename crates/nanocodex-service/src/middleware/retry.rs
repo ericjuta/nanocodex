@@ -2,11 +2,12 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use nanocodex_core::AgentEventKind;
 use tower::retry::{Policy, Retry};
+use web_time::Instant;
 
 use crate::{
     attempt::{ResponsesAttempt, ResponsesServiceResponse},
@@ -15,13 +16,18 @@ use crate::{
     telemetry::{AttemptRetrying, duration_ns, elapsed_ns},
 };
 
+#[cfg(not(target_family = "wasm"))]
+type RetryFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(target_family = "wasm")]
+type RetryFuture = Pin<Box<dyn Future<Output = ()>>>;
+
 #[derive(Clone, Copy, Default)]
 pub struct ResponsesRetryPolicy;
 
 impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
     for ResponsesRetryPolicy
 {
-    type Future = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+    type Future = RetryFuture;
 
     fn retry(
         &mut self,
@@ -73,7 +79,7 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
         let stats = Arc::clone(&request.observer.stats);
         Some(Box::pin(async move {
             let started_at = Instant::now();
-            tokio::time::sleep(delay).await;
+            sleep(delay).await;
             stats
                 .retry_backoff_duration_ns
                 .fetch_add(elapsed_ns(started_at), Ordering::Relaxed);
@@ -83,6 +89,26 @@ impl Policy<ResponsesAttempt, ResponsesServiceResponse, ResponsesServiceError>
     fn clone_request(&mut self, request: &ResponsesAttempt) -> Option<ResponsesAttempt> {
         Some(request.clone())
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn sleep(delay: Duration) {
+    tokio::time::sleep(delay).await;
+}
+
+#[cfg(target_family = "wasm")]
+async fn sleep(delay: Duration) {
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen_futures::JsFuture;
+
+    #[wasm_bindgen]
+    extern "C" {
+        #[wasm_bindgen(js_namespace = ["globalThis", "nanocodexHost"], js_name = sleep)]
+        fn host_sleep(milliseconds: u32) -> js_sys::Promise;
+    }
+
+    let milliseconds = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
+    drop(JsFuture::from(host_sleep(milliseconds)).await);
 }
 
 pub type DefaultResponsesService = Retry<ResponsesRetryPolicy, ResponsesService>;

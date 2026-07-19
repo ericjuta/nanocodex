@@ -1,10 +1,9 @@
-use std::time::Instant;
-
 use nanocodex_core::{
     AgentEventKind, ContentItem, EventSink, ResponseItem,
     responses::{ServerEvent, Usage},
 };
 use serde::Serialize;
+use web_time::Instant;
 
 use crate::{
     ResponsesError,

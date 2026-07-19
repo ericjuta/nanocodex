@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 use chrono::{Local, Utc};
 use nanocodex_core::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, MessageRole, ResponseItem,
@@ -78,6 +79,7 @@ fn task_context_with_time(
     ResponseItem::message(MessageRole::User, context)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn local_time_context() -> (String, String) {
     match iana_time_zone::get_timezone() {
         Ok(timezone) => (Local::now().format("%Y-%m-%d").to_string(), timezone),
@@ -86,6 +88,27 @@ fn local_time_context() -> (String, String) {
             "Etc/UTC".to_owned(),
         ),
     }
+}
+
+#[cfg(target_family = "wasm")]
+fn local_time_context() -> (String, String) {
+    let now = js_sys::Date::new_0();
+    let current_date = format!(
+        "{:04}-{:02}-{:02}",
+        now.get_full_year(),
+        now.get_month() + 1,
+        now.get_date()
+    );
+    let formatter =
+        js_sys::Intl::DateTimeFormat::new(&js_sys::Array::new(), &js_sys::Object::new());
+    let timezone = js_sys::Reflect::get(
+        &formatter.resolved_options(),
+        &wasm_bindgen::JsValue::from_str("timeZone"),
+    )
+    .ok()
+    .and_then(|value| value.as_string())
+    .unwrap_or_else(|| "Etc/UTC".to_owned());
+    (current_date, timezone)
 }
 
 fn environment_context(workspace: &str, shell: &str, current_date: &str, timezone: &str) -> String {

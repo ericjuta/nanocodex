@@ -1,12 +1,15 @@
+#[cfg(not(target_family = "wasm"))]
 use std::{
     collections::{HashMap, VecDeque},
     sync::{LazyLock, Mutex},
 };
 
+#[cfg(not(target_family = "wasm"))]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use nanocodex_core::{
     ContentItem, FunctionOutputBody, FunctionOutputContent, ImageDetail, ResponseItem,
 };
+#[cfg(not(target_family = "wasm"))]
 use sha1::{Digest as _, Sha1};
 
 use super::context_manager::is_contextual_user_message;
@@ -15,18 +18,23 @@ const SOL_CONTEXT_WINDOW: u64 = 272_000;
 const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 const APPROX_BYTES_PER_TOKEN: usize = 4;
 const RESIZED_IMAGE_BYTES_ESTIMATE: usize = 7_373;
+#[cfg(not(target_family = "wasm"))]
 const ORIGINAL_IMAGE_PATCH_SIZE: u32 = 32;
+#[cfg(not(target_family = "wasm"))]
 const ORIGINAL_IMAGE_MAX_PATCHES: usize = 10_000;
+#[cfg(not(target_family = "wasm"))]
 const ORIGINAL_IMAGE_ESTIMATE_CACHE_SIZE: usize = 32;
 const CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE: &str =
     "Output exceeded the available model context and was truncated";
 
+#[cfg(not(target_family = "wasm"))]
 #[derive(Default)]
 struct OriginalImageEstimateCache {
     entries: HashMap<[u8; 20], Option<usize>>,
     order: VecDeque<[u8; 20]>,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl OriginalImageEstimateCache {
     fn get_or_insert_with(
         &mut self,
@@ -51,6 +59,7 @@ impl OriginalImageEstimateCache {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<Mutex<OriginalImageEstimateCache>> =
     LazyLock::new(|| Mutex::new(OriginalImageEstimateCache::default()));
 
@@ -321,6 +330,7 @@ fn base64_image_payload(image_url: &str) -> Option<&str> {
         .then_some(payload)
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn original_image_bytes_estimate(image_url: &str) -> Option<usize> {
     let key = Sha1::digest(image_url.as_bytes()).into();
     let estimate = || {
@@ -338,6 +348,13 @@ fn original_image_bytes_estimate(image_url: &str) -> Option<usize> {
         Ok(mut cache) => cache.get_or_insert_with(key, estimate),
         Err(poisoned) => poisoned.into_inner().get_or_insert_with(key, estimate),
     }
+}
+
+#[cfg(target_family = "wasm")]
+const fn original_image_bytes_estimate(_image_url: &str) -> Option<usize> {
+    // Image decoding is a large native-only dependency. The portable runtime uses the same
+    // conservative resized-image estimate when dimensions are unavailable.
+    None
 }
 
 fn encrypted_function_output_estimate_adjustment(item: &ResponseItem) -> (usize, usize) {

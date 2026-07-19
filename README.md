@@ -173,6 +173,44 @@ cargo run -p nanocodex-examples --bin custom-tool
 cargo run -p nanocodex-examples --bin subagents
 ```
 
+### Embed from Python, Node.js, or a browser Worker
+
+The language bindings preserve the same owned session rather than wrapping the
+CLI or starting an app server:
+
+```python
+from nanocodex import Nanocodex
+
+agent, events = Nanocodex(api_key, thinking="low")
+first = agent.prompt("Choose one word for this project.")
+print(first.result())
+second = agent.prompt("Return that word in uppercase.")
+print(second.result())  # no previous result or transcript is passed back
+```
+
+The PyO3 extension owns a native Tokio runtime and exposes `Nanocodex`, `Turn`,
+and the ordered event receiver directly. See
+[`bindings/python`](bindings/python) for build instructions and event/follow-on
+examples.
+
+Node.js and web consumers use one shared Rust/WASM artifact. Node supplies a
+header-capable WebSocket and can define async JavaScript tools; a browser Worker
+supplies its own authenticated WebSocket boundary and browser-native tools:
+
+```js
+const turn = agent.prompt("Use multiply to calculate 6 × 7.");
+console.log(await turn.result());
+const followOn = agent.prompt("Add one to that result.");
+console.log(await followOn.result());
+```
+
+See [`bindings/wasm/node/example.mjs`](bindings/wasm/node/example.mjs) and
+[`bindings/wasm/browser/worker.mjs`](bindings/wasm/browser/worker.mjs). Browser
+WebSockets cannot set the Responses authorization upgrade header, so Nanocodex
+does not pretend direct browser authentication works and does not ship a relay;
+the embedding application supplies an already-authorized endpoint or custom
+`createWebSocket` implementation.
+
 [`subagents.rs`](examples/subagents.rs) shows that delegation does not require a
 multi-agent subsystem in the library. Its application-defined `spawn_agent`
 tool builds an independent `Nanocodex` for each task; the parent can invoke
@@ -239,6 +277,8 @@ same boundary style as `alloy-core` and Alloy's ergonomic top-level crate:
 
 `nanocodex-macros` implements `#[tool]`. The `nanocodex-bin` package under
 `bin/nanocodex` is an example CLI adapter, not the SDK boundary.
+The PyO3 and Rust/WASM packages under `bindings/` are likewise thin embedded
+adapters over the owned session and typed event contract.
 
 ## Develop this repository
 

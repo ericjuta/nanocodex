@@ -3,6 +3,14 @@
 .nanocodex/
 .venv/
 target/
+bindings/python/.venv/
+bindings/python/dist/
+bindings/python/python/nanocodex/*.so
+bindings/python/python/nanocodex/*.dylib
+bindings/python/python/nanocodex/*.pyd
+bindings/wasm/node_modules/
+bindings/wasm/pkg-node/
+bindings/wasm/pkg-web/
 jobs/
 trials/
 __pycache__/
