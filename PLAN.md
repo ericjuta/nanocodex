@@ -269,13 +269,6 @@ Status: complete.
    evals. Inspect their JSONL, trajectory, result, and verifier output; do not
    run the full eval suite for this maintenance phase.
 
-The final 2026-07-18 rebase onto `master` passed all 82 Rust tests, Clippy and
-rustdoc with warnings denied, formatting, and the native Linux artifact build.
-The user explicitly waived repeating the focused Harbor tasks after that
-rebase; the earlier green focused traces and verifier results remain recorded
-in `docs/RESPONSES_TOWER_REWRITE.md` and are not represented as a post-rebase
-eval run.
-
 ## Milestone 2: eval-driven tuning
 
 Status: in progress. Thirty-seven public tasks are active under the current
@@ -1816,6 +1809,19 @@ tokens, cache utilization, compactions, and cost when the API reports it. Once
 one attempt works, use repeated attempts to estimate variance and p50/p95 rather
 than drawing tuning conclusions from one lucky trajectory. Add private taste or
 regression tasks only after the public baseline is stable.
+
+### Upstream Codex parity review (2026-07-18)
+
+The review covered every OpenAI Codex commit from
+`3ac476bed22a7b7322a710a6ca79a0dbe917d604` through
+`35eaf3ffb0bf2001486c68c47a3d946b34d16634`. The harness adopts the corrected
+272,000-token `gpt-5.6-sol` context window from upstream commit
+`d26a9bf671b1c03aabfc32e1092d137c1feb3962`, yielding a 244,800-token automatic
+compaction threshold. Audio forwarding from
+`23899f7cb63a1510e53fddd68740dfc325853e3b` and modality-aware audio history
+from `56395bddaf26eb2829387ca6a417bf9128e5b239` remain deferred until the target
+model advertises audio input; current bundled Sol metadata supports only text
+and image. Do not import a model-catalog abstraction for that deferred path.
 
 ## Milestone 3: review provenance
 

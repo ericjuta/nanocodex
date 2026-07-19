@@ -11,7 +11,7 @@ agents:
     kwargs:
       effort: low
       web_search: false
-      system_prompt_path: src/model/prompts/system.md
+      system_prompt_path: crates/harness-core/prompts/system.md
       agents_md_path: evals/history-derived/AGENTS.md
 
 datasets:

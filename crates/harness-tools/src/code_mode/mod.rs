@@ -1,47 +1,87 @@
 mod description;
-mod host;
 mod output;
+mod protocol;
+mod spec;
 
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, process::Stdio, sync::Arc, time::Instant};
 
-use harness_core::{CustomToolFormat, ToolDefinition};
-use serde::Deserialize;
+use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::{
+    io::BufReader,
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::{Mutex, mpsc, oneshot},
+    task::JoinHandle,
+    time::Duration,
+};
+
+use harness_core::ResponseItem;
 use serde_json::value::RawValue;
-use serde_json::{Value, json};
-use tokio::{sync::Mutex, time::Duration};
 
-use super::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime};
-use host::NodeHost;
+use super::{ToolContext, ToolOutputBody, ToolOutputContent};
+use crate::runtime::ToolRegistry;
+use protocol::{read_protocol_line, write_json_line};
+pub(crate) use spec::{exec_spec, wait_spec};
 
+const RUNTIME: &str = include_str!("runtime.js");
 const INITIAL_YIELD: Duration = if cfg!(test) {
-    Duration::from_secs(5)
+    Duration::from_secs(30)
 } else {
     Duration::from_secs(10)
 };
 const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
-const GRAMMAR: &str = r"start: pragma_source | plain_source
-pragma_source: PRAGMA_LINE NEWLINE SOURCE
-plain_source: SOURCE
-PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
-NEWLINE: /\r?\n/
-SOURCE: /[\s\S]+/";
-
 pub(crate) struct CodeModeRuntime {
-    state: Mutex<CodeModeState>,
+    cells: Mutex<CellRegistry>,
+    stored: Arc<Mutex<HashMap<String, Value>>>,
 }
 
-struct CodeModeState {
-    host: Option<NodeHost>,
-    stored: HashMap<String, Value>,
+struct CellRegistry {
     next_cell_id: u64,
-    live_cell: Option<LiveCell>,
+    live_cells: HashMap<u64, LiveCell>,
 }
 
 struct LiveCell {
     id: u64,
+    output_token_budget: usize,
+    updates: mpsc::UnboundedReceiver<CellUpdate>,
+    terminate: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+
+struct OwnedToolContext {
+    model: String,
+    session_id: String,
     call_id: String,
+    history: Vec<ResponseItem>,
+    output_token_budget: usize,
+}
+
+enum CellUpdate {
+    NestedCall {
+        id: u64,
+        call: NestedToolCall,
+    },
+    Notification(CodeModeNotification),
+    Yielded {
+        content: Vec<ToolOutputContent>,
+    },
+    Completed {
+        content: Vec<ToolOutputContent>,
+    },
+    ScriptFailed {
+        message: String,
+        content: Vec<ToolOutputContent>,
+    },
+    HostFailed(String),
+}
+
+struct NodeHost {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
 }
 
 pub struct CodeModeExecution {
@@ -66,56 +106,110 @@ pub struct NestedToolCall {
     pub metadata: Option<Box<RawValue>>,
 }
 
+#[derive(Serialize)]
+struct ExecuteMessage<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    cell_id: u64,
+    source: &'a str,
+    tools: Vec<Value>,
+    stored: HashMap<String, Value>,
+}
+
+#[derive(Serialize)]
+struct ToolResultMessage {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    cell_id: u64,
+    id: u64,
+    value: Value,
+    success: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RuntimeEvent {
+    ToolCall {
+        cell_id: u64,
+        id: u64,
+        name: String,
+        input: Value,
+    },
+    Notify {
+        cell_id: u64,
+        text: String,
+    },
+    Yielded {
+        cell_id: u64,
+        #[serde(default)]
+        content: Vec<ToolOutputContent>,
+    },
+    Done {
+        cell_id: u64,
+        #[serde(default)]
+        content: Vec<ToolOutputContent>,
+        #[serde(default)]
+        stored: HashMap<String, Value>,
+    },
+    Error {
+        cell_id: u64,
+        message: String,
+        #[serde(default)]
+        content: Vec<ToolOutputContent>,
+        #[serde(default)]
+        stored: HashMap<String, Value>,
+    },
+}
+
+impl RuntimeEvent {
+    fn cell_id(&self) -> u64 {
+        match self {
+            Self::ToolCall { cell_id, .. }
+            | Self::Notify { cell_id, .. }
+            | Self::Yielded { cell_id, .. }
+            | Self::Done { cell_id, .. }
+            | Self::Error { cell_id, .. } => *cell_id,
+        }
+    }
+}
+
 struct CompletedNestedCall {
     id: u64,
     value: Value,
     call: NestedToolCall,
 }
 
-enum CellOutcome {
-    Yielded {
-        content: Vec<ToolOutputContent>,
-        stored: Option<HashMap<String, Value>>,
-        nested_calls: Vec<NestedToolCall>,
-        notifications: Vec<CodeModeNotification>,
-    },
+enum CellTerminal {
     Completed {
         content: Vec<ToolOutputContent>,
         stored: HashMap<String, Value>,
-        nested_calls: Vec<NestedToolCall>,
-        notifications: Vec<CodeModeNotification>,
     },
     ScriptFailed {
         message: String,
         content: Vec<ToolOutputContent>,
         stored: HashMap<String, Value>,
-        nested_calls: Vec<NestedToolCall>,
-        notifications: Vec<CodeModeNotification>,
     },
 }
 
 struct HostFailure {
     message: String,
-    nested_calls: Vec<NestedToolCall>,
-    notifications: Vec<CodeModeNotification>,
 }
 
 impl CodeModeRuntime {
     pub(super) fn new() -> Self {
         Self {
-            state: Mutex::new(CodeModeState {
-                host: None,
-                stored: HashMap::new(),
+            cells: Mutex::new(CellRegistry {
                 next_cell_id: 1,
-                live_cell: None,
+                live_cells: HashMap::new(),
             }),
+            stored: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub(super) async fn execute(
         &self,
         source: &str,
-        tools: &ToolRuntime,
+        tools: Arc<ToolRegistry>,
         context: ToolContext<'_>,
     ) -> CodeModeExecution {
         let started_at = Instant::now();
@@ -123,62 +217,47 @@ impl CodeModeRuntime {
             Ok(source) => source,
             Err(message) => return failed_execution(started_at, &message, Vec::new()),
         };
-        let mut state = self.state.lock().await;
-        if let Some(live_cell) = state.live_cell.as_ref() {
-            return failed_execution(
-                started_at,
-                &format!(
-                    "exec cell {} is still running; use wait before starting another",
-                    live_cell.id
-                ),
-                Vec::new(),
-            );
-        }
-        let cell_id = state.allocate_cell_id();
-        let parent_call_id = context.call_id.to_owned();
-        if state.host.is_none() {
-            match NodeHost::spawn() {
-                Ok(host) => state.host = Some(host),
-                Err(message) => return failed_execution(started_at, &message, Vec::new()),
-            }
-        }
-
-        let stored = state.stored.clone();
-        let result = if let Some(host) = state.host.as_mut() {
-            match host.start_cell(cell_id, &source.code, stored, tools).await {
-                Ok(()) => {
-                    let yield_after = source
-                        .yield_time_ms
-                        .map_or(INITIAL_YIELD, Duration::from_millis);
-                    host.drive_cell(cell_id, &parent_call_id, tools, context, yield_after)
-                        .await
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            return failed_execution(
-                started_at,
-                "local Node.js code-mode host was unavailable",
-                Vec::new(),
-            );
+        let output_token_budget = source
+            .max_output_tokens
+            .unwrap_or(context.output_token_budget)
+            .max(1);
+        let context = ToolContext {
+            output_token_budget,
+            ..context
         };
-        finish_cell(
-            &mut state,
+        let cell_id = self.cells.lock().await.allocate_cell_id();
+        let stored = self.stored.lock().await.clone();
+        let mut cell = match LiveCell::spawn(
             cell_id,
-            parent_call_id,
+            source.code,
+            tools,
+            OwnedToolContext::from(context),
+            stored,
+            Arc::clone(&self.stored),
+            output_token_budget,
+        ) {
+            Ok(cell) => cell,
+            Err(message) => return failed_execution(started_at, &message, Vec::new()),
+        };
+        let yield_after = source
+            .yield_time_ms
+            .map_or(INITIAL_YIELD, Duration::from_millis);
+        let (execution, running) = observe_cell(
+            &mut cell,
             started_at,
-            result,
-            source.max_output_tokens,
+            yield_after,
+            Some(output_token_budget),
         )
-        .await
+        .await;
+        if running {
+            self.cells.lock().await.live_cells.insert(cell_id, cell);
+        } else {
+            cell.join().await;
+        }
+        execution
     }
 
-    pub(super) async fn wait(
-        &self,
-        input: &str,
-        tools: &ToolRuntime,
-        context: ToolContext<'_>,
-    ) -> CodeModeExecution {
+    pub(super) async fn wait(&self, input: &str, _context: ToolContext<'_>) -> CodeModeExecution {
         let started_at = Instant::now();
         let arguments = match serde_json::from_str::<WaitArguments>(input) {
             Ok(arguments) => arguments,
@@ -200,24 +279,16 @@ impl CodeModeRuntime {
                 );
             }
         };
-        let mut state = self.state.lock().await;
-        let Some(live_cell) = state.live_cell.as_ref() else {
+        let Some(mut live_cell) = self.cells.lock().await.live_cells.remove(&cell_id) else {
             return failed_execution(
                 started_at,
                 &format!("exec cell {cell_id} was not found"),
                 Vec::new(),
             );
         };
-        if live_cell.id != cell_id {
-            return failed_execution(
-                started_at,
-                &format!("exec cell {cell_id} was not found"),
-                Vec::new(),
-            );
-        }
-        let parent_call_id = live_cell.call_id.clone();
+        let continued_output_token_budget = live_cell.output_token_budget;
         if arguments.terminate {
-            terminate_host(&mut state).await;
+            live_cell.terminate().await;
             return CodeModeExecution {
                 output: ToolOutputBody::Text(format!(
                     "Script terminated\nWall time {:.1} seconds\nOutput:\nexec cell {cell_id} was terminated",
@@ -233,23 +304,28 @@ impl CodeModeRuntime {
                 .yield_time_ms
                 .unwrap_or(u64::try_from(DEFAULT_WAIT_YIELD.as_millis()).unwrap_or(u64::MAX)),
         );
-        let result = if let Some(host) = state.host.as_mut() {
-            host.drive_cell(cell_id, &parent_call_id, tools, context, yield_time)
-                .await
-        } else {
-            Err(HostFailure::new(
-                "local Node.js code-mode host was unavailable".to_owned(),
-            ))
-        };
-        finish_cell(
-            &mut state,
-            cell_id,
-            parent_call_id,
+        let output_token_budget = arguments
+            .max_tokens
+            .unwrap_or(continued_output_token_budget)
+            .max(1);
+        let (execution, running) = observe_cell(
+            &mut live_cell,
             started_at,
-            result,
-            arguments.max_tokens,
+            yield_time,
+            Some(output_token_budget),
         )
-        .await
+        .await;
+        if running {
+            live_cell.output_token_budget = continued_output_token_budget;
+            self.cells
+                .lock()
+                .await
+                .live_cells
+                .insert(cell_id, live_cell);
+        } else {
+            live_cell.join().await;
+        }
+        execution
     }
 }
 
@@ -355,101 +431,463 @@ struct WaitArguments {
     terminate: bool,
 }
 
-async fn finish_cell(
-    state: &mut CodeModeState,
-    cell_id: u64,
-    parent_call_id: String,
+impl CellRegistry {
+    fn allocate_cell_id(&mut self) -> u64 {
+        let cell_id = self.next_cell_id;
+        self.next_cell_id = self.next_cell_id.saturating_add(1);
+        cell_id
+    }
+}
+
+impl OwnedToolContext {
+    fn from(context: ToolContext<'_>) -> Self {
+        Self {
+            model: context.model.to_owned(),
+            session_id: context.session_id.to_owned(),
+            call_id: context.call_id.to_owned(),
+            history: context.history.to_vec(),
+            output_token_budget: context.output_token_budget,
+        }
+    }
+
+    fn borrowed(&self) -> ToolContext<'_> {
+        ToolContext {
+            model: &self.model,
+            session_id: &self.session_id,
+            call_id: &self.call_id,
+            history: &self.history,
+            output_token_budget: self.output_token_budget,
+        }
+    }
+}
+
+impl LiveCell {
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        id: u64,
+        source: String,
+        tools: Arc<ToolRegistry>,
+        context: OwnedToolContext,
+        stored: HashMap<String, Value>,
+        shared_stored: Arc<Mutex<HashMap<String, Value>>>,
+        output_token_budget: usize,
+    ) -> Result<Self, String> {
+        let host = NodeHost::spawn(&tools.workspace)?;
+        let (updates_tx, updates) = mpsc::unbounded_channel();
+        let (terminate, terminate_rx) = oneshot::channel();
+        let task = tokio::spawn(run_cell_actor(
+            host,
+            id,
+            source,
+            tools,
+            context,
+            stored,
+            shared_stored,
+            updates_tx,
+            terminate_rx,
+        ));
+        Ok(Self {
+            id,
+            output_token_budget,
+            updates,
+            terminate: Some(terminate),
+            task: Some(task),
+        })
+    }
+
+    async fn terminate(&mut self) {
+        if let Some(terminate) = self.terminate.take() {
+            let _ = terminate.send(());
+        }
+        self.join().await;
+    }
+
+    async fn join(&mut self) {
+        self.terminate = None;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for LiveCell {
+    fn drop(&mut self) {
+        if let Some(terminate) = self.terminate.take() {
+            let _ = terminate.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn observe_cell(
+    cell: &mut LiveCell,
     started_at: Instant,
-    result: Result<CellOutcome, HostFailure>,
+    yield_after: Duration,
     max_output_tokens: Option<usize>,
-) -> CodeModeExecution {
-    let wall_time = started_at.elapsed().as_secs_f64();
-    match result {
-        Ok(CellOutcome::Yielded {
-            content,
-            stored,
-            nested_calls,
-            notifications,
-        }) => {
-            if let Some(stored) = stored {
-                state.stored = stored;
+) -> (CodeModeExecution, bool) {
+    let mut nested_calls = Vec::new();
+    let mut notifications = Vec::new();
+    let yield_timer = tokio::time::sleep(yield_after);
+    tokio::pin!(yield_timer);
+    loop {
+        let update = tokio::select! {
+            () = &mut yield_timer => {
+                return running_observation(
+                    cell.id,
+                    started_at,
+                    Vec::new(),
+                    max_output_tokens,
+                    nested_calls,
+                    notifications,
+                );
             }
-            state.live_cell = Some(LiveCell {
-                id: cell_id,
-                call_id: parent_call_id,
-            });
-            let content = output::truncate_content(content, max_output_tokens);
-            CodeModeExecution {
-                output: with_status(
-                    &format!("Script running with cell ID {cell_id}"),
-                    wall_time,
+            update = cell.updates.recv() => update,
+        };
+        match update {
+            Some(CellUpdate::NestedCall { id, call }) => nested_calls.push((id, call)),
+            Some(CellUpdate::Notification(notification)) => notifications.push(notification),
+            Some(CellUpdate::Yielded { content }) => {
+                return running_observation(
+                    cell.id,
+                    started_at,
                     content,
-                ),
-                success: true,
-                nested_calls,
-                notifications,
+                    max_output_tokens,
+                    nested_calls,
+                    notifications,
+                );
             }
-        }
-        Ok(CellOutcome::Completed {
-            content,
-            stored,
-            nested_calls,
-            notifications,
-        }) => {
-            state.live_cell = None;
-            state.stored = stored;
-            let content = output::truncate_content(content, max_output_tokens);
-            CodeModeExecution {
-                output: with_status("Script completed", wall_time, content),
-                success: true,
-                nested_calls,
-                notifications,
+            Some(CellUpdate::Completed { content }) => {
+                return (
+                    observed_execution(
+                        "Script completed",
+                        true,
+                        started_at,
+                        content,
+                        max_output_tokens,
+                        nested_calls,
+                        notifications,
+                    ),
+                    false,
+                );
             }
-        }
-        Ok(CellOutcome::ScriptFailed {
-            message,
-            mut content,
-            stored,
-            nested_calls,
-            notifications,
-        }) => {
-            state.live_cell = None;
-            state.stored = stored;
-            content.push(ToolOutputContent::InputText {
-                text: format!("Script error:\n{message}"),
-            });
-            let content = output::truncate_content(content, max_output_tokens);
-            CodeModeExecution {
-                output: with_status("Script failed", wall_time, content),
-                success: false,
-                nested_calls,
-                notifications,
+            Some(CellUpdate::ScriptFailed {
+                message,
+                mut content,
+            }) => {
+                content.push(ToolOutputContent::InputText {
+                    text: format!("Script error:\n{message}"),
+                });
+                return (
+                    observed_execution(
+                        "Script failed",
+                        false,
+                        started_at,
+                        content,
+                        max_output_tokens,
+                        nested_calls,
+                        notifications,
+                    ),
+                    false,
+                );
             }
-        }
-        Err(failure) => {
-            terminate_host(state).await;
-            let content = output::truncate_content(
-                vec![ToolOutputContent::InputText {
-                    text: failure.message,
-                }],
-                max_output_tokens,
-            );
-            CodeModeExecution {
-                output: with_status("Script failed", wall_time, content),
-                success: false,
-                nested_calls: failure.nested_calls,
-                notifications: failure.notifications,
+            Some(CellUpdate::HostFailed(message)) => {
+                return (
+                    observed_execution(
+                        "Script failed",
+                        false,
+                        started_at,
+                        vec![ToolOutputContent::InputText { text: message }],
+                        max_output_tokens,
+                        nested_calls,
+                        notifications,
+                    ),
+                    false,
+                );
+            }
+            None => {
+                return (
+                    observed_execution(
+                        "Script failed",
+                        false,
+                        started_at,
+                        vec![ToolOutputContent::InputText {
+                            text: "local code-mode cell ended before a result".to_owned(),
+                        }],
+                        max_output_tokens,
+                        nested_calls,
+                        notifications,
+                    ),
+                    false,
+                );
             }
         }
     }
 }
 
-impl CodeModeState {
-    fn allocate_cell_id(&mut self) -> u64 {
-        let cell_id = self.next_cell_id;
-        self.next_cell_id += 1;
-        cell_id
+fn running_observation(
+    cell_id: u64,
+    started_at: Instant,
+    content: Vec<ToolOutputContent>,
+    max_output_tokens: Option<usize>,
+    nested_calls: Vec<(u64, NestedToolCall)>,
+    notifications: Vec<CodeModeNotification>,
+) -> (CodeModeExecution, bool) {
+    (
+        observed_execution(
+            &format!("Script running with cell ID {cell_id}"),
+            true,
+            started_at,
+            content,
+            max_output_tokens,
+            nested_calls,
+            notifications,
+        ),
+        true,
+    )
+}
+
+fn observed_execution(
+    status: &str,
+    success: bool,
+    started_at: Instant,
+    content: Vec<ToolOutputContent>,
+    max_output_tokens: Option<usize>,
+    nested_calls: Vec<(u64, NestedToolCall)>,
+    notifications: Vec<CodeModeNotification>,
+) -> CodeModeExecution {
+    let content = output::truncate_content(content, max_output_tokens);
+    CodeModeExecution {
+        output: with_status(status, started_at.elapsed().as_secs_f64(), content),
+        success,
+        nested_calls: ordered_calls(nested_calls),
+        notifications,
     }
+}
+
+impl NodeHost {
+    fn spawn(workspace: &std::path::Path) -> Result<Self, String> {
+        let mut child = Command::new("node")
+            .args(["--input-type=module", "--eval", RUNTIME])
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| format!("failed to start local Node.js code-mode host: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Node code-mode host stdin was unavailable".to_owned())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Node code-mode host stdout was unavailable".to_owned())?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    async fn start_cell(
+        &mut self,
+        cell_id: u64,
+        source: &str,
+        stored: HashMap<String, Value>,
+        tools: &ToolRegistry,
+    ) -> Result<(), HostFailure> {
+        let request = ExecuteMessage {
+            kind: "execute",
+            cell_id,
+            source,
+            tools: tools.nested_tool_metadata(),
+            stored,
+        };
+        write_json_line(&mut self.stdin, &request)
+            .await
+            .map_err(|error| {
+                HostFailure::new(format!(
+                    "failed to initialize local code-mode cell: {error}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn drive_cell(
+        &mut self,
+        cell_id: u64,
+        parent_call_id: &str,
+        tools: &ToolRegistry,
+        context: &OwnedToolContext,
+        updates: &mpsc::UnboundedSender<CellUpdate>,
+    ) -> Result<CellTerminal, HostFailure> {
+        let mut pending_calls: FuturesUnordered<BoxFuture<'_, CompletedNestedCall>> =
+            FuturesUnordered::new();
+        loop {
+            tokio::select! {
+                completed = pending_calls.next(), if !pending_calls.is_empty() => {
+                    let Some(completed) = completed else {
+                        continue;
+                    };
+                    let id = completed.id;
+                    let call = self.send_completed_call(cell_id, completed).await?;
+                    let _ = updates.send(CellUpdate::NestedCall { id, call });
+                }
+                event = self.read_event() => {
+                    let event = event?;
+                    let event_cell_id = event.cell_id();
+                    if event_cell_id != cell_id {
+                        return Err(HostFailure::new(format!(
+                            "local code-mode host returned cell {event_cell_id} while executing cell {cell_id}"
+                        )));
+                    }
+                    match event {
+                        RuntimeEvent::ToolCall {
+                            id, name, input, ..
+                        } => {
+                            pending_calls
+                                .push(execute_nested_call(tools, id, name, input, context).boxed());
+                        }
+                        RuntimeEvent::Notify { text, .. } => {
+                            let _ = updates.send(CellUpdate::Notification(
+                                CodeModeNotification::new(parent_call_id, text),
+                            ));
+                        }
+                        RuntimeEvent::Yielded {
+                            content,
+                            ..
+                        } => {
+                            let _ = updates.send(CellUpdate::Yielded { content });
+                        }
+                        RuntimeEvent::Done {
+                            content,
+                            stored,
+                            ..
+                        } => {
+                            return Ok(CellTerminal::Completed {
+                                content,
+                                stored,
+                            });
+                        }
+                        RuntimeEvent::Error {
+                            message,
+                            content,
+                            stored,
+                            ..
+                        } => {
+                            return Ok(CellTerminal::ScriptFailed {
+                                message,
+                                content,
+                                stored,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn read_event(&mut self) -> Result<RuntimeEvent, HostFailure> {
+        let line = match read_protocol_line(&mut self.stdout).await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                let status = self.child.wait().await;
+                return Err(HostFailure::new(format!(
+                    "local code-mode host ended before a result: {status:?}"
+                )));
+            }
+            Err(error) => {
+                return Err(HostFailure::new(format!(
+                    "failed to read local code-mode host: {error}"
+                )));
+            }
+        };
+        serde_json::from_slice::<RuntimeEvent>(&line).map_err(|error| {
+            HostFailure::new(format!(
+                "local code-mode host emitted invalid JSON: {error}"
+            ))
+        })
+    }
+
+    async fn send_completed_call(
+        &mut self,
+        cell_id: u64,
+        completed: CompletedNestedCall,
+    ) -> Result<NestedToolCall, HostFailure> {
+        let response = ToolResultMessage {
+            kind: "tool_result",
+            cell_id,
+            id: completed.id,
+            value: completed.value,
+            success: completed.call.success,
+        };
+        write_json_line(&mut self.stdin, &response)
+            .await
+            .map_err(|error| {
+                HostFailure::new(format!("failed to return a nested tool result: {error}"))
+            })?;
+        Ok(completed.call)
+    }
+
+    async fn terminate(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cell_actor(
+    mut host: NodeHost,
+    cell_id: u64,
+    source: String,
+    tools: Arc<ToolRegistry>,
+    context: OwnedToolContext,
+    stored: HashMap<String, Value>,
+    shared_stored: Arc<Mutex<HashMap<String, Value>>>,
+    updates: mpsc::UnboundedSender<CellUpdate>,
+    mut terminate: oneshot::Receiver<()>,
+) {
+    let run = async {
+        host.start_cell(cell_id, &source, stored, tools.as_ref())
+            .await?;
+        host.drive_cell(
+            cell_id,
+            &context.call_id,
+            tools.as_ref(),
+            &context,
+            &updates,
+        )
+        .await
+    };
+    let terminal = tokio::select! {
+        biased;
+        _ = &mut terminate => {
+            host.terminate().await;
+            return;
+        }
+        terminal = run => terminal,
+    };
+    match terminal {
+        Ok(CellTerminal::Completed { content, stored }) => {
+            shared_stored.lock().await.extend(stored);
+            let _ = updates.send(CellUpdate::Completed { content });
+        }
+        Ok(CellTerminal::ScriptFailed {
+            message,
+            content,
+            stored,
+        }) => {
+            shared_stored.lock().await.extend(stored);
+            let _ = updates.send(CellUpdate::ScriptFailed { message, content });
+        }
+        Err(failure) => {
+            let _ = updates.send(CellUpdate::HostFailed(failure.message));
+        }
+    }
+    host.terminate().await;
 }
 
 impl CodeModeNotification {
@@ -463,21 +901,7 @@ impl CodeModeNotification {
 
 impl HostFailure {
     fn new(message: String) -> Self {
-        Self {
-            message,
-            nested_calls: Vec::new(),
-            notifications: Vec::new(),
-        }
-    }
-
-    fn with_progress(
-        mut self,
-        calls: Vec<(u64, NestedToolCall)>,
-        notifications: Vec<CodeModeNotification>,
-    ) -> Self {
-        self.nested_calls = ordered_calls(calls);
-        self.notifications = notifications;
-        self
+        Self { message }
     }
 }
 
@@ -487,14 +911,15 @@ fn ordered_calls(mut calls: Vec<(u64, NestedToolCall)>) -> Vec<NestedToolCall> {
 }
 
 async fn execute_nested_call(
-    tools: &ToolRuntime,
+    tools: &ToolRegistry,
     id: u64,
     name: String,
     input: Value,
-    context: ToolContext<'_>,
+    context: &OwnedToolContext,
 ) -> CompletedNestedCall {
     let started_at = Instant::now();
     let call_id = format!("code-{id}");
+    let context = context.borrowed();
     let execution = tools
         .execute_nested(
             &name,
@@ -522,13 +947,6 @@ async fn execute_nested_call(
     }
 }
 
-async fn terminate_host(state: &mut CodeModeState) {
-    if let Some(mut host) = state.host.take() {
-        host.terminate().await;
-    }
-    state.live_cell = None;
-}
-
 fn failed_execution(
     started_at: Instant,
     message: &str,
@@ -543,44 +961,6 @@ fn failed_execution(
         nested_calls,
         notifications: Vec::new(),
     }
-}
-
-pub(super) fn exec_spec(definitions: &[ToolDefinition]) -> ToolDefinition {
-    ToolDefinition::custom(
-        "exec",
-        description::exec_description(definitions),
-        CustomToolFormat::grammar("lark", GRAMMAR),
-    )
-}
-
-pub(super) fn wait_spec() -> ToolDefinition {
-    ToolDefinition::function(
-        "wait",
-        "Waits on a yielded `exec` cell and returns new output or completion.\n- Use `wait` only after `exec` returns `Script running with cell ID ...`.\n- `cell_id` identifies the running `exec` cell to resume.\n- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.\n- `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.\n- `terminate: true` stops the running cell; false or omitted waits for output.\n- `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.\n- If the cell is still running, `wait` may yield again with the same `cell_id`.\n- If the cell has already finished, `wait` returns the completed result and closes the cell.",
-        json!({
-            "type": "object",
-            "properties": {
-                "cell_id": {
-                    "type": "string",
-                    "description": "Identifier of the running exec cell."
-                },
-                "yield_time_ms": {
-                    "type": "number",
-                    "description": "Wait before yielding more output. Defaults to 10000 ms."
-                },
-                "max_tokens": {
-                    "type": "number",
-                    "description": "Output token budget for this wait call. Defaults to 10000 tokens."
-                },
-                "terminate": {
-                    "type": "boolean",
-                    "description": "True stops the running exec cell; false or omitted waits for output."
-                }
-            },
-            "required": ["cell_id"],
-            "additionalProperties": false
-        }),
-    )
 }
 
 fn with_status(

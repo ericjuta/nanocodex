@@ -23,8 +23,8 @@ pub use harness_service::{
     ResponsesRetryPolicy, ResponsesService, ResponsesServiceError, ResponsesServiceResponse,
 };
 pub use harness_tools::{
-    Tool, ToolContext, ToolExecution, ToolInput, ToolInputError, ToolOutputBody, ToolOutputContent,
-    Tools, ToolsBuildError, ToolsBuilder,
+    DEFAULT_TOOL_OUTPUT_TOKENS, Tool, ToolContext, ToolExecution, ToolInput, ToolInputError,
+    ToolOutputBody, ToolOutputContent, Tools, ToolsBuildError, ToolsBuilder,
 };
 #[doc(hidden)]
 pub use responses::{LayeredResponses, StandardResponses};

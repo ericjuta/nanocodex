@@ -15,6 +15,8 @@ use crate::{
     view_image, web_search,
 };
 
+pub const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 10_000;
+
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ToolOutputBody {
@@ -120,6 +122,7 @@ pub struct ToolContext<'a> {
     pub session_id: &'a str,
     pub call_id: &'a str,
     pub history: &'a [ResponseItem],
+    pub output_token_budget: usize,
 }
 
 /// Canonical input presented to function and freeform tools.
@@ -347,7 +350,7 @@ fn built_in_name(tools: &Tools, name: &str) -> bool {
 }
 
 pub struct ToolRuntime {
-    registry: ToolRegistry,
+    registry: Arc<ToolRegistry>,
     code_mode: code_mode::CodeModeRuntime,
     default_shell_name: &'static str,
 }
@@ -361,6 +364,7 @@ impl ToolRuntime {
         let workspace = workspace.into();
         let sessions = Arc::new(ShellSessions::new());
         let default_shell_name = sessions.default_shell_name();
+        let registry_workspace = workspace.clone();
         let mut handlers: Vec<Arc<dyn Tool>> = vec![
             Arc::new(shell::ExecCommandHandler::new(
                 workspace.clone(),
@@ -380,7 +384,7 @@ impl ToolRuntime {
             )));
         }
         Self {
-            registry: ToolRegistry::from_ordered(handlers),
+            registry: Arc::new(ToolRegistry::from_ordered(registry_workspace, handlers)),
             code_mode: code_mode::CodeModeRuntime::new(),
             default_shell_name,
         }
@@ -388,7 +392,7 @@ impl ToolRuntime {
 
     #[must_use]
     pub fn with_tools(mut self, tools: &Tools) -> Self {
-        self.registry.extend(tools.registered.iter().cloned());
+        Arc::make_mut(&mut self.registry).extend(tools.registered.iter().cloned());
         self
     }
 
@@ -404,20 +408,32 @@ impl ToolRuntime {
     }
 
     pub async fn execute_code(&self, source: &str, context: ToolContext<'_>) -> CodeModeExecution {
-        self.code_mode.execute(source, self, context).await
+        self.code_mode
+            .execute(source, Arc::clone(&self.registry), context)
+            .await
     }
 
     pub async fn wait_for_code(&self, input: &str, context: ToolContext<'_>) -> CodeModeExecution {
-        self.code_mode.wait(input, self, context).await
+        self.code_mode.wait(input, context).await
     }
+}
 
+#[derive(Clone)]
+pub(crate) struct ToolRegistry {
+    pub(crate) workspace: PathBuf,
+    ordered: Vec<Arc<dyn Tool>>,
+    definitions: Vec<ToolDefinition>,
+    by_name: HashMap<Box<str>, usize>,
+}
+
+impl ToolRegistry {
     pub(crate) async fn execute_nested(
         &self,
         name: &str,
         input: Value,
         context: ToolContext<'_>,
     ) -> ToolExecution {
-        let Some((handler, definition)) = self.registry.get(name) else {
+        let Some((handler, definition)) = self.get(name) else {
             return ToolExecution::error(format!("unsupported nested tool call: {name}"));
         };
         let input = match definition {
@@ -445,8 +461,7 @@ impl ToolRuntime {
     }
 
     pub(crate) fn nested_tool_metadata(&self) -> Vec<Value> {
-        self.registry
-            .entries()
+        self.entries()
             .map(|(handler, definition)| {
                 let kind = match definition {
                     ToolDefinition::Function { .. } => "function",
@@ -460,16 +475,7 @@ impl ToolRuntime {
             })
             .collect()
     }
-}
-
-struct ToolRegistry {
-    ordered: Vec<Arc<dyn Tool>>,
-    definitions: Vec<ToolDefinition>,
-    by_name: HashMap<Box<str>, usize>,
-}
-
-impl ToolRegistry {
-    fn from_ordered(ordered: Vec<Arc<dyn Tool>>) -> Self {
+    fn from_ordered(workspace: PathBuf, ordered: Vec<Arc<dyn Tool>>) -> Self {
         let definitions = ordered.iter().map(|tool| tool.definition()).collect();
         let by_name = ordered
             .iter()
@@ -477,6 +483,7 @@ impl ToolRegistry {
             .map(|(index, tool)| (tool.name().into(), index))
             .collect();
         Self {
+            workspace,
             ordered,
             definitions,
             by_name,
@@ -497,7 +504,7 @@ impl ToolRegistry {
         Some((self.ordered.get(index)?, self.definitions.get(index)?))
     }
 
-    fn definitions(&self) -> &[ToolDefinition] {
+    pub(crate) fn definitions(&self) -> &[ToolDefinition] {
         &self.definitions
     }
 
@@ -550,8 +557,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ImageGenerationConfig, Tool, ToolContext, ToolExecution, ToolInput, ToolOutputBody,
-        ToolRuntime, Tools, WebSearchConfig,
+        DEFAULT_TOOL_OUTPUT_TOKENS, ImageGenerationConfig, Tool, ToolContext, ToolExecution,
+        ToolInput, ToolOutputBody, ToolRuntime, Tools, WebSearchConfig,
     };
 
     struct Double;
@@ -663,6 +670,7 @@ mod tests {
                     session_id: "test-session",
                     call_id: "test-call",
                     history: &[],
+                    output_token_budget: DEFAULT_TOOL_OUTPUT_TOKENS,
                 },
             )
             .await;

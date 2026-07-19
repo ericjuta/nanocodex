@@ -19,7 +19,10 @@ use super::{
     compaction,
     context_manager::ContextManager,
     display_endpoint, elapsed_ns,
-    input::{custom_tool_notification, custom_tool_output, function_tool_output, task_input},
+    input::{
+        custom_tool_notification, custom_tool_output, function_tool_output, task_context,
+        task_input,
+    },
     resolve_workspace, terminal_payload,
 };
 use crate::{AgentError, HarnessError, ResponsesError, Result};
@@ -103,12 +106,16 @@ impl ConversationState {
         self.context.replace_last_turn_images(placeholder)
     }
 
-    fn install_compaction(&mut self, item: ResponseItem) {
-        self.context.replace(compaction::install_history(
-            self.context.raw_items(),
-            &self.canonical_context,
-            item,
-        ));
+    fn install_compaction(
+        &mut self,
+        item: ResponseItem,
+        canonical_context: ResponseItem,
+        request_prefix: &[ResponseItem],
+    ) {
+        let history =
+            compaction::install_history(self.context.raw_items(), &canonical_context, item);
+        self.canonical_context = canonical_context;
+        self.context.replace_and_recompute(history, request_prefix);
         self.delta_start = 0;
         self.previous_response_id = None;
     }
@@ -313,8 +320,14 @@ where
             if code_calls.is_empty() {
                 if end_turn == Some(false) {
                     session.conversation.clear_delta();
-                    self.maybe_compact(call_index, &mut session.conversation, &session.factory)
-                        .await?;
+                    self.maybe_compact(
+                        call_index,
+                        &mut session.conversation,
+                        &session.factory,
+                        &session.workspace,
+                        session.tools.default_shell_name(),
+                    )
+                    .await?;
                     continue;
                 }
                 if let Some(message) = final_message {
@@ -342,8 +355,14 @@ where
                     .await?;
                 session.conversation.append(output);
             }
-            self.maybe_compact(call_index, &mut session.conversation, &session.factory)
-                .await?;
+            self.maybe_compact(
+                call_index,
+                &mut session.conversation,
+                &session.factory,
+                &session.workspace,
+                session.tools.default_shell_name(),
+            )
+            .await?;
         }
     }
 
@@ -394,6 +413,7 @@ where
             session_id: self.events.request_id(),
             call_id: &call.call_id,
             history,
+            output_token_budget: harness_tools::DEFAULT_TOOL_OUTPUT_TOKENS,
         };
         let mut execution = if call.name == "exec" {
             tools.execute_code(&call.input, context).await
@@ -436,6 +456,8 @@ where
         after_model_call_index: u32,
         conversation: &mut ConversationState,
         factory: &ResponsesAttemptFactory,
+        workspace: &str,
+        shell: &str,
     ) -> Result<()> {
         let Some(auto_compact_token_limit) = compaction::auto_compact_token_limit(MODEL) else {
             return Ok(());
@@ -452,7 +474,7 @@ where
                 .ok_or(AgentError::MalformedResponse {
                     detail: "compaction did not have a previous response ID",
                 })?;
-        let (item, usage) = self
+        let (item, _usage) = self
             .perform_compaction(
                 after_model_call_index,
                 conversation.prompt_history(),
@@ -463,8 +485,9 @@ where
                 factory,
             )
             .await?;
-        conversation.update_token_info(usage.as_ref());
-        conversation.install_compaction(item);
+        let project_instructions = load_project_instructions(Path::new(workspace))?;
+        let canonical_context = task_context(workspace, shell, project_instructions.as_deref());
+        conversation.install_compaction(item, canonical_context, factory.profile().prefix());
         Ok(())
     }
 

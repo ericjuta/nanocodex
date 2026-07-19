@@ -4,8 +4,6 @@ use harness_core::{
 };
 use harness_tools::{ToolOutputBody, ToolOutputContent};
 
-const INITIAL_HISTORY_CAPACITY: usize = 8;
-
 pub(in crate::model) fn task_input(
     user_content: Vec<ContentItem>,
     workspace: &str,
@@ -23,6 +21,21 @@ pub(in crate::model) fn task_input(
     )
 }
 
+pub(in crate::model) fn task_context(
+    workspace: &str,
+    shell: &str,
+    project_instructions: Option<&str>,
+) -> ResponseItem {
+    let (current_date, timezone) = local_time_context();
+    task_context_with_time(
+        workspace,
+        shell,
+        project_instructions,
+        &current_date,
+        &timezone,
+    )
+}
+
 fn task_input_with_time_context(
     user_content: Vec<ContentItem>,
     workspace: &str,
@@ -31,6 +44,25 @@ fn task_input_with_time_context(
     current_date: &str,
     timezone: &str,
 ) -> Vec<ResponseItem> {
+    vec![
+        task_context_with_time(
+            workspace,
+            shell,
+            project_instructions,
+            current_date,
+            timezone,
+        ),
+        ResponseItem::message(MessageRole::User, user_content),
+    ]
+}
+
+fn task_context_with_time(
+    workspace: &str,
+    shell: &str,
+    project_instructions: Option<&str>,
+    current_date: &str,
+    timezone: &str,
+) -> ResponseItem {
     let mut context = Vec::with_capacity(2);
     if let Some(project_instructions) = project_instructions {
         context.push(ContentItem::InputText {
@@ -43,10 +75,7 @@ fn task_input_with_time_context(
     context.push(ContentItem::InputText {
         text: environment_context(workspace, shell, current_date, timezone).into_boxed_str(),
     });
-    let mut input = Vec::with_capacity(INITIAL_HISTORY_CAPACITY);
-    input.push(ResponseItem::message(MessageRole::User, context));
-    input.push(ResponseItem::message(MessageRole::User, user_content));
-    input
+    ResponseItem::message(MessageRole::User, context)
 }
 
 fn local_time_context() -> (String, String) {

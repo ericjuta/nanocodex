@@ -818,7 +818,7 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "text(\"tool completed\")"
+                    "input": "require(\"node:fs\").writeFileSync(\"AGENTS.md\", \"fresh compacted instructions\"); text(\"tool completed\")"
                 })],
                 372_001,
             ),
@@ -866,6 +866,11 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
         );
         assert!(continuation["input"][4].get("id").is_none());
         assert!(continuation.to_string().contains("exercise compaction"));
+        assert!(
+            continuation
+                .to_string()
+                .contains("fresh compacted instructions")
+        );
         assert!(!continuation.to_string().contains("tool completed"));
         send_final(&mut socket, "resp-final").await
     });

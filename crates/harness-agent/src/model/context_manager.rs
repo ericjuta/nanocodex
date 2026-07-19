@@ -61,8 +61,21 @@ impl ContextManager {
         }
     }
 
-    pub(super) fn replace(&mut self, items: Vec<ResponseItem>) {
+    pub(super) fn replace_and_recompute(
+        &mut self,
+        items: Vec<ResponseItem>,
+        prefix: &[ResponseItem],
+    ) {
         self.items = Arc::new(items);
+        let total_tokens = prefix
+            .iter()
+            .chain(self.items.iter())
+            .map(compaction::estimate_item_tokens)
+            .fold(0, u64::saturating_add);
+        self.last_token_usage = Some(Usage {
+            total_tokens,
+            ..Usage::default()
+        });
         self.function_calls.clear();
         self.function_outputs.clear();
         self.custom_calls.clear();

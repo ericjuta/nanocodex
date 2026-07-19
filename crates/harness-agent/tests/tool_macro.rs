@@ -26,6 +26,7 @@ async fn macro_generates_schema_and_executes_through_public_tool_trait() {
                 session_id: "test-session",
                 call_id: "test-call",
                 history: &[],
+                output_token_budget: harness_agent::DEFAULT_TOOL_OUTPUT_TOKENS,
             },
         )
         .await;
