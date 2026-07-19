@@ -1,4 +1,6 @@
 .env
+.dev.vars*
+.wrangler/
 .harness/
 .nanocodex/
 .venv/

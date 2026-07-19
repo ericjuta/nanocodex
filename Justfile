@@ -72,6 +72,10 @@ smoke-wasm-node: build-wasm
 build-react-example: build-wasm
     npm run build --prefix examples/react-vite
 
+# Run the React frontend and API Worker together in Cloudflare's Vite environment.
+dev-react-example:
+    CLOUDFLARE_INCLUDE_PROCESS_ENV=true npm run dev --prefix examples/react-vite -- --host 127.0.0.1
+
 # Exercise background MCP discovery, Code Mode tool_search, and one MCP call.
 smoke-mcp:
     cargo run --quiet -p nanocodex-examples --bin mcp

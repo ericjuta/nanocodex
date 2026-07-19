@@ -1,14 +1,18 @@
+import { cloudflare } from "@cloudflare/vite-plugin";
 import react from "@vitejs/plugin-react";
-import { defineConfig, searchForWorkspaceRoot } from "vite";
+import { fileURLToPath } from "node:url";
+import { defineConfig } from "vite";
+
+const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), cloudflare()],
   worker: { format: "es" },
   server: {
     fs: {
       // The example consumes the generated WASM package and browser host from
       // bindings/wasm without copying either artifact into the application.
-      allow: [searchForWorkspaceRoot(process.cwd())],
+      allow: [repositoryRoot],
     },
   },
 });

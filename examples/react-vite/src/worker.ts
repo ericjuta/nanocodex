@@ -3,7 +3,6 @@ import { createBrowserHost } from "../../../bindings/wasm/browser/host.mjs";
 
 type StartMessage = {
   type: "start";
-  websocketUrl: string;
   thinking: "low" | "medium" | "high" | "xhigh";
 };
 
@@ -22,7 +21,11 @@ hostGlobal.nanocodexHost = createBrowserHost({
   // Browser WebSockets cannot attach an Authorization header. The URL must be
   // authorized by the embedding application, for example through a short-lived
   // signed URL or same-site session cookie.
-  createWebSocket: (endpoint: string) => new WebSocket(endpoint),
+  createWebSocket: (endpoint: string, sessionId: string) => {
+    const url = new URL(endpoint);
+    url.searchParams.set("session_id", sessionId);
+    return new WebSocket(url);
+  },
   onEvent: (eventJson: string) => {
     worker.postMessage({ type: "event", event: JSON.parse(eventJson) });
   },
@@ -47,8 +50,8 @@ worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
   if (data.type === "start") {
     agent?.free();
     agent = new Nanocodex(JSON.stringify({
-      api_key: "host-managed",
-      websocket_url: data.websocketUrl,
+      api_key: "worker-managed",
+      websocket_url: workerEndpoint(),
       thinking: data.thinking,
       workspace: "/browser",
     }));
@@ -74,3 +77,8 @@ worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
     }),
   );
 };
+
+function workerEndpoint(): string {
+  const protocol = self.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${self.location.host}/api/responses`;
+}
