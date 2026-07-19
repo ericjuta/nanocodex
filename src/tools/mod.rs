@@ -135,9 +135,14 @@ pub(crate) struct ImageGenerationConfig {
 }
 
 pub(crate) struct ToolRuntime {
-    handlers: Vec<Box<dyn ToolHandler>>,
+    inner: Arc<ToolRuntimeInner>,
     code_mode: code_mode::CodeModeRuntime,
+}
+
+struct ToolRuntimeInner {
+    handlers: Vec<Arc<dyn ToolHandler>>,
     default_shell_name: &'static str,
+    workspace: PathBuf,
 }
 
 impl ToolRuntime {
@@ -149,35 +154,41 @@ impl ToolRuntime {
         let workspace = workspace.into();
         let sessions = Arc::new(ShellSessions::new());
         let default_shell_name = sessions.default_shell_name();
-        let mut handlers: Vec<Box<dyn ToolHandler>> = vec![
-            Box::new(shell::ExecCommandHandler::new(
+        let mut handlers: Vec<Arc<dyn ToolHandler>> = vec![
+            Arc::new(shell::ExecCommandHandler::new(
                 workspace.clone(),
                 Arc::clone(&sessions),
             )),
-            Box::new(shell::WriteStdinHandler::new(sessions)),
-            Box::new(plan::PlanHandler::new()),
-            Box::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
-            Box::new(view_image::ViewImageHandler::new(workspace)),
+            Arc::new(shell::WriteStdinHandler::new(sessions)),
+            Arc::new(plan::PlanHandler::new()),
+            Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
+            Arc::new(view_image::ViewImageHandler::new(workspace.clone())),
         ];
         if let Some(web_search) = web_search {
-            handlers.push(Box::new(web_search::WebSearchHandler::new(web_search)));
+            handlers.push(Arc::new(web_search::WebSearchHandler::new(web_search)));
         }
-        handlers.push(Box::new(image_generation::ImageGenerationHandler::new(
+        handlers.push(Arc::new(image_generation::ImageGenerationHandler::new(
             image_generation,
         )));
         Self {
-            handlers,
+            inner: Arc::new(ToolRuntimeInner {
+                handlers,
+                default_shell_name,
+                workspace,
+            }),
             code_mode: code_mode::CodeModeRuntime::new(),
-            default_shell_name,
         }
     }
 
-    pub(crate) const fn default_shell_name(&self) -> &'static str {
-        self.default_shell_name
+    pub(crate) fn default_shell_name(&self) -> &'static str {
+        self.inner.default_shell_name
     }
 
     pub(crate) fn model_specs(&self) -> Vec<Value> {
-        vec![code_mode::exec_spec(&self.handlers), code_mode::wait_spec()]
+        vec![
+            code_mode::exec_spec(&self.inner.handlers),
+            code_mode::wait_spec(),
+        ]
     }
 
     pub(crate) async fn execute_code(
@@ -185,7 +196,9 @@ impl ToolRuntime {
         source: &str,
         context: ToolContext<'_>,
     ) -> CodeModeExecution {
-        self.code_mode.execute(source, self, context).await
+        self.code_mode
+            .execute(source, Arc::clone(&self.inner), context)
+            .await
     }
 
     pub(crate) async fn wait_for_code(
@@ -193,9 +206,11 @@ impl ToolRuntime {
         input: &str,
         context: ToolContext<'_>,
     ) -> CodeModeExecution {
-        self.code_mode.wait(input, self, context).await
+        self.code_mode.wait(input, context).await
     }
+}
 
+impl ToolRuntimeInner {
     async fn execute_nested(
         &self,
         name: &str,
@@ -268,6 +283,7 @@ mod tests {
         let enabled = runtime(true);
         assert!(
             enabled
+                .inner
                 .handlers
                 .iter()
                 .any(|handler| handler.name() == "web__run")
@@ -281,6 +297,7 @@ mod tests {
         let disabled = runtime(false);
         assert!(
             disabled
+                .inner
                 .handlers
                 .iter()
                 .all(|handler| handler.name() != "web__run")

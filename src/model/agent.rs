@@ -13,7 +13,7 @@ use super::{
     terminal_payload,
     wire::{
         RequestProfile, ResponseCreate, Usage, WarmupServerEvent, custom_tool_notification,
-        custom_tool_output, function_tool_output, task_input,
+        custom_tool_output, function_tool_output, task_context, task_input,
     },
 };
 use crate::{
@@ -244,10 +244,16 @@ impl ConversationState {
             .active_context_tokens(server_reasoning_included)
     }
 
-    fn install_compaction(&mut self, item: Value) {
+    fn install_compaction(
+        &mut self,
+        item: Value,
+        canonical_context: Value,
+        request_prefix: &[Value],
+    ) {
         let history =
-            compaction::install_history(self.history.raw_items(), &self.canonical_context, item);
-        self.history.replace(history);
+            compaction::install_history(self.history.raw_items(), &canonical_context, item);
+        self.canonical_context = canonical_context;
+        self.history.replace_and_recompute(history, request_prefix);
         self.delta_start = None;
         self.previous_response_id = None;
     }
@@ -370,8 +376,15 @@ impl<'a, W: Write> ModelRun<'a, W> {
             if code_calls.is_empty() {
                 if end_turn == Some(false) {
                     conversation.delta_start = Some(conversation.history_len());
-                    self.maybe_compact(&mut socket, call_index, &mut conversation, &profile)
-                        .await?;
+                    self.maybe_compact(
+                        &mut socket,
+                        call_index,
+                        &mut conversation,
+                        &profile,
+                        &workspace,
+                        tools.default_shell_name(),
+                    )
+                    .await?;
                     continue;
                 }
                 if let Some(message) = final_message {
@@ -394,8 +407,15 @@ impl<'a, W: Write> ModelRun<'a, W> {
                     .await?;
                 conversation.record_items(output);
             }
-            self.maybe_compact(&mut socket, call_index, &mut conversation, &profile)
-                .await?;
+            self.maybe_compact(
+                &mut socket,
+                call_index,
+                &mut conversation,
+                &profile,
+                &workspace,
+                tools.default_shell_name(),
+            )
+            .await?;
         }
     }
 
@@ -517,6 +537,8 @@ impl<'a, W: Write> ModelRun<'a, W> {
         after_model_call_index: u32,
         conversation: &mut ConversationState,
         profile: &RequestProfile,
+        workspace: &str,
+        shell: &str,
     ) -> Result<()> {
         let Some(auto_compact_token_limit) =
             compaction::auto_compact_token_limit(&self.config.model)
@@ -535,7 +557,9 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 .ok_or(AgentError::MalformedResponse {
                     detail: "compaction did not have a previous response ID",
                 })?;
-        let (item, usage) = self
+        let project_instructions = load_project_instructions(Path::new(workspace))?;
+        let canonical_context = task_context(workspace, shell, project_instructions.as_deref());
+        let item = self
             .perform_compaction(
                 socket,
                 after_model_call_index,
@@ -547,8 +571,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 profile,
             )
             .await?;
-        conversation.update_token_info(usage.as_ref());
-        conversation.install_compaction(item);
+        conversation.install_compaction(item, canonical_context, profile.prefix());
         Ok(())
     }
 
@@ -857,7 +880,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
         active_context_tokens: u64,
         auto_compact_token_limit: u64,
         profile: &RequestProfile,
-    ) -> Result<(Value, Option<Usage>)> {
+    ) -> Result<Value> {
         self.capture_turn_state(socket);
         let trigger = compaction::trigger();
         let delta_start =
@@ -954,7 +977,7 @@ impl<'a, W: Write> ModelRun<'a, W> {
                 usage: response.usage.as_ref(),
             },
         )?;
-        Ok((response.item, response.usage))
+        Ok(response.item)
     }
 
     async fn replay_generation(

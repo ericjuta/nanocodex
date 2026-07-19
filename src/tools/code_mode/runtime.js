@@ -112,6 +112,7 @@ async function runCell(init) {
   const pending = new Map();
   const content = [];
   const stored = new Map(Object.entries(init.stored));
+  const storedWrites = new Map();
   let nextId = 1;
   currentCell = { cellId: init.cell_id, pending };
 
@@ -213,7 +214,9 @@ async function runCell(init) {
 
   function store(key, value) {
     const normalizedKey = storageKey(key, "store");
-    stored.set(normalizedKey, storedValue(normalizedKey, value));
+    const normalizedValue = storedValue(normalizedKey, value);
+    stored.set(normalizedKey, normalizedValue);
+    storedWrites.set(normalizedKey, normalizedValue);
   }
 
   function load(key) {
@@ -276,7 +279,7 @@ async function runCell(init) {
       type: "done",
       cell_id: init.cell_id,
       content,
-      stored: Object.fromEntries(stored),
+      stored: Object.fromEntries(storedWrites),
     });
   } catch (error) {
     const message = errorText(error);
@@ -285,7 +288,7 @@ async function runCell(init) {
       cell_id: init.cell_id,
       message,
       content,
-      stored: Object.fromEntries(stored),
+      stored: Object.fromEntries(storedWrites),
     });
   } finally {
     currentCell = undefined;

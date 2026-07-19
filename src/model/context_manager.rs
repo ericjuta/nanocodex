@@ -45,8 +45,17 @@ impl ContextManager {
         );
     }
 
-    pub(super) fn replace(&mut self, items: Vec<Value>) {
+    pub(super) fn replace_and_recompute(&mut self, items: Vec<Value>, prefix: &[Value]) {
         self.items = items;
+        let total_tokens = prefix
+            .iter()
+            .chain(&self.items)
+            .map(estimate_item_tokens)
+            .fold(0, u64::saturating_add);
+        self.last_token_usage = Some(Usage {
+            total_tokens,
+            ..Usage::default()
+        });
     }
 
     pub(super) fn update_token_info(&mut self, usage: Option<&Usage>) {
@@ -490,6 +499,29 @@ mod tests {
 
         history.update_token_info(None);
         assert_eq!(history.active_context_tokens(true), 1_000 + tail);
+    }
+
+    #[test]
+    fn replacement_history_recomputes_active_tokens_from_prefix_and_items() {
+        let prefix = vec![json!({
+            "type": "message",
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": "base instructions" }],
+        })];
+        let replacement = vec![
+            json!({ "type": "message", "role": "user", "content": [] }),
+            json!({ "type": "compaction", "encrypted_content": "opaque" }),
+        ];
+        let expected: u64 = prefix
+            .iter()
+            .chain(&replacement)
+            .map(estimate_item_tokens)
+            .sum();
+        let mut history = ContextManager::new(Vec::new());
+
+        history.replace_and_recompute(replacement, &prefix);
+
+        assert_eq!(history.active_context_tokens(true), expected);
     }
 
     #[test]

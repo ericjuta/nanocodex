@@ -10,8 +10,8 @@ use crate::tools::{
 };
 
 #[tokio::test]
-async fn reuses_one_node_host_between_cells() -> Result<()> {
-    let workspace = temporary_workspace("persistent-node-host")?;
+async fn starts_each_cell_in_a_fresh_node_host() -> Result<()> {
+    let workspace = temporary_workspace("fresh-node-host")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let context = test_context(&history);
@@ -21,7 +21,59 @@ async fn reuses_one_node_host_between_cells() -> Result<()> {
 
     assert!(first.success);
     assert!(second.success);
-    assert_eq!(emitted_text(&first)?, emitted_text(&second)?);
+    assert_ne!(emitted_text(&first)?, emitted_text(&second)?);
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn multiple_yielded_cells_continue_and_complete_independently() -> Result<()> {
+    let workspace = temporary_workspace("multiple-live-cells")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let first = tools
+        .execute_code(
+            r#"
+await yield_control();
+const result = await tools.exec_command({ cmd: "sleep 0.04; printf 'first done'", login: false });
+text(result.output);
+"#,
+            test_context_with_call(&history, "call-first"),
+        )
+        .await;
+    let second = tools
+        .execute_code(
+            r#"
+await yield_control();
+const result = await tools.exec_command({ cmd: "sleep 0.01; printf 'second done'", login: false });
+text(result.output);
+"#,
+            test_context_with_call(&history, "call-second"),
+        )
+        .await;
+
+    assert!(execution_output(&first).contains("Script running with cell ID 1"));
+    assert!(execution_output(&second).contains("Script running with cell ID 2"));
+
+    let second = tools
+        .wait_for_code(
+            r#"{"cell_id":"2","yield_time_ms":1000}"#,
+            test_context_with_call(&history, "call-wait-second"),
+        )
+        .await;
+    let first = tools
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":1000}"#,
+            test_context_with_call(&history, "call-wait-first"),
+        )
+        .await;
+
+    assert!(second.success, "{}", execution_output(&second));
+    assert!(execution_output(&second).contains("second done"));
+    assert_eq!(second.nested_calls.len(), 1);
+    assert!(first.success, "{}", execution_output(&first));
+    assert!(execution_output(&first).contains("first done"));
+    assert_eq!(first.nested_calls.len(), 1);
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -433,7 +485,7 @@ async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            "// @exec: {\"max_output_tokens\": 2}\ntext(\"abcdefghijklmnop\")",
+            "// @exec: {\"yield_time_ms\": 30000, \"max_output_tokens\": 2}\ntext(\"abcdefghijklmnop\")",
             test_context(&history),
         )
         .await;

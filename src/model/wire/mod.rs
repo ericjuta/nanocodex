@@ -3,6 +3,6 @@ mod response;
 
 pub(super) use request::{
     RequestProfile, ResponseCreate, custom_tool_notification, custom_tool_output,
-    function_tool_output, task_input,
+    function_tool_output, task_context, task_input,
 };
 pub(super) use response::{ServerEvent, Usage, WarmupServerEvent};

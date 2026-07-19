@@ -67,6 +67,21 @@ pub(in crate::model) fn task_input(
     )
 }
 
+pub(in crate::model) fn task_context(
+    workspace: &str,
+    shell: &str,
+    project_instructions: Option<&str>,
+) -> Value {
+    let (current_date, timezone) = local_time_context();
+    task_context_with_time(
+        workspace,
+        shell,
+        project_instructions,
+        &current_date,
+        &timezone,
+    )
+}
+
 fn task_input_with_time_context(
     user_content: &[Value],
     workspace: &str,
@@ -75,6 +90,29 @@ fn task_input_with_time_context(
     current_date: &str,
     timezone: &str,
 ) -> Vec<Value> {
+    vec![
+        task_context_with_time(
+            workspace,
+            shell,
+            project_instructions,
+            current_date,
+            timezone,
+        ),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": user_content,
+        }),
+    ]
+}
+
+fn task_context_with_time(
+    workspace: &str,
+    shell: &str,
+    project_instructions: Option<&str>,
+    current_date: &str,
+    timezone: &str,
+) -> Value {
     let mut context = Vec::with_capacity(2);
     if let Some(project_instructions) = project_instructions {
         context.push(json!({
@@ -88,18 +126,11 @@ fn task_input_with_time_context(
         "type": "input_text",
         "text": environment_context(workspace, shell, current_date, timezone),
     }));
-    vec![
-        json!({
-            "type": "message",
-            "role": "user",
-            "content": context,
-        }),
-        json!({
-            "type": "message",
-            "role": "user",
-            "content": user_content,
-        }),
-    ]
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": context,
+    })
 }
 
 fn local_time_context() -> (String, String) {

@@ -1,11 +1,11 @@
-use std::fmt::Write as _;
+use std::{fmt::Write as _, sync::Arc};
 
 use serde_json::Value;
 
 use crate::tools::{ToolHandler, ToolKind};
 
 const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose tool calls
-- Evaluates the provided JavaScript as a cell in one local Node.js host reused for the session.
+- Evaluates the provided JavaScript in a fresh local Node.js host. Yielded cells keep running independently until completion or termination.
 - All nested tools are available on the global `tools` object, for example `await tools.exec_command(...)`.
 - Nested tool methods take either a string or an object as their input argument.
 - Nested tools return either an object or a string, based on the description.
@@ -28,7 +28,7 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - `ALL_TOOLS`: metadata for the enabled nested tools as `{ name, description, kind }` entries.
 - `yield_control()`: yields the accumulated output to the model immediately while the cell keeps running."#;
 
-pub(super) fn exec_description(handlers: &[Box<dyn ToolHandler>]) -> String {
+pub(super) fn exec_description(handlers: &[Arc<dyn ToolHandler>]) -> String {
     let mut description = EXEC_DESCRIPTION.to_owned();
     for handler in handlers {
         let spec = handler.spec();
