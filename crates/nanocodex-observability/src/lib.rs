@@ -250,9 +250,19 @@ mod tests {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
-                        let mut request = [0_u8; 16 * 1024];
-                        let read = stream.read(&mut request).unwrap_or_default();
-                        let is_trace_request = request[..read]
+                        let mut request = Vec::with_capacity(4 * 1024);
+                        let mut chunk = [0_u8; 1024];
+                        while request.len() < 16 * 1024 {
+                            let read = stream.read(&mut chunk).unwrap_or_default();
+                            if read == 0 {
+                                break;
+                            }
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        let is_trace_request = request
                             .windows(b"POST /v1/traces".len())
                             .any(|window| window == b"POST /v1/traces");
                         stream
