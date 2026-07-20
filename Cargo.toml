@@ -59,7 +59,7 @@ sonic-rs = "0.5.8"
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tokio = "1.48.0"
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["connect", "proxy", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.28.0", git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", default-features = false, features = ["connect", "proxy", "rustls-tls-webpki-roots"] }
 tower = { version = "0.5.2", features = ["limit", "load-shed", "retry", "timeout", "util"] }
 tracing = "0.1.44"
 tracing-appender = "0.2.4"
