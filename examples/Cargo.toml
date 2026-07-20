@@ -56,5 +56,9 @@ path = "fork_conversations.rs"
 name = "fork-checkpoint-bench"
 path = "fork_checkpoint_bench.rs"
 
+[[bin]]
+name = "codex-parity-bench"
+path = "codex_parity_bench.rs"
+
 [lints]
 workspace = true
