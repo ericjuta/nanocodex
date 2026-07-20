@@ -39,7 +39,7 @@ nanocodex-tools = { version = "0.1.0", path = "crates/nanocodex-tools" }
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "pnm", "webp"] }
 iana-time-zone = "0.1.64"
 js-sys = "0.3.82"
-nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "user"] }
+nix = { version = "0.30.1", default-features = false, features = ["fs", "process", "signal", "user"] }
 portable-pty = "0.9.0"
 opentelemetry = { version = "0.31.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-client", "reqwest-rustls-webpki-roots", "trace"] }
@@ -68,6 +68,7 @@ sonic-rs = "0.5.8"
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "xxh32"] }
 tokio = "1.48.0"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tower = { version = "0.5.2", features = ["limit", "load-shed", "retry", "timeout", "util"] }
