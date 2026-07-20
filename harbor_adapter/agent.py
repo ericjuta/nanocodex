@@ -42,6 +42,35 @@ RUN_METRIC_FIELDS = (
 USAGE_METRIC_FIELDS = ("cache_write_input_tokens", "reasoning_output_tokens")
 
 
+def _cli_tools_install_command(*, install_node: bool) -> str:
+    """Build a portable installer for the stock Codex task-side CLI toolset."""
+    packages = ["ca-certificates", "curl", "bash", "ripgrep"]
+    checks = ["curl", "bash", "rg"]
+    if install_node:
+        packages.extend(("nodejs", "npm"))
+        checks.extend(("node", "npm"))
+
+    package_list = " ".join(packages)
+    command_checks = "; ".join(
+        f"command -v {command} >/dev/null 2>&1" for command in checks
+    )
+    return (
+        "if ldd --version 2>&1 | grep -qi musl || "
+        "[ -f /etc/alpine-release ]; then "
+        f"apk add --no-cache {package_list}; "
+        "elif command -v apt-get >/dev/null 2>&1; then "
+        "apt-get update && DEBIAN_FRONTEND=noninteractive "
+        "apt-get install --yes --no-install-recommends "
+        f"{package_list}; "
+        "elif command -v yum >/dev/null 2>&1; then "
+        f"yum install -y {package_list}; "
+        "else "
+        "echo 'No supported package manager found; checking preinstalled tools' >&2; "
+        "fi; "
+        f"{command_checks}"
+    )
+
+
 class NanocodexAgent(BaseInstalledAgent):
     """Upload one Rust binary, run it once, and retain its JSONL."""
 
@@ -104,17 +133,11 @@ class NanocodexAgent(BaseInstalledAgent):
             raise RuntimeError(
                 f"missing nanocodex binary at {self._binary_path}; run `just build-agent`"
             )
-        if self._install_node:
-            await self.exec_as_root(
-                environment,
-                "if ! command -v node >/dev/null 2>&1; then "
-                "command -v apt-get >/dev/null 2>&1 || { "
-                "echo 'Node.js is missing and this image has no apt-get' >&2; "
-                "exit 1; }; "
-                "apt-get update && DEBIAN_FRONTEND=noninteractive "
-                "apt-get install --yes --no-install-recommends nodejs; "
-                "fi; node --version",
-            )
+        await self.exec_as_root(
+            environment,
+            _cli_tools_install_command(install_node=self._install_node),
+            env={"DEBIAN_FRONTEND": "noninteractive"},
+        )
         await environment.upload_file(self._binary_path, self._BINARY)
         await self.exec_as_root(environment, f"chmod 0755 {self._BINARY}")
 

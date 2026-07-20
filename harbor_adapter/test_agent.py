@@ -16,13 +16,66 @@ from unittest.mock import AsyncMock
 import yaml
 from harbor.models.agent.context import AgentContext
 
-from harbor_adapter.agent import NanocodexAgent
+from harbor_adapter.agent import NanocodexAgent, _cli_tools_install_command
 from harbor_adapter.codex import ParityCodexAgent
 from harbor_adapter.environment import _toolbox_mount_setup_command
 from harbor_adapter.verifier import (
     _VERIFIER_OVERLAY_PATH_VALIDATION,
     _toolbox_library_path_setup_command,
 )
+
+
+class CliToolInstallContractTests(unittest.TestCase):
+    def test_leaderboard_install_provisions_the_codex_cli_toolset_and_cas(self) -> None:
+        command = _cli_tools_install_command(install_node=True)
+
+        for package in (
+            "ca-certificates",
+            "curl",
+            "bash",
+            "nodejs",
+            "npm",
+            "ripgrep",
+        ):
+            self.assertIn(package, command)
+        for package_manager in ("apk add", "apt-get install", "yum install"):
+            self.assertIn(package_manager, command)
+        for executable in ("curl", "bash", "node", "npm", "rg"):
+            self.assertIn(f"command -v {executable}", command)
+
+    def test_node_policy_keeps_node_and_npm_optional(self) -> None:
+        command = _cli_tools_install_command(install_node=False)
+
+        self.assertNotIn("nodejs", command)
+        self.assertNotIn("command -v node", command)
+        self.assertNotIn("command -v npm", command)
+        for package in ("ca-certificates", "curl", "bash", "ripgrep"):
+            self.assertIn(package, command)
+
+    def test_agent_install_applies_the_tool_policy_before_uploading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "nanocodex"
+            binary.touch()
+            agent = object.__new__(NanocodexAgent)
+            agent._binary_path = binary
+            agent._install_node = True
+            agent.exec_as_root = AsyncMock()
+            environment = SimpleNamespace(upload_file=AsyncMock())
+
+            asyncio.run(agent.install(environment))
+
+        install_command = agent.exec_as_root.await_args_list[0].args[1]
+        self.assertIn("ca-certificates", install_command)
+        self.assertIn("nodejs", install_command)
+        self.assertEqual(
+            agent.exec_as_root.await_args_list[0].kwargs["env"],
+            {"DEBIAN_FRONTEND": "noninteractive"},
+        )
+        environment.upload_file.assert_awaited_once_with(binary, agent._BINARY)
+        self.assertEqual(
+            agent.exec_as_root.await_args_list[1].args[1],
+            "chmod 0755 /installed-agent/nanocodex",
+        )
 
 
 class WebSearchContractTests(unittest.TestCase):
