@@ -380,7 +380,11 @@ fn header_string(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        env,
+        process::{Command, Stdio},
+        time::Duration,
+    };
 
     use eyre::{Result, eyre};
     use futures_util::{SinkExt, StreamExt};
@@ -391,6 +395,162 @@ mod tests {
     };
 
     use super::{ResponsesSocket, parse_raw_json};
+
+    #[tokio::test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback's error response type"
+    )]
+    async fn respects_http_proxy_for_websocket_connections() -> Result<()> {
+        run_proxy_test(
+            "HTTP_PROXY",
+            "ws://unreachable.nanocodex.invalid/v1/responses",
+            "unreachable.nanocodex.invalid:80",
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback's error response type"
+    )]
+    async fn respects_https_proxy_for_secure_websocket_connections() -> Result<()> {
+        run_proxy_test(
+            "HTTPS_PROXY",
+            "wss://unreachable.nanocodex.invalid/v1/responses",
+            "unreachable.nanocodex.invalid:443",
+            Some(502),
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback's error response type"
+    )]
+    async fn run_proxy_test(
+        proxy_env: &str,
+        endpoint: &str,
+        expected_authority: &str,
+        rejection_status: Option<u16>,
+    ) -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy_address = listener.local_addr()?;
+        let test_binary = env::current_exe()?;
+        let mut command = Command::new(test_binary);
+        command
+            .args([
+                "--exact",
+                "socket::tests::proxy_connection_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("NANOCODEX_HTTP_PROXY_TEST_CHILD", "1")
+            .env("NANOCODEX_HTTP_PROXY_TEST_ENDPOINT", endpoint)
+            .env_remove("HTTP_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("https_proxy")
+            .env_remove("ALL_PROXY")
+            .env_remove("all_proxy")
+            .env(proxy_env, format!("http://{proxy_address}"))
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(status) = rejection_status {
+            command.env(
+                "NANOCODEX_HTTP_PROXY_TEST_EXPECT_REJECTION",
+                status.to_string(),
+            );
+        }
+        let child = command.spawn()?;
+
+        let accepted = timeout(Duration::from_secs(5), listener.accept()).await;
+        let (stream, _) = if let Ok(connection) = accepted {
+            connection?
+        } else {
+            let output = child.wait_with_output()?;
+            return Err(eyre!(
+                "WebSocket transport never contacted {proxy_env}; child status: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        };
+
+        let mut request = Vec::new();
+        loop {
+            stream.readable().await?;
+            let mut bytes = [0_u8; 1024];
+            match stream.try_read(&mut bytes) {
+                Ok(0) => return Err(eyre!("proxy client closed before CONNECT completed")),
+                Ok(read) => {
+                    request.extend_from_slice(&bytes[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let request = String::from_utf8(request)?;
+        assert!(
+            request.starts_with(&format!("CONNECT {expected_authority} HTTP/1.1\r\n")),
+            "unexpected proxy request: {request:?}"
+        );
+
+        let response = rejection_status.map_or_else(
+            || "HTTP/1.1 200 Connection Established\r\n\r\n".to_owned(),
+            |status| format!("HTTP/1.1 {status} Bad Gateway\r\nContent-Length: 0\r\n\r\n"),
+        );
+        let mut written = 0;
+        while written < response.len() {
+            stream.writable().await?;
+            match stream.try_write(&response.as_bytes()[written..]) {
+                Ok(0) => return Err(eyre!("proxy client closed before CONNECT response")),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        if rejection_status.is_none() {
+            let socket =
+                accept_hdr_async(stream, |_request: &Request, response| Ok(response)).await?;
+            drop(socket);
+        }
+        let output = child.wait_with_output()?;
+        assert!(
+            output.status.success(),
+            "proxy child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "run only as the isolated child of the proxy connection tests"]
+    async fn proxy_connection_child() -> Result<()> {
+        if env::var_os("NANOCODEX_HTTP_PROXY_TEST_CHILD").is_none() {
+            return Ok(());
+        }
+        let endpoint = env::var("NANOCODEX_HTTP_PROXY_TEST_ENDPOINT")?;
+        let result = ResponsesSocket::connect(&endpoint, "test-key", "session-proxy").await;
+        let expected_rejection = env::var("NANOCODEX_HTTP_PROXY_TEST_EXPECT_REJECTION")
+            .ok()
+            .map(|status| status.parse::<u16>())
+            .transpose()?;
+        match (result, expected_rejection) {
+            (Ok(_), None) | (Err(_), Some(_)) => Ok(()),
+            (Err(error), None) => Err(error.into()),
+            (Ok(_), Some(expected)) => Err(eyre!(
+                "proxy connection succeeded; expected HTTP {expected} rejection"
+            )),
+        }
+    }
 
     #[tokio::test]
     #[allow(
