@@ -54,5 +54,69 @@ fn benchmark_fork_append(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, benchmark_fork_append);
+fn benchmark_active_boundary_snapshot(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("active_boundary_snapshot_then_append");
+    for item_count in [100_usize, 1_000, 10_000] {
+        group.throughput(Throughput::Elements(
+            u64::try_from(item_count).expect("benchmark sizes fit in u64"),
+        ));
+        let items: Vec<_> = (0..item_count).map(history_item).collect();
+        let active = ResponseHistory::new(items.clone());
+        group.bench_with_input(
+            BenchmarkId::new("immutable_boundary", item_count),
+            &active,
+            |bencher, history| {
+                bencher.iter(|| {
+                    let mut parent = history.clone();
+                    parent.commit_tail();
+                    let snapshot = parent.clone();
+                    parent.push(history_item(usize::MAX));
+                    black_box((parent, snapshot));
+                });
+            },
+        );
+
+        let copy_on_write = Arc::new(items);
+        group.bench_with_input(
+            BenchmarkId::new("arc_vec_boundary", item_count),
+            &copy_on_write,
+            |bencher, history| {
+                bencher.iter(|| {
+                    let snapshot = Arc::clone(history);
+                    let mut parent = Arc::clone(history);
+                    Arc::make_mut(&mut parent).push(history_item(usize::MAX));
+                    black_box((parent, snapshot));
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn benchmark_incremental_suffix(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("incremental_suffix_iteration");
+    for item_count in [100_usize, 1_000, 10_000] {
+        let mut history = ResponseHistory::default();
+        for index in 0..item_count {
+            history.push(history_item(index));
+            history.commit_tail();
+        }
+        group.bench_with_input(
+            BenchmarkId::new("last_item", item_count),
+            &history,
+            |bencher, history| {
+                bencher
+                    .iter(|| black_box(history.iter_from(history.len().saturating_sub(1)).count()));
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    benchmark_fork_append,
+    benchmark_active_boundary_snapshot,
+    benchmark_incremental_suffix
+);
 criterion_main!(benches);

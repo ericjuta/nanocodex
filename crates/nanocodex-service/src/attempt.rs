@@ -217,9 +217,10 @@ impl ResponsesAttempt {
                 self.tail.as_ref(),
             )
         } else {
-            ResponsesInput::new(
+            ResponsesInput::history_suffix(
                 &[],
-                &self.incremental_history.tail()[self.incremental_start..],
+                &self.incremental_history,
+                self.incremental_start,
                 self.tail.as_ref(),
             )
         }

@@ -56,7 +56,7 @@ pub struct ResponseHistory {
 
 struct HistorySegment {
     previous: Option<Arc<HistorySegment>>,
-    items: Arc<[ResponseItem]>,
+    items: Arc<Vec<ResponseItem>>,
     len: usize,
 }
 
@@ -102,8 +102,7 @@ impl ResponseHistory {
         if self.tail.is_empty() {
             return;
         }
-        let items =
-            Arc::<[ResponseItem]>::from(Arc::unwrap_or_clone(std::mem::take(&mut self.tail)));
+        let items = std::mem::take(&mut self.tail);
         let previous_len = self.head.as_ref().map_or(0, |segment| segment.len);
         self.head = Some(Arc::new(HistorySegment {
             previous: self.head.take(),
@@ -119,7 +118,12 @@ impl ResponseHistory {
 
     #[must_use]
     pub fn iter(&self) -> ResponseHistoryIter<'_> {
-        ResponseHistoryIter::new(self)
+        ResponseHistoryIter::new(self, 0)
+    }
+
+    #[must_use]
+    pub fn iter_from(&self, start: usize) -> ResponseHistoryIter<'_> {
+        ResponseHistoryIter::new(self, start)
     }
 
     #[cfg(test)]
@@ -145,19 +149,30 @@ pub struct ResponseHistoryIter<'a> {
 }
 
 impl<'a> ResponseHistoryIter<'a> {
-    fn new(history: &'a ResponseHistory) -> Self {
+    fn new(history: &'a ResponseHistory, start: usize) -> Self {
         let mut segments = Vec::new();
-        let mut current = history.head.as_deref();
-        while let Some(segment) = current {
-            segments.push(segment);
-            current = segment.previous.as_deref();
+        let committed_len = history.head.as_ref().map_or(0, |segment| segment.len);
+        let start = start.min(history.len());
+        let mut item_index = 0;
+        if start < committed_len {
+            let mut current = history.head.as_deref();
+            while let Some(segment) = current {
+                let previous_len = segment.previous.as_ref().map_or(0, |previous| previous.len);
+                segments.push(segment);
+                if start >= previous_len {
+                    item_index = start - previous_len;
+                    break;
+                }
+                current = segment.previous.as_deref();
+            }
+            segments.reverse();
         }
-        segments.reverse();
+        let tail_start = start.saturating_sub(committed_len);
         Self {
             segments,
             segment_index: 0,
-            item_index: 0,
-            tail: history.tail.iter(),
+            item_index,
+            tail: history.tail[tail_start..].iter(),
         }
     }
 }
@@ -203,6 +218,7 @@ pub struct ResponsesInput<'a> {
     first: &'a [ResponseItem],
     second: &'a [ResponseItem],
     history: Option<&'a ResponseHistory>,
+    history_start: usize,
     tail: Option<&'a ResponseItem>,
 }
 
@@ -217,6 +233,7 @@ impl<'a> ResponsesInput<'a> {
             first,
             second,
             history: None,
+            history_start: 0,
             tail,
         }
     }
@@ -231,15 +248,35 @@ impl<'a> ResponsesInput<'a> {
             first,
             second: &[],
             history: Some(history),
+            history_start: 0,
             tail,
         }
     }
 
+    #[must_use]
+    pub const fn history_suffix(
+        first: &'a [ResponseItem],
+        history: &'a ResponseHistory,
+        history_start: usize,
+        tail: Option<&'a ResponseItem>,
+    ) -> Self {
+        Self {
+            first,
+            second: &[],
+            history: Some(history),
+            history_start,
+            tail,
+        }
+    }
+
+    #[must_use]
     pub fn iter(self) -> ResponsesInputIter<'a> {
         ResponsesInputIter {
             first: self.first.iter(),
             second: self.second.iter(),
-            history: self.history.map(ResponseHistory::iter),
+            history: self
+                .history
+                .map(|history| history.iter_from(self.history_start)),
             tail: self.tail.into_iter(),
         }
     }
@@ -248,7 +285,9 @@ impl<'a> ResponsesInput<'a> {
     pub fn len(self) -> usize {
         self.first.len()
             + self.second.len()
-            + self.history.map_or(0, ResponseHistory::len)
+            + self.history.map_or(0, |history| {
+                history.len().saturating_sub(self.history_start)
+            })
             + usize::from(self.tail.is_some())
     }
 
@@ -472,5 +511,32 @@ mod tests {
             fork.committed_head().unwrap()
         ));
         assert_eq!(history.iter().count(), 2);
+    }
+
+    #[test]
+    fn sealing_a_boundary_reuses_the_tail_and_suffixes_cross_segments() {
+        let item = |text: &'static str| {
+            ResponseItem::message(
+                MessageRole::User,
+                [ContentItem::InputText { text: text.into() }],
+            )
+        };
+        let mut history = ResponseHistory::new(vec![item("zero"), item("one")]);
+        let active_tail = history.shared_tail();
+        history.commit_tail();
+        assert!(Arc::ptr_eq(
+            &history.committed_head().unwrap().items,
+            &active_tail,
+        ));
+        history.push(item("two"));
+        history.commit_tail();
+        history.push(item("three"));
+
+        let suffix: Vec<_> = history.iter_from(1).cloned().collect();
+        assert_eq!(
+            serde_json::to_value(suffix).unwrap(),
+            serde_json::to_value(vec![item("one"), item("two"), item("three")]).unwrap(),
+        );
+        assert_eq!(history.iter_from(99).count(), 0);
     }
 }
