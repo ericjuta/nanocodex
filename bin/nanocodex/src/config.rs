@@ -1,10 +1,20 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::Result;
 use nanocodex::{AgentEvents, Nanocodex, Responses, Thinking, Tools};
 
 use crate::mcp::McpArgs;
+use crate::subagents::{self, ChildAgents};
+
+pub(crate) struct ConfiguredAgent {
+    pub(crate) handle: Nanocodex,
+    pub(crate) events: AgentEvents,
+    pub(crate) child_agents: Option<Arc<ChildAgents>>,
+}
 
 #[derive(Args)]
 pub(crate) struct AgentArgs {
@@ -49,6 +59,16 @@ pub(crate) struct AgentArgs {
     )]
     image_generation: bool,
 
+    /// Expose reusable clean, forked, and follow-up child agents in Code Mode.
+    #[arg(
+        long,
+        global = true,
+        env = "NANOCODEX_SUBAGENTS",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    subagents: bool,
+
     /// Responses API WebSocket endpoint.
     #[arg(
         long,
@@ -76,7 +96,7 @@ impl AgentArgs {
         &self.cwd
     }
 
-    pub(crate) fn build(self) -> Result<(Nanocodex, AgentEvents)> {
+    pub(crate) fn build(self) -> Result<ConfiguredAgent> {
         let responses = Responses::builder()
             .websocket_url(self.websocket_url)
             .api_base_url(self.api_base_url)
@@ -88,16 +108,30 @@ impl AgentArgs {
             tools = tools.provider(mcp);
         }
         let tools = tools.build()?;
+        let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
         let builder = Nanocodex::builder(self.api_key)
             .thinking(self.thinking)
-            .tools(tools)
             .workspace(self.cwd)
             .responses(responses);
+        let builder = if let Some(child_agents) = &child_agents {
+            let tools = tools.clone();
+            let child_agents = Arc::downgrade(child_agents);
+            builder.tools_factory(move |agent| {
+                subagents::with_subagents(tools.clone(), agent, child_agents.clone())
+            })
+        } else {
+            builder.tools(tools)
+        };
         let builder = if let Some(prompt) = self.system_prompt {
             builder.prompt(prompt)
         } else {
             builder
         };
-        Ok(builder.build()?)
+        let (handle, events) = builder.build()?;
+        Ok(ConfiguredAgent {
+            handle,
+            events,
+            child_agents,
+        })
     }
 }

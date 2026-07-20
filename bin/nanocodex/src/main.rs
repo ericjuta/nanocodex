@@ -2,6 +2,7 @@ mod config;
 mod mcp;
 mod observability;
 mod run;
+mod subagents;
 mod tui;
 
 use clap::{Parser, Subcommand, builder::NonEmptyStringValueParser};

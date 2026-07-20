@@ -18,12 +18,22 @@ pub(crate) struct Run {
 
 impl Run {
     pub(crate) async fn run(self, config: AgentArgs) -> Result<()> {
-        let (handle, mut events) = config.build()?;
-        for _ in 0..self.repeat {
-            let turn = handle.prompt(self.prompt.clone()).await?;
-            events.write_turn_jsonl(io::stdout()).await?;
-            turn.result().await?;
+        let configured = config.build()?;
+        let handle = configured.handle;
+        let mut events = configured.events;
+        let result = async {
+            for _ in 0..self.repeat {
+                let turn = handle.prompt(self.prompt.clone()).await?;
+                events.write_turn_jsonl(io::stdout()).await?;
+                turn.result().await?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        drop(handle);
+        if let Some(child_agents) = configured.child_agents {
+            child_agents.shutdown().await;
+        }
+        result
     }
 }

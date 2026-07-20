@@ -7,21 +7,59 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, ToolStatus, TranscriptItem};
+use super::app::{App, Conversation, PaneId, ToolStatus, TranscriptItem};
 
 pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let composer_height = composer_height(&app.input, area.width.saturating_sub(4));
-    let [header_area, transcript_area, composer_area, footer_area] = Layout::vertical([
+    let pending_height = pending_height(app.active_conversation());
+    let [
+        header_area,
+        transcript_area,
+        pending_area,
+        composer_area,
+        footer_area,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
+        Constraint::Length(pending_height),
         Constraint::Length(composer_height),
         Constraint::Length(1),
     ])
     .areas(area);
 
     render_header(frame, app, header_area);
-    render_transcript(frame, app, transcript_area);
+    if let Some(btw) = &app.btw {
+        let [main_area, btw_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(transcript_area);
+        render_transcript(
+            frame,
+            &app.main,
+            main_area,
+            " Main ",
+            app.focus == PaneId::Main,
+            "Ask Nanocodex to inspect, edit, run, or explain this workspace.",
+        );
+        render_transcript(
+            frame,
+            &btw.conversation,
+            btw_area,
+            " BTW · forked context ",
+            app.focus == PaneId::Btw(btw.id),
+            "Ask a quick side question without interrupting the main thread.",
+        );
+    } else {
+        render_transcript(
+            frame,
+            &app.main,
+            transcript_area,
+            " Main ",
+            true,
+            "Ask Nanocodex to inspect, edit, run, or explain this workspace.",
+        );
+    }
+    render_pending(frame, app.active_conversation(), pending_area);
     render_composer(frame, app, composer_area);
     render_footer(frame, app, footer_area);
 }
@@ -44,31 +82,48 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(title), area);
 }
 
-fn render_transcript(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn render_transcript(
+    frame: &mut Frame<'_>,
+    conversation: &Conversation,
+    area: Rect,
+    title: &'static str,
+    focused: bool,
+    empty_message: &'static str,
+) {
     let block = Block::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let text = transcript_text(app);
+    let text = transcript_text(conversation, empty_message);
     let line_count = wrapped_line_count(&text, inner.width);
     let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
     let max_scroll = line_count.saturating_sub(usize::from(inner.height));
-    let scroll = max_scroll.saturating_sub(app.scroll_from_bottom.min(max_scroll));
+    let scroll = max_scroll.saturating_sub(conversation.scroll_from_bottom.min(max_scroll));
     frame.render_widget(paragraph.scroll((saturating_u16(scroll), 0)), inner);
 }
 
 fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let title = if app.running {
-        " Message (Enter queues) "
+    let conversation = app.active_conversation();
+    let target = match app.focus {
+        PaneId::Main => "Main",
+        PaneId::Btw(_) => "BTW",
+    };
+    let title = if conversation.running {
+        format!(" Message → {target} (Enter steers · Tab queues) ")
     } else {
-        " Message "
+        format!(" Message → {target} ")
     };
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.running {
+        .border_style(Style::default().fg(if conversation.running {
             Color::Yellow
         } else {
             Color::Cyan
@@ -94,17 +149,34 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let conversation = app.active_conversation();
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-    let state = if app.running {
-        format!("{} {}", spinner[app.frame % spinner.len()], app.status)
+    let state = if conversation.running {
+        format!(
+            "{} {}",
+            spinner[app.frame % spinner.len()],
+            conversation.status
+        )
     } else {
-        app.status.clone()
+        conversation.status.clone()
     };
-    let queued = app.pending_turns.saturating_sub(usize::from(app.running));
-    let queue = if queued == 0 {
+    let queued = conversation
+        .pending_turns
+        .saturating_sub(usize::from(conversation.running));
+    let steering = conversation.pending_steers.len();
+    let queue = if queued == 0 && steering == 0 {
         String::new()
     } else {
-        format!("  ·  {queued} queued")
+        match (steering, queued) {
+            (0, queued) => format!(" · {queued} queued"),
+            (steering, 0) => format!(" · {steering} steering"),
+            (steering, queued) => format!(" · {steering} steering · {queued} queued"),
+        }
+    };
+    let help = if app.btw.is_some() {
+        "  BackTab switch · Enter send/steer · Tab queue · /close dismiss · Ctrl+C quit"
+    } else {
+        "  /btw <question> side fork · Enter send/steer · Tab queue · Ctrl+J newline · Ctrl+C quit"
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -112,28 +184,71 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 format!(" {state}{queue}"),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(
-                "    Enter send  Ctrl+J newline  PgUp/PgDn scroll  Ctrl+C quit",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(help, Style::default().fg(Color::DarkGray)),
         ])),
         area,
     );
 }
 
-fn transcript_text(app: &App) -> Text<'static> {
-    if app.transcript.is_empty() {
+fn pending_height(conversation: &Conversation) -> u16 {
+    let count = conversation.pending_steers.len() + conversation.queued_prompts.len();
+    if count == 0 {
+        0
+    } else {
+        saturating_u16(count.min(3) + 2)
+    }
+}
+
+fn render_pending(frame: &mut Frame<'_>, conversation: &Conversation, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let mut lines = Vec::new();
+    for prompt in &conversation.pending_steers {
+        lines.push(Line::from(vec![
+            Span::styled("↳ steer  ", Style::default().fg(Color::Yellow)),
+            Span::raw(prompt_preview(prompt)),
+        ]));
+    }
+    for prompt in &conversation.queued_prompts {
+        lines.push(Line::from(vec![
+            Span::styled("⏳ next   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(prompt_preview(prompt)),
+        ]));
+    }
+    lines.truncate(3);
+
+    let block = Block::default()
+        .title(" Pending input ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn prompt_preview(prompt: &str) -> String {
+    let mut preview = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_CHARS: usize = 96;
+    if preview.chars().count() > MAX_CHARS {
+        preview = preview.chars().take(MAX_CHARS - 1).collect();
+        preview.push('…');
+    }
+    preview
+}
+
+fn transcript_text(conversation: &Conversation, empty_message: &'static str) -> Text<'static> {
+    if conversation.transcript.is_empty() {
         return Text::from(vec![
             Line::raw(""),
             Line::styled(
-                "  Ask Nanocodex to inspect, edit, run, or explain this workspace.",
+                format!("  {empty_message}"),
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
     }
 
     let mut lines = Vec::new();
-    for item in &app.transcript {
+    for item in &conversation.transcript {
         match item {
             TranscriptItem::User(message) => {
                 lines.push(Line::styled(
@@ -226,4 +341,48 @@ fn wrapped_line_count(text: &Text<'_>, width: u16) -> usize {
         .iter()
         .map(|line| line.width().div_ceil(width).max(1))
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::render;
+    use crate::tui::app::App;
+
+    #[test]
+    fn btw_renders_as_a_side_by_side_focused_pane() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.begin_btw();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Main"));
+        assert!(rendered.contains("BTW · forked context"));
+        assert!(rendered.contains("Message → BTW"));
+        assert!(rendered.contains("BackTab switch"));
+    }
+
+    #[test]
+    fn active_turn_renders_steers_separately_from_queued_follow_ups() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.main.running = true;
+        assert!(app.queue_steer(
+            crate::tui::app::PaneId::Main,
+            "use the database implementation".to_owned()
+        ));
+        assert!(app.queue_prompt(
+            crate::tui::app::PaneId::Main,
+            "write a final benchmark summary".to_owned()
+        ));
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Enter steers · Tab queues"));
+        assert!(rendered.contains("↳ steer"));
+        assert!(rendered.contains("use the database implementation"));
+        assert!(rendered.contains("⏳ next"));
+        assert!(rendered.contains("write a final benchmark summary"));
+    }
 }

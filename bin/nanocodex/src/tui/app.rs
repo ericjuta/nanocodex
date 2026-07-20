@@ -26,42 +26,230 @@ pub(super) enum ToolStatus {
     Failed,
 }
 
-pub(super) struct App {
-    pub(super) cwd: PathBuf,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PaneId {
+    Main,
+    Btw(u64),
+}
+
+pub(super) struct Conversation {
     pub(super) transcript: Vec<TranscriptItem>,
-    pub(super) input: String,
-    pub(super) cursor: usize,
     pub(super) pending_turns: usize,
     pub(super) running: bool,
     pub(super) status: String,
     pub(super) scroll_from_bottom: usize,
-    pub(super) frame: usize,
     streamed_this_turn: bool,
     reasoning: String,
+    pub(super) queued_prompts: VecDeque<String>,
+    pub(super) pending_steers: VecDeque<String>,
+}
+
+impl Conversation {
+    fn new(status: impl Into<String>) -> Self {
+        Self {
+            transcript: Vec::new(),
+            pending_turns: 0,
+            running: false,
+            status: status.into(),
+            scroll_from_bottom: 0,
+            streamed_this_turn: false,
+            reasoning: String::new(),
+            queued_prompts: VecDeque::new(),
+            pending_steers: VecDeque::new(),
+        }
+    }
+
+    fn queue_prompt(&mut self, prompt: String) {
+        self.queued_prompts.push_back(prompt);
+        self.pending_turns += 1;
+        self.status = if self.running {
+            "Prompt queued".to_owned()
+        } else {
+            "Starting".to_owned()
+        };
+        self.scroll_from_bottom = 0;
+    }
+
+    fn queue_steer(&mut self, prompt: String) {
+        self.pending_steers.push_back(prompt);
+        self.status = "Steer pending".to_owned();
+        self.scroll_from_bottom = 0;
+    }
+
+    fn steer_accepted(&mut self, prompt: String) {
+        drop(self.pending_steers.pop_front());
+        self.transcript.push(TranscriptItem::User(prompt));
+        self.status = if self.running {
+            "Steer accepted".to_owned()
+        } else {
+            "Ready".to_owned()
+        };
+    }
+
+    fn steer_queued(&mut self, prompt: String) {
+        drop(self.pending_steers.pop_front());
+        self.queue_prompt(prompt);
+    }
+
+    fn steer_failed(&mut self, error: String) {
+        drop(self.pending_steers.pop_front());
+        self.transcript.push(TranscriptItem::Error(error));
+        self.status = if self.running {
+            "Working".to_owned()
+        } else {
+            "Ready".to_owned()
+        };
+    }
+
+    fn turn_finished(&mut self, error: Option<String>) {
+        self.pending_turns = self.pending_turns.saturating_sub(1);
+        if let Some(error) = error {
+            self.transcript.push(TranscriptItem::Error(error));
+        }
+    }
+
+    fn on_agent_event(&mut self, event: &AgentEvent) -> bool {
+        match event.kind {
+            AgentEventKind::RunStarted => {
+                if let Some(prompt) = self.queued_prompts.pop_front() {
+                    self.transcript.push(TranscriptItem::User(prompt));
+                }
+                self.running = true;
+                self.streamed_this_turn = false;
+                self.reasoning.clear();
+                "Thinking".clone_into(&mut self.status);
+            }
+            AgentEventKind::RunSteered => {
+                "Working".clone_into(&mut self.status);
+            }
+            AgentEventKind::AssistantDelta => {
+                if let Ok(payload) = event.decode_payload::<TextPayload>() {
+                    self.push_assistant_delta(&payload.text);
+                }
+            }
+            AgentEventKind::AssistantMessage => {
+                if let Ok(payload) = event.decode_payload::<TextPayload>()
+                    && !self.streamed_this_turn
+                {
+                    self.transcript
+                        .push(TranscriptItem::Assistant(payload.text));
+                }
+            }
+            AgentEventKind::ReasoningSummaryDelta => {
+                if let Ok(payload) = event.decode_payload::<TextPayload>() {
+                    self.reasoning.push_str(&payload.text);
+                    self.status = reasoning_tail(&self.reasoning);
+                }
+            }
+            AgentEventKind::ToolCall => {
+                if let Ok(payload) = event.decode_payload::<ToolCallPayload>() {
+                    let arguments = compact_arguments(&payload.arguments);
+                    self.status = format!("Running {}", payload.tool);
+                    self.transcript.push(TranscriptItem::Tool {
+                        call_id: payload.call_id,
+                        name: payload.tool,
+                        arguments,
+                        status: ToolStatus::Running,
+                    });
+                }
+            }
+            AgentEventKind::ToolResult => {
+                if let Ok(payload) = event.decode_payload::<ToolResultPayload>() {
+                    let status = if payload.status == "completed" {
+                        ToolStatus::Completed
+                    } else {
+                        ToolStatus::Failed
+                    };
+                    if let Some(TranscriptItem::Tool {
+                        status: current, ..
+                    }) = self.transcript.iter_mut().rev().find(|item| {
+                        matches!(item, TranscriptItem::Tool { call_id, .. } if call_id == &payload.call_id)
+                    }) {
+                        *current = status;
+                    }
+                    "Working".clone_into(&mut self.status);
+                }
+            }
+            AgentEventKind::RunError => {
+                if let Ok(payload) = event.decode_payload::<ErrorPayload>() {
+                    self.transcript.push(TranscriptItem::Error(payload.message));
+                }
+            }
+            AgentEventKind::RunCompleted => {
+                self.running = false;
+                "Ready".clone_into(&mut self.status);
+            }
+            AgentEventKind::RunFailed => {
+                self.running = false;
+                "Turn failed".clone_into(&mut self.status);
+            }
+            AgentEventKind::ApiEvent
+            | AgentEventKind::ModelWarmupStarted
+            | AgentEventKind::ModelWarmupCompleted
+            | AgentEventKind::ModelWarmupFailed
+            | AgentEventKind::ModelCallStarted
+            | AgentEventKind::ModelCallCompleted
+            | AgentEventKind::ModelCallFailed
+            | AgentEventKind::ModelCompactionStarted
+            | AgentEventKind::ModelCompactionCompleted
+            | AgentEventKind::ModelCompactionFailed
+            | AgentEventKind::ModelAttemptStarted
+            | AgentEventKind::ModelAttemptFailed
+            | AgentEventKind::ModelAttemptRetrying
+            | AgentEventKind::ModelConnectionStarted
+            | AgentEventKind::ModelConnectionCompleted
+            | AgentEventKind::ModelConnectionFailed => return false,
+        }
+        true
+    }
+
+    fn push_assistant_delta(&mut self, delta: &str) {
+        let append_to_current = self.streamed_this_turn;
+        self.streamed_this_turn = true;
+        if append_to_current
+            && let Some(TranscriptItem::Assistant(message)) = self.transcript.last_mut()
+        {
+            message.push_str(delta);
+        } else {
+            self.transcript
+                .push(TranscriptItem::Assistant(delta.to_owned()));
+        }
+    }
+}
+
+pub(super) struct BtwPane {
+    pub(super) id: u64,
+    pub(super) conversation: Conversation,
+}
+
+pub(super) struct App {
+    pub(super) cwd: PathBuf,
+    pub(super) main: Conversation,
+    pub(super) btw: Option<BtwPane>,
+    pub(super) focus: PaneId,
+    pub(super) input: String,
+    pub(super) cursor: usize,
+    pub(super) frame: usize,
     history: Vec<String>,
     history_cursor: Option<usize>,
     history_draft: String,
-    queued_prompts: VecDeque<String>,
+    next_btw_id: u64,
 }
 
 impl App {
     pub(super) fn new(cwd: PathBuf) -> Self {
         Self {
             cwd,
-            transcript: Vec::new(),
+            main: Conversation::new("Ready"),
+            btw: None,
+            focus: PaneId::Main,
             input: String::new(),
             cursor: 0,
-            pending_turns: 0,
-            running: false,
-            status: "Ready".to_owned(),
-            scroll_from_bottom: 0,
             frame: 0,
-            streamed_this_turn: false,
-            reasoning: String::new(),
             history: Vec::new(),
             history_cursor: None,
             history_draft: String::new(),
-            queued_prompts: VecDeque::new(),
+            next_btw_id: 1,
         }
     }
 
@@ -175,138 +363,173 @@ impl App {
         self.history.push(prompt.clone());
         self.history_cursor = None;
         self.history_draft.clear();
-        self.queued_prompts.push_back(prompt.clone());
-        self.pending_turns += 1;
-        self.status = if self.running {
-            "Prompt queued".to_owned()
-        } else {
-            "Starting".to_owned()
-        };
-        self.scroll_from_bottom = 0;
         Some(prompt)
     }
 
-    pub(super) fn turn_finished(&mut self, error: Option<String>) {
-        self.pending_turns = self.pending_turns.saturating_sub(1);
-        if let Some(error) = error {
-            self.transcript.push(TranscriptItem::Error(error));
+    pub(super) fn begin_btw(&mut self) -> u64 {
+        let id = self.next_btw_id;
+        self.next_btw_id = self.next_btw_id.saturating_add(1);
+        self.btw = Some(BtwPane {
+            id,
+            conversation: Conversation::new("Forking latest checkpoint"),
+        });
+        self.focus = PaneId::Btw(id);
+        id
+    }
+
+    pub(super) fn btw_id(&self) -> Option<u64> {
+        self.btw.as_ref().map(|btw| btw.id)
+    }
+
+    pub(super) fn btw_busy(&self) -> bool {
+        self.btw
+            .as_ref()
+            .is_some_and(|btw| btw.conversation.running || btw.conversation.pending_turns > 0)
+    }
+
+    pub(super) fn reject_btw_close_while_busy(&mut self) {
+        if let Some(btw) = self.btw.as_mut() {
+            btw.conversation.transcript.push(TranscriptItem::Error(
+                "BTW has an active or queued turn; wait for it to finish before /close".to_owned(),
+            ));
+            "BTW still running".clone_into(&mut btw.conversation.status);
         }
     }
 
+    pub(super) fn focus_btw(&mut self) {
+        if let Some(id) = self.btw_id() {
+            self.focus = PaneId::Btw(id);
+        }
+    }
+
+    pub(super) fn toggle_focus(&mut self) {
+        self.focus = match (self.focus, self.btw_id()) {
+            (PaneId::Main, Some(id)) => PaneId::Btw(id),
+            (PaneId::Btw(_), _) | (PaneId::Main, None) => PaneId::Main,
+        };
+    }
+
+    pub(super) fn close_btw(&mut self, id: u64) {
+        if self.btw_id() == Some(id) {
+            self.btw = None;
+            self.focus = PaneId::Main;
+        }
+    }
+
+    pub(super) fn btw_opened(&mut self, id: u64) {
+        if let Some(conversation) = self.conversation_mut(PaneId::Btw(id)) {
+            conversation.status = if conversation.pending_turns == 0 {
+                "Ready".to_owned()
+            } else {
+                "Starting".to_owned()
+            };
+        }
+    }
+
+    pub(super) fn btw_failed(&mut self, id: u64, error: String) {
+        if let Some(conversation) = self.conversation_mut(PaneId::Btw(id)) {
+            conversation.transcript.push(TranscriptItem::Error(error));
+            conversation.pending_turns = 0;
+            conversation.queued_prompts.clear();
+            conversation.pending_steers.clear();
+            conversation.running = false;
+            "Fork failed".clone_into(&mut conversation.status);
+        }
+    }
+
+    pub(super) fn queue_prompt(&mut self, target: PaneId, prompt: String) -> bool {
+        let Some(conversation) = self.conversation_mut(target) else {
+            return false;
+        };
+        conversation.queue_prompt(prompt);
+        true
+    }
+
+    pub(super) fn queue_steer(&mut self, target: PaneId, prompt: String) -> bool {
+        let Some(conversation) = self.conversation_mut(target) else {
+            return false;
+        };
+        conversation.queue_steer(prompt);
+        true
+    }
+
+    pub(super) fn steer_accepted(&mut self, target: PaneId, prompt: String) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.steer_accepted(prompt);
+        }
+    }
+
+    pub(super) fn steer_queued(&mut self, target: PaneId, prompt: String) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.steer_queued(prompt);
+        }
+    }
+
+    pub(super) fn steer_failed(&mut self, target: PaneId, error: String) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.steer_failed(error);
+        }
+    }
+
+    pub(super) fn is_running(&self, target: PaneId) -> bool {
+        self.conversation(target)
+            .is_some_and(|conversation| conversation.running)
+    }
+
+    pub(super) fn has_input(&self) -> bool {
+        !self.input.chars().all(char::is_whitespace)
+    }
+
+    pub(super) fn turn_finished(&mut self, target: PaneId, error: Option<String>) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.turn_finished(error);
+        }
+    }
+
+    pub(super) fn on_agent_event(&mut self, target: PaneId, event: &AgentEvent) -> bool {
+        self.conversation_mut(target)
+            .is_some_and(|conversation| conversation.on_agent_event(event))
+    }
+
     pub(super) fn scroll_up(&mut self, rows: usize) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_add(rows);
+        if let Some(conversation) = self.conversation_mut(self.focus) {
+            conversation.scroll_from_bottom = conversation.scroll_from_bottom.saturating_add(rows);
+        }
     }
 
     pub(super) fn scroll_down(&mut self, rows: usize) {
-        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(rows);
+        if let Some(conversation) = self.conversation_mut(self.focus) {
+            conversation.scroll_from_bottom = conversation.scroll_from_bottom.saturating_sub(rows);
+        }
     }
 
     pub(super) fn on_tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
     }
 
-    pub(super) fn on_agent_event(&mut self, event: &AgentEvent) -> bool {
-        match event.kind {
-            AgentEventKind::RunStarted => {
-                if let Some(prompt) = self.queued_prompts.pop_front() {
-                    self.transcript.push(TranscriptItem::User(prompt));
-                }
-                self.running = true;
-                self.streamed_this_turn = false;
-                self.reasoning.clear();
-                "Thinking".clone_into(&mut self.status);
-            }
-            AgentEventKind::AssistantDelta => {
-                if let Ok(payload) = event.decode_payload::<TextPayload>() {
-                    self.push_assistant_delta(&payload.text);
-                }
-            }
-            AgentEventKind::AssistantMessage => {
-                if let Ok(payload) = event.decode_payload::<TextPayload>()
-                    && !self.streamed_this_turn
-                {
-                    self.transcript
-                        .push(TranscriptItem::Assistant(payload.text));
-                }
-            }
-            AgentEventKind::ReasoningSummaryDelta => {
-                if let Ok(payload) = event.decode_payload::<TextPayload>() {
-                    self.reasoning.push_str(&payload.text);
-                    self.status = reasoning_tail(&self.reasoning);
-                }
-            }
-            AgentEventKind::ToolCall => {
-                if let Ok(payload) = event.decode_payload::<ToolCallPayload>() {
-                    let arguments = compact_arguments(&payload.arguments);
-                    self.status = format!("Running {}", payload.tool);
-                    self.transcript.push(TranscriptItem::Tool {
-                        call_id: payload.call_id,
-                        name: payload.tool,
-                        arguments,
-                        status: ToolStatus::Running,
-                    });
-                }
-            }
-            AgentEventKind::ToolResult => {
-                if let Ok(payload) = event.decode_payload::<ToolResultPayload>() {
-                    let status = if payload.status == "completed" {
-                        ToolStatus::Completed
-                    } else {
-                        ToolStatus::Failed
-                    };
-                    if let Some(TranscriptItem::Tool {
-                        status: current, ..
-                    }) = self.transcript.iter_mut().rev().find(|item| {
-                        matches!(item, TranscriptItem::Tool { call_id, .. } if call_id == &payload.call_id)
-                    }) {
-                        *current = status;
-                    }
-                    "Working".clone_into(&mut self.status);
-                }
-            }
-            AgentEventKind::RunError => {
-                if let Ok(payload) = event.decode_payload::<ErrorPayload>() {
-                    self.transcript.push(TranscriptItem::Error(payload.message));
-                }
-            }
-            AgentEventKind::RunCompleted => {
-                self.running = false;
-                "Ready".clone_into(&mut self.status);
-            }
-            AgentEventKind::RunFailed => {
-                self.running = false;
-                "Turn failed".clone_into(&mut self.status);
-            }
-            AgentEventKind::ApiEvent
-            | AgentEventKind::ModelWarmupStarted
-            | AgentEventKind::ModelWarmupCompleted
-            | AgentEventKind::ModelWarmupFailed
-            | AgentEventKind::ModelCallStarted
-            | AgentEventKind::ModelCallCompleted
-            | AgentEventKind::ModelCallFailed
-            | AgentEventKind::ModelCompactionStarted
-            | AgentEventKind::ModelCompactionCompleted
-            | AgentEventKind::ModelCompactionFailed
-            | AgentEventKind::ModelAttemptStarted
-            | AgentEventKind::ModelAttemptFailed
-            | AgentEventKind::ModelAttemptRetrying
-            | AgentEventKind::ModelConnectionStarted
-            | AgentEventKind::ModelConnectionCompleted
-            | AgentEventKind::ModelConnectionFailed => return false,
-        }
-        true
+    pub(super) fn active_conversation(&self) -> &Conversation {
+        self.conversation(self.focus).unwrap_or(&self.main)
     }
 
-    fn push_assistant_delta(&mut self, delta: &str) {
-        let append_to_current = self.streamed_this_turn;
-        self.streamed_this_turn = true;
-        if append_to_current
-            && let Some(TranscriptItem::Assistant(message)) = self.transcript.last_mut()
-        {
-            message.push_str(delta);
-        } else {
-            self.transcript
-                .push(TranscriptItem::Assistant(delta.to_owned()));
+    fn conversation(&self, target: PaneId) -> Option<&Conversation> {
+        match target {
+            PaneId::Main => Some(&self.main),
+            PaneId::Btw(id) => self
+                .btw
+                .as_ref()
+                .filter(|btw| btw.id == id)
+                .map(|btw| &btw.conversation),
+        }
+    }
+
+    fn conversation_mut(&mut self, target: PaneId) -> Option<&mut Conversation> {
+        match target {
+            PaneId::Main => Some(&mut self.main),
+            PaneId::Btw(id) => self
+                .btw
+                .as_mut()
+                .filter(|btw| btw.id == id)
+                .map(|btw| &mut btw.conversation),
         }
     }
 
@@ -364,4 +587,75 @@ fn reasoning_tail(reasoning: &str) -> String {
         .collect();
     tail.insert(0, '…');
     tail
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, PaneId};
+
+    #[test]
+    fn btw_conversation_isolated_and_focus_toggles() {
+        let mut app = App::new(".".into());
+        assert_eq!(app.focus, PaneId::Main);
+        let id = app.begin_btw();
+        assert_eq!(app.focus, PaneId::Btw(id));
+        assert!(app.queue_prompt(PaneId::Btw(id), "side question".to_owned()));
+        assert_eq!(app.main.pending_turns, 0);
+        assert_eq!(app.btw.as_ref().unwrap().conversation.pending_turns, 1);
+        app.toggle_focus();
+        assert_eq!(app.focus, PaneId::Main);
+        app.toggle_focus();
+        assert_eq!(app.focus, PaneId::Btw(id));
+        assert!(app.btw_busy());
+        app.turn_finished(PaneId::Btw(id), None);
+        assert!(!app.btw_busy());
+        app.close_btw(id);
+        assert_eq!(app.focus, PaneId::Main);
+        assert!(app.btw.is_none());
+    }
+
+    #[test]
+    fn stale_btw_updates_do_not_reach_a_reopened_pane() {
+        let mut app = App::new(".".into());
+        let first = app.begin_btw();
+        app.close_btw(first);
+        let second = app.begin_btw();
+        app.btw_failed(first, "stale".to_owned());
+        assert_eq!(app.btw_id(), Some(second));
+        assert!(app.btw.as_ref().unwrap().conversation.transcript.is_empty());
+    }
+
+    #[test]
+    fn accepted_steers_and_queued_turns_have_distinct_lifecycles() {
+        let mut app = App::new(".".into());
+        app.main.running = true;
+
+        assert!(app.queue_steer(PaneId::Main, "narrow the search".to_owned()));
+        assert!(app.queue_prompt(PaneId::Main, "then summarize".to_owned()));
+        assert_eq!(app.main.pending_steers.len(), 1);
+        assert_eq!(app.main.queued_prompts.len(), 1);
+        assert_eq!(app.main.pending_turns, 1);
+
+        app.steer_accepted(PaneId::Main, "narrow the search".to_owned());
+        assert!(app.main.pending_steers.is_empty());
+        assert_eq!(app.main.queued_prompts.len(), 1);
+        assert_eq!(app.main.pending_turns, 1);
+    }
+
+    #[test]
+    fn steer_rejected_after_turn_completion_becomes_the_next_turn() {
+        let mut app = App::new(".".into());
+        app.main.running = true;
+        assert!(app.queue_steer(PaneId::Main, "one more constraint".to_owned()));
+
+        app.main.running = false;
+        app.steer_queued(PaneId::Main, "one more constraint".to_owned());
+
+        assert!(app.main.pending_steers.is_empty());
+        assert_eq!(
+            app.main.queued_prompts.front().map(String::as_str),
+            Some("one more constraint")
+        );
+        assert_eq!(app.main.pending_turns, 1);
+    }
 }
