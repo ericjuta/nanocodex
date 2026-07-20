@@ -1,17 +1,117 @@
 # Nanocodex
 
-Nanocodex is a small, headless Rust agents SDK. It is a library first: embed it
-in your process, configure the agent and its tools, submit turns through a cheap
-handle, and decide whether to consume every event or only typed final results.
-There is no required app server, JSON-RPC layer, global runtime, or UI. The CLI
-and Harbor integration in this repository are thin adapters over the same
-public library API.
+Nanocodex is a small, library-first Rust agents SDK built around the OpenAI
+Responses WebSocket API. It keeps the useful coding-agent loop—persistent
+conversations, shell and patch tools, Code Mode, MCP, steering, queueing, and
+conversation forks—without requiring an app server or making a durable agent
+control plane part of every application.
 
-The scope is deliberately narrow. Nanocodex currently runs `gpt-5.6-sol` over
-the OpenAI Responses WebSocket API, preserves one stateful session across
-follow-on prompts, and exposes its transport as a caller-composable Tower
-service. Model-generated code mode runs in local Node.js and calls the Rust tool
-registry.
+It is best understood as a deliberate alternative to embedding Codex, not as a
+drop-in reimplementation of the Codex application.
+
+## Nanocodex versus Codex
+
+Codex is a complete agent product and a large durable runtime. Nanocodex is an
+embeddable SDK: the caller owns the process, chooses the tools, and receives a
+cheap prompt handle, independently awaitable typed results, and an optional
+ordered event stream.
+
+| | Nanocodex | Codex |
+| --- | --- | --- |
+| Primary boundary | Rust library in the caller's process | Application, app server, and durable agent runtime |
+| Conversation state | One owned in-memory driver with client-owned typed history | Persisted threads and rollouts |
+| Follow-on turns | Persistent WebSocket plus a new delta and `previous_response_id` | Full Codex session lifecycle |
+| Historical forks | Exact completed response checkpoint while the mainline continues | Reconstructed or sanitized durable thread history |
+| Tools | Small Code Mode surface over caller-defined Rust tools and MCP | Broad built-in tool and integration surface |
+| Middleware | Caller-composable concrete Tower service | Codex-owned runtime policy |
+| Events | Optional typed stream independent from typed turn results | Product-wide rollout and UI event lifecycle |
+| Orchestration | Application tools; the model can generate the topology in Code Mode | First-class agents, mailboxes, task identities, budgets, and lifecycle controls |
+
+The smaller boundary is the point. A normal consumer builds an agent, receives
+`(Nanocodex, AgentEvents)`, submits prompts through a cloneable handle, and
+awaits `TurnResult`s. The CLI, Harbor adapter, Python binding, and Rust/WASM
+binding are all consumers of that same API rather than alternate runtimes.
+
+### Performance
+
+The checkpoint benchmark uses `gpt-5.6-sol`, a deterministic 600-fact prefix,
+a ten-turn conversation, and concurrent historical forks. A three-run live
+rerun on 2026-07-20 using Nanocodex `210ac85` and stock Codex CLI
+`0.145.0-alpha.18` measured:
+
+| Measurement | Nanocodex checkpoint path | Stock Codex app server | Difference |
+| --- | ---: | ---: | ---: |
+| Ten short sequential turns, median total | 14.78 s | 24.99 s | **1.69x faster** |
+| Warm turn p50, turns 3–10 | 1.304 s | 1.532 s | **1.18x faster** |
+| Historical fork to first answer, p50 | 1.570 s | 6.530 s | **4.16x faster** |
+| Historical fork model time, p50 | 1.291 s | 5.862 s | **4.54x faster** |
+
+The ten-turn totals sum request-to-completion model-turn latency. Nanocodex's
+separately measured WebSocket handshake had a 361 ms median; Codex app-server
+process and thread initialization were also outside the reported total.
+
+Nanocodex's fork sends about 725 bytes of new request data from an exact stored
+checkpoint. Replaying the same Nanocodex history would send 27–29 KB, a 97.4%
+reduction. Each child gets its own WebSocket, session, driver, service stack,
+and tool runtime while the parent continues independently.
+
+These are checkpoint-path measurements, **not a normalized full-agent quality
+or model-runtime comparison**. The Nanocodex arm deliberately uses a minimal
+benchmark developer message and no production tool definitions; the Codex arm
+runs the complete stock app-server agent with its system instructions, tools,
+and repository context. That makes the workload useful for measuring the cost
+of continuation and historical branching, but it does not establish that a
+fully configured Nanocodex agent is always 4x faster or uses 68% fewer tokens.
+The methodology, earlier trials, cache observations, and reproduction commands
+are in [`benchmarks/fork_results.md`](benchmarks/fork_results.md).
+
+On a real 41-task coding gate, Nanocodex completed 38/41 tasks with 92.23% of
+input tokens cached, zero Responses retries, and zero WebSocket reconnects.
+That demonstrates a useful coding agent, but it is not yet an apples-to-apples
+Codex quality result or a completed Terminal-Bench 2.1 leaderboard submission.
+
+### Fewer top-level tools, not necessarily fewer capabilities
+
+The model normally sees two Nanocodex tool definitions: Code Mode and its wait
+operation. Code Mode can call the nested Rust registry, which includes shell
+execution, persistent shell input, patching, planning, image inspection,
+optional web search and image generation, MCP providers, and application tools.
+The model can compose those operations in generated JavaScript with loops,
+conditionals, and `Promise.all` rather than paying for every tool as a separate
+top-level schema.
+
+For repository work, the important capabilities are still present: inspect
+files, run commands, edit code, execute tests, and repeat. Applications can add
+domain-specific tools with `#[tool]` or MCP. The smaller default surface can
+reduce prompt material and tool-selection noise, but it is not inherently a
+quality advantage; tasks that depend on a missing integration must supply it.
+
+### Tradeoffs
+
+Nanocodex intentionally gives up product breadth and durability in exchange
+for a smaller embeddable boundary:
+
+- It currently supports one model family, `gpt-5.6-sol`, through the OpenAI
+  Responses WebSocket API. It is not a provider abstraction.
+- Sessions, branches, child registries, and typed history are owned by the
+  running process. Codex is the better fit for durable threads, restart/resume,
+  detached agents, and long-lived mailbox-driven collaboration.
+- Multi-agent tools are application-defined. Nanocodex does not yet provide
+  Codex's central task registry, execution budgets, residency controls,
+  interruption, or cancellation propagation. Unbounded recursive orchestration
+  can spend tokens quickly.
+- The caller owns sandboxing, permissions, and tool policy. There is no built-in
+  approval product or compatibility app server.
+- Code Mode requires Node.js 12.22 or newer on `PATH`. Browser and computer-use
+  integrations are not built in.
+- The Ratatui client is useful but intentionally thinner than Codex's mature
+  TUI and IDE ecosystem.
+
+Choose Nanocodex when the agent belongs inside your Rust service, CLI, notebook,
+or language binding and you want direct ownership of tools, middleware,
+results, events, and fast structured branches. Choose Codex when durable
+sessions, built-in integrations, approval UX, managed subagent lifecycles, and
+a complete daily-driver product matter more than a small library boundary.
 
 ## Use the daily-driver CLI
 
