@@ -465,5 +465,7 @@ Retained jobs live under `.nanocodex/harbor/jobs`; `just view` opens them. The
 latest full 41-task gate scored 38/41 with zero Responses retries or WebSocket
 reconnects and 92.23% cached input. One task hit a transient upstream policy
 rejection after producing a verifier-passing artifact and passed an isolated
-rerun. Current architecture, validation policy, failure classifications, and
-ordered future work live in [`PLAN.md`](PLAN.md).
+rerun. The research and measurement log for a focused race-free Rust evaluation
+runner lives in [`docs/HARBOR_RS_LOG.md`](docs/HARBOR_RS_LOG.md). Current agent
+architecture, validation policy, failure classifications, and ordered future
+work live in [`PLAN.md`](PLAN.md).
