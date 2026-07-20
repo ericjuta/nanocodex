@@ -786,10 +786,7 @@ mod tests {
         assert_eq!(app.handle_escape(now), None);
         app.expire_cancel_confirmation(now + Duration::from_millis(1_001));
         assert!(!app.cancel_confirmation_active());
-        assert_eq!(
-            app.handle_escape(now + Duration::from_millis(1_002)),
-            None
-        );
+        assert_eq!(app.handle_escape(now + Duration::from_millis(1_002)), None);
         assert!(app.cancel_confirmation_active());
     }
 }

@@ -859,12 +859,12 @@ fn classify_submission(input: String) -> Submission {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::Event;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use tokio::sync::mpsc;
 
     use super::{
-        BTW_BOUNDARY, RedrawPriority, Submission, UiAction, UiModel, UiUpdate, classify_submission,
-        prepare_btw_prompt,
+        BTW_BOUNDARY, RedrawPriority, Submission, UiAction, UiModel, UiUpdate, WorkerCommand,
+        classify_submission, handle_key, prepare_btw_prompt,
     };
     use crate::tui::app::App;
 
@@ -924,5 +924,26 @@ mod tests {
             UiUpdate::Redraw(RedrawPriority::Streaming)
         );
         assert!(!ui.worker_updates_open);
+    }
+
+    #[test]
+    fn second_escape_sends_cancel_for_the_focused_turn() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        app.main.running = true;
+        app.input = "preserved draft".to_owned();
+        app.cursor = app.input.len();
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(!handle_key(escape, &mut app, &commands).unwrap());
+        assert!(worker.try_recv().is_err());
+        assert!(!handle_key(escape, &mut app, &commands).unwrap());
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::Cancel {
+                target: super::PaneId::Main
+            })
+        ));
+        assert_eq!(app.input, "preserved draft");
     }
 }
