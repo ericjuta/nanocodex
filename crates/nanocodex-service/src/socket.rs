@@ -7,7 +7,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    MaybeTlsStream, WebSocketStream,
     tungstenite::{
         Error as WebSocketError, Message, Utf8Bytes,
         client::IntoClientRequest,
@@ -15,7 +15,7 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::ResponsesError;
+use crate::{ResponsesError, connector::connect_async};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);

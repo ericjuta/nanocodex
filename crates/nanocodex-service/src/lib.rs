@@ -1,6 +1,8 @@
 mod attempt;
 mod client;
 #[cfg(not(target_family = "wasm"))]
+mod connector;
+#[cfg(not(target_family = "wasm"))]
 mod error;
 #[cfg(target_family = "wasm")]
 #[path = "error_wasm.rs"]

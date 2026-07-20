@@ -11,6 +11,7 @@ repository.workspace = true
 description = "Tower services and persistent Responses WebSocket transport for Nanocodex"
 
 [dependencies]
+http.workspace = true
 nanocodex-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +23,7 @@ tracing.workspace = true
 web-time.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+base64.workspace = true
 futures-util.workspace = true
 rustls.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
@@ -38,6 +40,7 @@ eyre.workspace = true
 simd-json.workspace = true
 smallvec.workspace = true
 sonic-rs.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [[bench]]
 name = "tower_responses"
