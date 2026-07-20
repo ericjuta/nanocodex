@@ -20,6 +20,7 @@ async fn repeated_cli_turns_search_and_call_mcp_through_the_library() -> Result<
     let output = timeout(
         std::time::Duration::from_secs(30),
         Command::new(env!("CARGO_BIN_EXE_nanocodex"))
+            .arg("run")
             .arg("--api-key")
             .arg("test-key")
             .arg("--websocket-url")
@@ -30,7 +31,6 @@ async fn repeated_cli_turns_search_and_call_mcp_through_the_library() -> Result<
             .arg("fixture=node")
             .arg("--mcp-arg")
             .arg(format!("fixture={}", fixture.display()))
-            .arg("run")
             .arg("--repeat")
             .arg(TURNS.to_string())
             .arg("exercise the fixture MCP server")

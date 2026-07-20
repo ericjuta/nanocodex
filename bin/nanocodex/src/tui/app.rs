@@ -181,7 +181,10 @@ impl Conversation {
             }
             AgentEventKind::RunFailed => {
                 self.running = false;
-                "Turn failed".clone_into(&mut self.status);
+                self.status = match event.decode_payload::<TerminalPayload>() {
+                    Ok(payload) if payload.status == "cancelled" => "Cancelled".to_owned(),
+                    _ => "Turn failed".to_owned(),
+                };
             }
             AgentEventKind::ApiEvent
             | AgentEventKind::ModelWarmupStarted
@@ -471,6 +474,33 @@ impl App {
         }
     }
 
+    pub(super) fn cancel_pending(&mut self, target: PaneId) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            "Cancelling".clone_into(&mut conversation.status);
+        }
+    }
+
+    pub(super) fn cancel_accepted(&mut self, target: PaneId) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            // RunFailed is the authoritative lifecycle event. Avoid overwriting
+            // a queued turn's RunStarted state if it has already arrived.
+            if conversation.status == "Cancelling" {
+                "Cancellation accepted".clone_into(&mut conversation.status);
+            }
+        }
+    }
+
+    pub(super) fn cancel_failed(&mut self, target: PaneId, error: String) {
+        if let Some(conversation) = self.conversation_mut(target) {
+            conversation.transcript.push(TranscriptItem::Error(error));
+            conversation.status = if conversation.running {
+                "Working".to_owned()
+            } else {
+                "Ready".to_owned()
+            };
+        }
+    }
+
     pub(super) fn is_running(&self, target: PaneId) -> bool {
         self.conversation(target)
             .is_some_and(|conversation| conversation.running)
@@ -547,6 +577,11 @@ struct TextPayload {
 #[derive(Deserialize)]
 struct ErrorPayload {
     message: String,
+}
+
+#[derive(Deserialize)]
+struct TerminalPayload {
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -657,5 +692,17 @@ mod tests {
             Some("one more constraint")
         );
         assert_eq!(app.main.pending_turns, 1);
+    }
+
+    #[test]
+    fn late_cancel_ack_does_not_overwrite_the_next_turn_state() {
+        let mut app = App::new(".".into());
+        app.main.running = true;
+        "Thinking".clone_into(&mut app.main.status);
+
+        app.cancel_accepted(PaneId::Main);
+
+        assert!(app.main.running);
+        assert_eq!(app.main.status, "Thinking");
     }
 }

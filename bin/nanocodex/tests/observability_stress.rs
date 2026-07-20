@@ -122,6 +122,7 @@ fn stress_command(
 ) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nanocodex"));
     command
+        .arg("run")
         .arg("--api-key")
         .arg(API_KEY_SENTINEL)
         .arg("--websocket-url")
@@ -146,7 +147,6 @@ fn stress_command(
             .arg("stress");
     }
     command
-        .arg("run")
         .arg("--repeat")
         .arg(turns.to_string())
         .arg(PROMPT_SENTINEL);

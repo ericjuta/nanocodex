@@ -28,21 +28,20 @@ pub(crate) struct AgentArgs {
     api_key: String,
 
     /// Working directory exposed to the coding tools.
-    #[arg(long, global = true, default_value = ".")]
+    #[arg(long, default_value = ".")]
     cwd: PathBuf,
 
     /// Reasoning effort used by the model.
-    #[arg(long, global = true, env = "OPENAI_REASONING_EFFORT", default_value_t)]
+    #[arg(long, env = "OPENAI_REASONING_EFFORT", default_value_t)]
     thinking: Thinking,
 
-    /// Replace the standard system/developer prompt.
-    #[arg(long, global = true, value_parser = NonEmptyStringValueParser::new())]
-    system_prompt: Option<String>,
+    /// Replace the standard system/developer instructions.
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    instructions: Option<String>,
 
     /// Whether standalone web search is exposed to the model.
     #[arg(
         long,
-        global = true,
         env = "NANOCODEX_WEB_SEARCH",
         default_value_t = true,
         action = ArgAction::Set
@@ -52,7 +51,6 @@ pub(crate) struct AgentArgs {
     /// Whether image generation is exposed to the model.
     #[arg(
         long,
-        global = true,
         env = "NANOCODEX_IMAGE_GENERATION",
         default_value_t = true,
         action = ArgAction::Set
@@ -62,7 +60,6 @@ pub(crate) struct AgentArgs {
     /// Expose reusable clean, forked, and follow-up child agents in Code Mode.
     #[arg(
         long,
-        global = true,
         env = "NANOCODEX_SUBAGENTS",
         default_value_t = false,
         action = ArgAction::Set
@@ -72,7 +69,6 @@ pub(crate) struct AgentArgs {
     /// Responses API WebSocket endpoint.
     #[arg(
         long,
-        global = true,
         env = "OPENAI_RESPONSES_WEBSOCKET_URL",
         default_value = "wss://api.openai.com/v1/responses"
     )]
@@ -81,7 +77,6 @@ pub(crate) struct AgentArgs {
     /// `OpenAI` HTTP API base used by standalone web search.
     #[arg(
         long,
-        global = true,
         env = "OPENAI_API_BASE_URL",
         default_value = "https://api.openai.com/v1"
     )]
@@ -122,8 +117,8 @@ impl AgentArgs {
         } else {
             builder.tools(tools)
         };
-        let builder = if let Some(prompt) = self.system_prompt {
-            builder.prompt(prompt)
+        let builder = if let Some(instructions) = self.instructions {
+            builder.instructions(instructions)
         } else {
             builder
         };
