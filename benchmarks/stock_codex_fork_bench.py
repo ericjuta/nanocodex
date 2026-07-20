@@ -21,6 +21,7 @@ class TurnMeasurement:
     thread_id: str
     turn_id: str
     latency_ms: float
+    time_to_first_output_ms: float | None
     usage: dict[str, Any] | None
     final_message: str | None
 
@@ -38,6 +39,7 @@ class AppServer:
         self.raw_usage: dict[str, dict[str, Any] | None] = {}
         self.token_usage: dict[str, dict[str, Any]] = {}
         self.final_messages: dict[str, str] = {}
+        self.first_output_at: dict[str, float] = {}
         self.reader_task: asyncio.Task[None] | None = None
         self.stderr_task: asyncio.Task[None] | None = None
 
@@ -119,6 +121,11 @@ class AppServer:
             thread_id=thread_id,
             turn_id=turn_id,
             latency_ms=(time.perf_counter() - started) * 1000,
+            time_to_first_output_ms=(
+                (self.first_output_at.pop(turn_id) - started) * 1000
+                if turn_id in self.first_output_at
+                else None
+            ),
             usage=self.raw_usage.pop(turn_id, None)
             or self.token_usage.pop(turn_id, {}).get("last"),
             final_message=self.final_messages.pop(turn_id, None),
@@ -156,6 +163,8 @@ class AppServer:
                 item = params.get("item", {})
                 if item.get("type") == "agentMessage":
                     self.final_messages[params["turnId"]] = item.get("text", "")
+            elif method == "item/agentMessage/delta":
+                self.first_output_at.setdefault(params["turnId"], time.perf_counter())
             elif "id" in message:
                 # This workload should not trigger approvals or dynamic tools.
                 await self._write(
@@ -180,23 +189,65 @@ def prefix_prompt(workload: dict[str, Any]) -> str:
             f"FACT_{index:04}=VALUE_{index:04}_ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             for index in range(workload["fact_count"])
         ),
-        "Reply only ACK_01.",
+        (
+            "Reply only ACK_01."
+            if workload["task"] == "transport_control"
+            else "Report the current ledger using the required STATE format."
+        ),
     ]
     return "\n".join(rows)
 
 
 def prompts(workload: dict[str, Any]) -> list[str]:
     values = [prefix_prompt(workload)]
-    values.extend(
-        f"Reply only ACK_{index:02}."
-        for index in range(2, workload["chain_turns"] + 1)
-    )
+    if workload["task"] == "transport_control":
+        values.extend(
+            f"Reply only ACK_{index:02}."
+            for index in range(2, workload["chain_turns"] + 1)
+        )
+    elif workload["task"] == "stateful_ledger":
+        values.extend(
+            f"Append EVENT_{index:02}=ORBIT_{index:02}. Report the current ledger using the required STATE format."
+            for index in range(2, workload["chain_turns"] + 1)
+        )
+    else:
+        raise RuntimeError(f"unknown workload task {workload['task']!r}")
     values.append(workload["mainline_prompt"])
-    values.extend(
-        f"Forked from turn {turn}. Reply only FORK_{turn:02}."
-        for turn in workload["fork_turns"]
-    )
+    if workload["task"] == "transport_control":
+        values.extend(
+            f"Forked from turn {turn}. Reply only FORK_{turn:02}."
+            for turn in workload["fork_turns"]
+        )
+    else:
+        values.extend(
+            "Without changing the ledger, report its current state using the required FORK format."
+            for _ in workload["fork_turns"]
+        )
     return values
+
+
+def ledger_state(prefix: str, count: int) -> str:
+    def probe(index: int) -> str:
+        return f"ORBIT_{index:02}" if count >= index else "UNKNOWN"
+
+    return (
+        f"{prefix} count={count:02} first=ORBIT_01 latest=ORBIT_{count:02} "
+        f"probe04={probe(4)} probe07={probe(7)} probe10={probe(10)} "
+        "anchor=VALUE_0420_ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    )
+
+
+def expected_outputs(workload: dict[str, Any]) -> tuple[list[str], str, list[str]]:
+    if workload["task"] == "transport_control":
+        chain = [f"ACK_{index:02}" for index in range(1, workload["chain_turns"] + 1)]
+        branches = [f"FORK_{index:02}" for index in workload["fork_turns"]]
+        return chain, "MAIN_11", branches
+    chain = [
+        ledger_state("STATE", index)
+        for index in range(1, workload["chain_turns"] + 1)
+    ]
+    branches = [ledger_state("FORK", index) for index in workload["fork_turns"]]
+    return chain, ledger_state("MAIN", workload["chain_turns"] + 1), branches
 
 
 def digest_strings(values: list[str]) -> str:
@@ -263,6 +314,8 @@ def cached_tokens(usage: dict[str, Any] | None) -> int | None:
 
 
 async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    args.cwd = args.cwd.resolve()
+    args.workload = args.workload.resolve()
     workload_bytes = args.workload.read_bytes()
     workload = json.loads(workload_bytes)
     if (
@@ -275,6 +328,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise RuntimeError("workload is incompatible with this parity harness")
     all_prompts = prompts(workload)
+    chain_expected, main_expected, branch_expected = expected_outputs(workload)
     if digest_strings(all_prompts) != workload["prompt_fnv1a64"]:
         raise RuntimeError("generated prompts do not match the workload digest")
     api_key = load_api_key(args.env_file)
@@ -306,7 +360,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "baseInstructions": workload["base_instructions"],
                 "config": {
                     "model_reasoning_effort": workload["reasoning_effort"],
-                    "model_reasoning_summary": "none",
+                    "model_reasoning_summary": "auto",
                     "model_verbosity": workload["text_verbosity"],
                 },
                 "experimentalRawEvents": True,
@@ -322,7 +376,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             prompt = all_prompts[index - 1]
             turn_id, started = await server.start_turn(root, prompt)
             completed = await server.wait_turn(root, turn_id, started)
-            assert_message(completed, f"ACK_{index:02}")
+            assert_message(completed, chain_expected[index - 1])
             chain.append(completed)
 
         main_id, main_started = await server.start_turn(
@@ -362,9 +416,9 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             for branch, (turn_id, started) in zip(branches, branch_starts)
         ]
         mainline, *branch_turns = await asyncio.gather(main_task, *branch_tasks)
-        assert_message(mainline, "MAIN_11")
-        for branch_turn, index in zip(branch_turns, workload["fork_turns"]):
-            assert_message(branch_turn, f"FORK_{index:02}")
+        assert_message(mainline, main_expected)
+        for branch_turn, expected in zip(branch_turns, branch_expected):
+            assert_message(branch_turn, expected)
 
         return {
             "implementation": "stock_codex",
@@ -379,14 +433,34 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "prompt_fnv1a64": digest_strings(all_prompts),
             "thread_start_wall_ms": round(thread_start_wall_ms, 1),
             "chain_turn_latency_ms": [round(turn.latency_ms, 1) for turn in chain],
+            "chain_time_to_first_output_ms": [
+                round(turn.time_to_first_output_ms, 1)
+                if turn.time_to_first_output_ms is not None
+                else None
+                for turn in chain
+            ],
+            "chain_final_messages": [turn.final_message for turn in chain],
             "chain_usage": [turn.usage for turn in chain],
             "chain_median_latency_ms": round(
                 statistics.median(turn.latency_ms for turn in chain), 1
             ),
             "fork_rpc_wall_ms": round(fork_wall_ms, 1),
             "mainline_latency_ms": round(mainline.latency_ms, 1),
+            "mainline_time_to_first_output_ms": (
+                round(mainline.time_to_first_output_ms, 1)
+                if mainline.time_to_first_output_ms is not None
+                else None
+            ),
+            "mainline_final_message": mainline.final_message,
             "mainline_usage": mainline.usage,
             "branch_latency_ms": [round(turn.latency_ms, 1) for turn in branch_turns],
+            "branch_time_to_first_output_ms": [
+                round(turn.time_to_first_output_ms, 1)
+                if turn.time_to_first_output_ms is not None
+                else None
+                for turn in branch_turns
+            ],
+            "branch_final_messages": [turn.final_message for turn in branch_turns],
             "branch_cached_tokens": [cached_tokens(turn.usage) for turn in branch_turns],
             "branch_usage": [turn.usage for turn in branch_turns],
         }

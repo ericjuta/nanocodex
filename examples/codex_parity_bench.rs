@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Deserialize, Serialize)]
 struct Workload {
     schema_version: u32,
+    task: String,
     model: String,
     reasoning_effort: String,
     text_verbosity: String,
@@ -131,7 +132,7 @@ async fn main() -> Result<()> {
     let mut chain = Vec::with_capacity(workload.chain_turns);
     let mut checkpoints = Vec::with_capacity(workload.chain_turns);
     for (index, prompt) in prompts.iter().take(workload.chain_turns).enumerate() {
-        let expected = format!("ACK_{:02}", index + 1);
+        let expected = expected_chain_output(&workload, index + 1)?;
         let (result, measurement) =
             measured_turn(&agent, &mut root_events, prompt, &expected).await?;
         checkpoints.push(result);
@@ -169,11 +170,21 @@ async fn main() -> Result<()> {
         await_result(turn_6, started_6),
         await_result(turn_9, started_9),
     )?;
+    let main_expected = expected_mainline_output(&workload)?;
+    let branch_expected = workload
+        .fork_turns
+        .iter()
+        .map(|turn| expected_branch_output(&workload, *turn))
+        .collect::<Result<Vec<_>>>()?;
     let mainline =
-        measurement_after_result(main_result, &mut root_events, main_latency, "MAIN_11").await?;
-    let branch_3 = measurement_after_result(result_3, &mut events_3, latency_3, "FORK_03").await?;
-    let branch_6 = measurement_after_result(result_6, &mut events_6, latency_6, "FORK_06").await?;
-    let branch_9 = measurement_after_result(result_9, &mut events_9, latency_9, "FORK_09").await?;
+        measurement_after_result(main_result, &mut root_events, main_latency, &main_expected)
+            .await?;
+    let branch_3 =
+        measurement_after_result(result_3, &mut events_3, latency_3, &branch_expected[0]).await?;
+    let branch_6 =
+        measurement_after_result(result_6, &mut events_6, latency_6, &branch_expected[1]).await?;
+    let branch_9 =
+        measurement_after_result(result_9, &mut events_9, latency_9, &branch_expected[2]).await?;
 
     let mut chain_latencies = chain.iter().map(|turn| turn.latency_ms).collect::<Vec<_>>();
     chain_latencies.sort_by(f64::total_cmp);
@@ -290,18 +301,82 @@ fn prompts(workload: &Workload) -> Vec<String> {
         let fact = format!("FACT_{index:04}=VALUE_{index:04}_ABCDEFGHIJKLMNOPQRSTUVWXYZ");
         first.push_str(&fact);
     }
-    first.push_str("\nReply only ACK_01.");
+    match workload.task.as_str() {
+        "transport_control" => first.push_str("\nReply only ACK_01."),
+        "stateful_ledger" => {
+            first.push_str("\nReport the current ledger using the required STATE format.");
+        }
+        _ => {}
+    }
 
     let mut prompts = vec![first];
-    prompts.extend((2..=workload.chain_turns).map(|index| format!("Reply only ACK_{index:02}.")));
+    match workload.task.as_str() {
+        "transport_control" => prompts.extend(
+            (2..=workload.chain_turns).map(|index| format!("Reply only ACK_{index:02}.")),
+        ),
+        "stateful_ledger" => prompts.extend((2..=workload.chain_turns).map(|index| {
+            format!(
+                "Append EVENT_{index:02}=ORBIT_{index:02}. Report the current ledger using the required STATE format."
+            )
+        })),
+        _ => {}
+    }
     prompts.push(workload.mainline_prompt.clone());
-    prompts.extend(
-        workload
-            .fork_turns
-            .iter()
-            .map(|turn| format!("Forked from turn {turn}. Reply only FORK_{turn:02}.")),
-    );
+    match workload.task.as_str() {
+        "transport_control" => prompts.extend(
+            workload
+                .fork_turns
+                .iter()
+                .map(|turn| format!("Forked from turn {turn}. Reply only FORK_{turn:02}.")),
+        ),
+        "stateful_ledger" => prompts.extend(workload.fork_turns.iter().map(|_| {
+            String::from(
+                "Without changing the ledger, report its current state using the required FORK format.",
+            )
+        })),
+        _ => {}
+    }
     prompts
+}
+
+fn ledger_state(prefix: &str, count: usize) -> String {
+    let probe = |index| {
+        if count >= index {
+            format!("ORBIT_{index:02}")
+        } else {
+            String::from("UNKNOWN")
+        }
+    };
+    format!(
+        "{prefix} count={count:02} first=ORBIT_01 latest=ORBIT_{count:02} probe04={} probe07={} probe10={} anchor=VALUE_0420_ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        probe(4),
+        probe(7),
+        probe(10)
+    )
+}
+
+fn expected_chain_output(workload: &Workload, turn: usize) -> Result<String> {
+    match workload.task.as_str() {
+        "transport_control" => Ok(format!("ACK_{turn:02}")),
+        "stateful_ledger" => Ok(ledger_state("STATE", turn)),
+        task => bail!("unknown workload task {task:?}"),
+    }
+}
+
+fn expected_mainline_output(workload: &Workload) -> Result<String> {
+    match workload.task.as_str() {
+        "transport_control" => Ok(String::from("MAIN_11")),
+        "stateful_ledger" => Ok(ledger_state("MAIN", workload.chain_turns + 1)),
+        task => bail!("unknown workload task {task:?}"),
+    }
+}
+
+fn expected_branch_output(workload: &Workload, turn: usize) -> Result<String> {
+    match workload.task.as_str() {
+        "transport_control" => Ok(format!("FORK_{turn:02}")),
+        "stateful_ledger" => Ok(ledger_state("FORK", turn)),
+        task => bail!("unknown workload task {task:?}"),
+    }
 }
 
 fn checkpoint(results: &[TurnResult], turn: usize) -> Result<&TurnResult> {
@@ -351,6 +426,10 @@ fn validate_workload(workload: &Workload) -> Result<()> {
         || workload.text_verbosity != "low"
         || workload.chain_turns != 10
         || workload.fork_turns != [3, 6, 9]
+        || !matches!(
+            workload.task.as_str(),
+            "transport_control" | "stateful_ledger"
+        )
     {
         bail!("workload is incompatible with this parity harness");
     }
