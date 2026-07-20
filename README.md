@@ -218,7 +218,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 persistent WebSocket, and retry/reconnect policy. Node.js 12.22 or newer must be
 available on `PATH` for model-generated code mode.
 
-### Follow-on prompts and events
+### API at a glance
+
+The API separates configuration, command submission, control, and completion.
+Callers never manage response IDs, turn IDs, socket tasks, history replay, or
+tool results:
+
+| Intent | API | Resulting behavior |
+| --- | --- | --- |
+| Use all defaults | `Nanocodex::new(api_key)` | Starts one owned agent and returns its handle plus optional events |
+| Configure policy | `Nanocodex::builder(api_key)` | Sets instructions, thinking, workspace, tools, session identity, and Responses policy before startup |
+| Submit ordinary input | `agent.prompt(input).await` | Appends one FIFO turn and returns an independently awaitable `Turn` |
+| Add input to the active turn | `turn.steer(input).await` | Joins that exact turn at its next safe model boundary |
+| Split result and control ownership | `turn.control()` | Returns a cloneable `TurnControl` for another task |
+| Stop exact work | `turn.cancel().await` | Removes a queued turn or stops an active turn and its subprocesses |
+| Continue normally | `agent.prompt(input).await` again | Reuses retained history, WebSocket, tools, and response chain automatically |
+| Branch from the latest commit | `agent.fork().await` | Starts an independent agent at the latest completed checkpoint |
+| Branch from an older commit | `agent.fork_from(&result).await` | Starts an independent agent at that exact historical `TurnResult` |
+| Build a clean child inside a tool | `handle.spawn().await` | Reuses private builder policy without inheriting conversation context |
+| Build a contextual child inside a tool | `handle.fork().await` | Forks the invoking agent rather than accidentally targeting the root |
+
+`Turn` is the capability for unfinished work: it can be steered, cancelled, or
+consumed by `result()`. `TurnResult` represents committed work: it contains the
+final message and an opaque immutable checkpoint, but has no steering or
+cancellation methods. `AgentHandle` is a weak, per-driver capability supplied
+only to tools factories; it does not keep its parent alive or expose the API key.
+
+### Turns, queueing, steering, and cancellation
 
 `build()` spawns the stateful agent driver and returns `(Nanocodex,
 AgentEvents)`. `Nanocodex` is a cheap, cloneable command handle. Calling
@@ -236,11 +262,13 @@ model work, Code Mode cells, and shell process groups have stopped. In either
 case the result resolves to the typed `NanocodexError::TurnCancelled`. Partial
 model and tool work is discarded, and the next surviving prompt resumes from
 the last completed checkpoint. Queued cancellation is acknowledged immediately,
-while its result and terminal event retain FIFO event order behind earlier turns. If
-one task must await the result while another controls it, clone
-`turn.control()` before moving the `Turn` into the result task. Completed
-`TurnResult`s are deliberately inert; historical branching remains
-`agent.fork_from(&result)` because a fork creates another owned agent lifecycle.
+while its result and terminal event retain FIFO event order behind earlier
+turns. If one task must await the result while another controls it, clone
+`turn.control()` before moving the `Turn` into the result task. Normal code can
+call `steer` and `cancel` directly on `Turn`; the separate control value is only
+needed when ownership splits. Completed `TurnResult`s are deliberately inert;
+historical branching remains `agent.fork_from(&result)` because a fork creates
+another owned agent lifecycle.
 
 ```rust
 use nanocodex::{Nanocodex, NanocodexError};
@@ -301,6 +329,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 independent from turn results. A server, TUI, notebook, or language binding can
 translate all events, select a subset, or ignore them without changing prompt
 and result handling.
+
+### Fork conversations without stopping the mainline
+
+Forks contain only committed work. If the root has an active turn,
+`agent.fork()` uses its latest completed checkpoint and excludes partial model
+output and tool work. `agent.fork_from(&result)` can branch from any retained
+historical result while the root continues advancing. Each branch gets a fresh
+driver, WebSocket, event stream, response chain, service stack, and tool runtime;
+immutable typed history and the cache lineage remain shared.
+
+```rust
+use nanocodex::Nanocodex;
+
+# async fn branching(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
+let (root, _) = Nanocodex::new(api_key)?;
+let historical_checkpoint = root
+    .prompt("Record early decision A.")
+    .await?
+    .result()
+    .await?;
+root.prompt("Record later decision B.")
+    .await?
+    .result()
+    .await?;
+
+// The root can keep running while old and latest checkpoints are forked.
+let root_turn = root.prompt("Add in-flight mainline decision C.").await?;
+let ((historical, _), (latest, _)) = tokio::try_join!(
+    root.fork_from(&historical_checkpoint),
+    root.fork(),
+)?;
+
+let historical_turn = historical.prompt("Explore an alternative to A.").await?;
+let latest_turn = latest.prompt("Review the latest committed context.").await?;
+let (root_result, historical_result, latest_result) = tokio::try_join!(
+    root_turn.result(),
+    historical_turn.result(),
+    latest_turn.result(),
+)?;
+
+println!("root: {}", root_result.final_message);
+println!("historical: {}", historical_result.final_message);
+println!("latest: {}", latest_result.final_message);
+# Ok(())
+# }
+```
+
+The checkpoint and provider-side `previous_response_id` are intentionally
+opaque. A healthy fork sends only its new input from the stored checkpoint. If
+that checkpoint is missing, Nanocodex drops the ID once and replays its
+client-owned committed history before returning to incremental requests.
+
+### Handle typed errors
+
+Lifecycle failures are direct `NanocodexError` variants, so common control flow
+does not require a nested agent-error match. Transport and API failures preserve
+their typed source even through caller-provided Tower middleware:
+
+```rust
+use nanocodex::{NanocodexError, ResponsesError};
+
+# fn handle(error: NanocodexError) -> Result<(), NanocodexError> {
+match &error {
+    NanocodexError::TurnCancelled => return Ok(()),
+    NanocodexError::TurnNotSteerable => eprintln!("submit a new prompt instead"),
+    _ => {}
+}
+
+if matches!(
+    error.responses_error(),
+    Some(ResponsesError::InvalidImageRequest { .. })
+) {
+    eprintln!("the Responses API rejected the image payload");
+}
+
+Err(error)
+# }
+```
+
+The error surface distinguishes invalid configuration, workspace and project
+instruction I/O, stopped agents, turn lifecycle conflicts, checkpoint lineage,
+tool construction, Responses transport/service failures, and caller middleware
+failures. Source details remain available through the standard `Error::source`
+chain as well as `responses_error()`.
 
 ### Define custom tools
 
@@ -480,6 +592,8 @@ pretend direct browser authentication works and does not ship a relay; the
 embedding application supplies an already-authorized endpoint or custom
 `createWebSocket` implementation.
 
+### Let Code Mode orchestrate application-defined agents
+
 [`subagents.rs`](examples/subagents.rs) shows that delegation does not require a
 multi-agent subsystem in the library. Its application-defined Code Mode tools
 contrast `spawn_agent`, which builds an independent conversation, with
@@ -518,6 +632,26 @@ Responses stack. `.instructions(...)` configures the stable system/developer
 instructions; `.prompt(...)` on the built handle submits only user input. The
 workspace is fixed for the owned session at build time and cannot be changed by
 a later prompt or steer.
+
+Factories are conditional, not the default. Pass a completed `Tools` value to
+`.tools(tools)` for stateless or shareable handlers. Use
+`.tools_factory(|handle| ...)` only when every root, fork, and clean child needs
+a fresh tool collection or a tool must target its invoking agent through that
+weak `AgentHandle`. The factory receives no credentials; spawned agents reuse
+the builder's private API key and configuration automatically.
+
+The same distinction applies to Responses services. Use `.layer(...)` to wrap
+the standard persistent-WebSocket and retry implementation. Use
+`.service(|| make_stack())` only when replacing the complete Tower service. A
+replacement is always a factory because cancellation recovery and independent
+branches require fresh mutable service and connection state; a one-off service
+instance could not satisfy those lifecycle guarantees.
+
+The concrete Responses configuration is carried in `NanocodexBuilder`'s type,
+so `build()` is available only when the selected layer or service satisfies the
+complete `Service<ResponsesAttempt>` contract. This keeps dispatch generic and
+unboxed while leaving socket tasks, queue capacities, and mutable run state
+private.
 
 Add `tower = { version = "0.5", features = ["limit", "timeout"] }` when
 composing the middleware used below.
