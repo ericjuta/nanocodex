@@ -227,8 +227,8 @@ fn render_pending(frame: &mut Frame<'_>, conversation: &Conversation, area: Rect
 }
 
 fn prompt_preview(prompt: &str) -> String {
-    let mut preview = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     const MAX_CHARS: usize = 96;
+    let mut preview = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if preview.chars().count() > MAX_CHARS {
         preview = preview.chars().take(MAX_CHARS - 1).collect();
         preview.push('…');

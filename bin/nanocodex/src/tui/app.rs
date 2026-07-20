@@ -72,7 +72,7 @@ impl Conversation {
 
     fn queue_steer(&mut self, prompt: String) {
         self.pending_steers.push_back(prompt);
-        self.status = "Steer pending".to_owned();
+        "Steer pending".clone_into(&mut self.status);
         self.scroll_from_bottom = 0;
     }
 
