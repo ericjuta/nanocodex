@@ -30,19 +30,27 @@ server or durable control plane.
 ```rust
 let (agent, _events) = Nanocodex::new(api_key)?;
 
-let turn = agent.prompt("Inspect this repository.").await?;       // accepted now
-let _control = turn.control();                                    // optional cloneable control
-turn.steer("Focus on the failing tests.").await?;                 // same active turn
-let checkpoint = turn.result().await?;                            // completed result + checkpoint
+// Accepted now.
+let turn = agent.prompt("Inspect this repository.").await?;
+// Optional cloneable control.
+let _control = turn.control();
+// Steer the same active turn.
+turn.steer("Focus on the failing tests.").await?;
+// Completed result and checkpoint.
+let checkpoint = turn.result().await?;
 
 let _follow_on = agent.prompt("Now propose a fix.").await?.result().await?;
 
 let turn = agent.prompt("Run a long investigation.").await?;
-turn.cancel().await?;                                             // queued or active
-let _cancelled = turn.result().await;                             // Err(TurnCancelled)
+// Cancel queued or active work.
+turn.cancel().await?;
+// Returns Err(TurnCancelled).
+let _cancelled = turn.result().await;
 
-let (latest, _events) = agent.fork().await?;                      // latest completed state
-let (historical, _events) = agent.fork_from(&checkpoint).await?;  // exact older state
+// Fork from the latest completed state.
+let (latest, _events) = agent.fork().await?;
+// Fork from the exact older state.
+let (historical, _events) = agent.fork_from(&checkpoint).await?;
 ```
 
 `prompt().await` means accepted, not completed. The agent retains conversation
@@ -315,11 +323,16 @@ Architecture and current work are tracked in [`PLAN.md`](PLAN.md); benchmark
 runner research lives in [`docs/HARBOR_RS_LOG.md`](docs/HARBOR_RS_LOG.md).
 
 ```sh
-just bootstrap      # install pinned host dependencies
-just run            # native smoke
-just prepare-evals  # build and cache benchmark inputs
-just eval           # run the pinned Terminal-Bench suite
-just view           # inspect retained Harbor jobs
+# Install pinned host dependencies.
+just bootstrap
+# Run the native smoke test.
+just run
+# Build and cache benchmark inputs.
+just prepare-evals
+# Run the pinned Terminal-Bench suite.
+just eval
+# Inspect retained Harbor jobs.
+just view
 ```
 
 ## Nanocodex versus Codex
