@@ -32,15 +32,29 @@ class WebSearchContractTests(unittest.TestCase):
         agent._effort = "low"
 
         agent._web_search = True
+        agent._subagents = False
         self.assertEqual(
-            agent._run_arguments("test prompt")[-3:],
-            ["--web-search", "true", "test prompt"],
+            agent._run_arguments("test prompt")[-6:],
+            ["--web-search", "true", "--subagents", "false", "--", "test prompt"],
         )
 
         agent._web_search = False
+        agent._subagents = True
         self.assertEqual(
-            agent._run_arguments("test prompt")[-3:],
-            ["--web-search", "false", "test prompt"],
+            agent._run_arguments("test prompt")[-6:],
+            ["--web-search", "false", "--subagents", "true", "--", "test prompt"],
+        )
+
+    def test_run_arguments_protect_a_prompt_that_starts_with_a_hyphen(self) -> None:
+        agent = object.__new__(NanocodexAgent)
+        agent._model = "test-model"
+        agent._effort = "low"
+        agent._web_search = False
+        agent._subagents = False
+
+        self.assertEqual(
+            agent._run_arguments("- benchmark instruction")[-2:],
+            ["--", "- benchmark instruction"],
         )
 
     def test_terminal_bench_disables_web_search(self) -> None:
@@ -50,6 +64,30 @@ class WebSearchContractTests(unittest.TestCase):
         )
 
         self.assertIs(config["agents"][0]["kwargs"]["web_search"], False)
+
+    def test_only_subagent_retry_arm_enables_subagents(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        baseline = yaml.safe_load(
+            (repository / "evals" / "terminal-bench-2-1.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        high = yaml.safe_load(
+            (repository / "evals" / "terminal-bench-2-1-high-failures.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        subagents = yaml.safe_load(
+            (
+                repository
+                / "evals"
+                / "terminal-bench-2-1-subagents-high-failures.yaml"
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertNotIn("subagents", baseline["agents"][0]["kwargs"])
+        self.assertNotIn("subagents", high["agents"][0]["kwargs"])
+        self.assertIs(subagents["agents"][0]["kwargs"]["subagents"], True)
 
 
 class ContextParityContractTests(unittest.TestCase):
@@ -641,6 +679,7 @@ class InterruptedRunContractTests(unittest.TestCase):
         agent = object.__new__(NanocodexAgent)
         agent.logs_dir = logs_dir
         agent._run_interrupted = interrupted
+        agent._run_failed = False
         agent.logger = logging.getLogger("harbor_adapter.test_agent")
         return agent
 
@@ -677,6 +716,21 @@ class InterruptedRunContractTests(unittest.TestCase):
             logs_dir = Path(directory)
             self._write_partial_stream(logs_dir)
             agent = self._agent(logs_dir, interrupted=True)
+            context = AgentContext()
+
+            agent.populate_context_post_run(context)
+
+            self.assertTrue(context.is_empty())
+
+    def test_empty_stream_is_best_effort_after_agent_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logs_dir = Path(directory)
+            (logs_dir / "input.jsonl").write_text(
+                json.dumps({"instruction": "test"}) + "\n", encoding="utf-8"
+            )
+            (logs_dir / "events.jsonl").write_text("", encoding="utf-8")
+            agent = self._agent(logs_dir, interrupted=False)
+            agent._run_failed = True
             context = AgentContext()
 
             agent.populate_context_post_run(context)

@@ -26,6 +26,7 @@ RUN mkdir bin/nanocodex/src \
         bindings/wasm/src \
         crates/nanocodex/src \
         crates/nanocodex-core/src \
+        crates/nanocodex-core/benches \
         crates/nanocodex-macros/src \
         crates/nanocodex-mcp/src \
         crates/nanocodex-observability/src \
@@ -37,6 +38,7 @@ RUN mkdir bin/nanocodex/src \
     printf '\n' > bindings/wasm/src/lib.rs && \
     printf '\n' > crates/nanocodex/src/lib.rs && \
     printf '\n' > crates/nanocodex-core/src/lib.rs && \
+    printf 'fn main() {}\n' > crates/nanocodex-core/benches/fork_history.rs && \
     printf '\n' > crates/nanocodex-macros/src/lib.rs && \
     printf '\n' > crates/nanocodex-mcp/src/lib.rs && \
     printf '\n' > crates/nanocodex-observability/src/lib.rs && \
@@ -47,7 +49,9 @@ RUN mkdir bin/nanocodex/src \
     printf 'fn main() {}\n' > examples/follow_on.rs && \
     printf 'fn main() {}\n' > examples/custom_tool.rs && \
     printf 'fn main() {}\n' > examples/subagents.rs && \
-    printf 'fn main() {}\n' > examples/mcp.rs
+    printf 'fn main() {}\n' > examples/mcp.rs && \
+    printf 'fn main() {}\n' > examples/fork_conversations.rs && \
+    printf 'fn main() {}\n' > examples/fork_checkpoint_bench.rs
 RUN --mount=type=cache,id=nanocodex-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=nanocodex-target-${TARGETARCH},target=/build/target \
     cargo build --locked --profile "${CARGO_PROFILE}"

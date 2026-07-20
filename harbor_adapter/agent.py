@@ -59,6 +59,7 @@ class NanocodexAgent(BaseInstalledAgent):
         model_name: str | None = None,
         effort: str = "low",
         web_search: bool = True,
+        subagents: bool = False,
         install_node: bool = False,
         system_prompt_path: str | Path | None = None,
         agents_md_path: str | Path | None = None,
@@ -81,12 +82,14 @@ class NanocodexAgent(BaseInstalledAgent):
             raise ValueError(f"nanocodex supports only {MODEL}, got {self._model}")
         self._effort = effort
         self._web_search = web_search
+        self._subagents = subagents
         self._install_node = install_node
         self._system_prompt_path = self._resolve_context_file(
             system_prompt_path, "system prompt"
         )
         self._agents_md_path = self._resolve_context_file(agents_md_path, "AGENTS.md")
         self._run_interrupted = False
+        self._run_failed = False
 
     @staticmethod
     def name() -> str:
@@ -159,10 +162,14 @@ class NanocodexAgent(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         self._run_interrupted = False
+        self._run_failed = False
         try:
             await self._run_to_completion(instruction, environment, context)
         except asyncio.CancelledError:
             self._run_interrupted = True
+            raise
+        except Exception:
+            self._run_failed = True
             raise
 
     async def _run_to_completion(
@@ -182,7 +189,12 @@ class NanocodexAgent(BaseInstalledAgent):
         command = (
             f'api_key=$(<{self._API_KEY_FILE}) && test -n "$api_key" && '
             f'rm -f {self._API_KEY_FILE} && OPENAI_API_KEY="$api_key" '
-            "PATH=$PATH:/opt/nanocodex-verifier/bin "
+            + (
+                "NANOCODEX_SUBAGENT_JSONL=1 "
+                if getattr(self, "_subagents", False)
+                else ""
+            )
+            + "PATH=$PATH:/opt/nanocodex-verifier/bin "
             + " ".join(shlex.quote(argument) for argument in arguments)
             + f" 2> {self._STDERR} | tee {self._EVENTS}"
         )
@@ -204,6 +216,9 @@ class NanocodexAgent(BaseInstalledAgent):
             self._effort,
             "--web-search",
             str(self._web_search).lower(),
+            "--subagents",
+            str(getattr(self, "_subagents", False)).lower(),
+            "--",
             prompt,
         ]
 
@@ -211,10 +226,13 @@ class NanocodexAgent(BaseInstalledAgent):
         try:
             self._populate_context_post_run_strict(context)
         except Exception:
-            if not self._run_interrupted:
+            if not (
+                getattr(self, "_run_interrupted", False)
+                or getattr(self, "_run_failed", False)
+            ):
                 raise
             self.logger.debug(
-                "skipping strict nanocodex trajectory validation after run cancellation",
+                "skipping strict nanocodex trajectory validation after an incomplete run",
                 exc_info=True,
             )
 
