@@ -72,6 +72,8 @@
   dropped.
 - One agent reuses its WebSocket, typed history, code-mode runtime, shell
   sessions, stable cache key, and response chain across sequential turns.
+- Agent-relative tools are instantiated per driver with weak self capabilities;
+  a fork must never inherit a handler that still targets its parent driver.
 - `prompt().await` waits only for command acceptance and returns an independently
   awaitable `Turn`. Prompt queueing order is owned by the driver.
 - Client-owned typed history is authoritative. Healthy turns send only the new
@@ -79,8 +81,10 @@
   replays complete committed history.
 - Commit only completed responses. A failed partial response must not execute a
   tool or enter history.
-- Preserve `store: false`, stable prompt/cache identity, and byte-stable shared
-  prefixes across turns, retries, compaction, and reconnects.
+- Preserve stable prompt/cache identity and byte-stable shared prefixes across
+  turns, retries, compaction, and reconnects. Stored Responses checkpoints are
+  an optional transport optimization for branching; complete client-owned typed
+  history remains authoritative and is replayed when a checkpoint is missing.
 - Cancellation and process cleanup are explicit. Timeout or cancellation must
   terminate subprocess groups and descendants.
 
@@ -145,6 +149,9 @@
 - Keep the promoted Ratatui, PyO3, and Node/browser WASM consumers as thin
   adapters over the owned session API; they must consume, not reshape, the
   library contract. Do not add browser/computer use, JJ review provenance,
-  graders, or local multi-agent scheduling until separately promoted.
-- Do not expose turn IDs, steering, or branching in the default prompt API
-  before those behaviors are implemented end to end.
+  graders, or a generic local multi-agent scheduler. Application-owned Code
+  Mode child tools and the Ratatui `/btw` fork remain thin consumers of the
+  owned session API rather than core scheduling concepts.
+- Do not expose raw transport response IDs or internal turn IDs. Branching may
+  be exposed through opaque checkpoints on completed typed turn results only
+  after the behavior is implemented end to end.

@@ -33,6 +33,14 @@ composer, and Ctrl+C to exit. Use `--cwd`, `--thinking`, `--system-prompt`,
 `--web-search`, and `--image-generation` to configure the session; `--prompt`
 submits an initial turn immediately.
 
+After at least one completed turn, enter `/btw <question>` to fork the latest
+checkpoint into a right-hand side conversation. The main thread keeps running
+on its original WebSocket. Press BackTab to switch panes and `/close` to dismiss
+an idle BTW branch. While a turn is running, Enter steers that turn at its next
+safe model/tool boundary and Tab explicitly queues a follow-up turn. Pending
+steers and queued turns remain visibly separate. Active or queued BTW turns must
+finish first because the public cancellation contract is not yet exposed.
+
 The headless adapter remains available for scripts and evals. Its stdout is
 flushed JSONL only:
 
@@ -98,6 +106,11 @@ available on `PATH` for model-generated code mode.
 AgentEvents)`. `Nanocodex` is a cheap, cloneable command handle. Calling
 `prompt(...)` accepts and queues a turn, then immediately returns a `Turn`; the
 agent continues independently until `turn.result()` is awaited.
+`steer(...)` instead targets the currently active turn. It acknowledges only
+after the instruction enters that turn's bounded FIFO and returns a typed error
+when no turn is active or the steering queue is full. Steering is sampled only
+between complete model responses and tool outputs; it does not create another
+`Turn` or another terminal event.
 
 The session retains the complete typed conversation history. A follow-on prompt
 does **not** need the previous `final_message`, transcript, response ID, or tool
@@ -176,6 +189,12 @@ image-generation integrations enabled. Use `.without_defaults()` to disable
 those optional integrations before adding application tools. The core local
 coding tools remain available through code mode.
 
+Manual `Tool` implementations return `ToolResult`, so input decoding and SDK
+operations compose with `?`. The runtime converts `Err` into a failed
+model-visible tool result, allowing the model to recover without terminating
+the agent turn. An explicit `Ok(ToolExecution { success: false, .. })` is
+reserved for preserving structured failure payloads from remote tool protocols.
+
 For dynamic state, freeform inputs, multimodal outputs, metadata, or custom
 decoding, implement the public `Tool` trait directly and register the value with
 the same `.tool(...)` method. Internal and external tools use the same
@@ -190,6 +209,7 @@ cargo run -p nanocodex-examples --bin minimal
 cargo run -p nanocodex-examples --bin follow-on
 cargo run -p nanocodex-examples --bin custom-tool
 cargo run -p nanocodex-examples --bin subagents
+cargo run -p nanocodex-examples --bin fork-conversations
 cargo run -p nanocodex-examples --bin mcp
 ```
 
@@ -312,14 +332,34 @@ embedding application supplies an already-authorized endpoint or custom
 `createWebSocket` implementation.
 
 [`subagents.rs`](examples/subagents.rs) shows that delegation does not require a
-multi-agent subsystem in the library. Its application-defined `spawn_agent`
-tool builds an independent `Nanocodex` for each task; the parent can invoke
-several of them concurrently from code mode with `Promise.all`. The example
-keeps delegation one level deep by leaving `spawn_agent` out of each child's
-tool registry. It also routes every parent and child `AgentEvent` through one
-host-owned writer, producing a unified JSONL stream with a global `stream_seq`
-and a tagged `source` while retaining each event's session-local `request_id`
-and `seq`.
+multi-agent subsystem in the library. Its application-defined Code Mode tools
+contrast `spawn_agent`, which builds an independent conversation, with
+`fork_agent`, which forks the invoking agent's latest completed checkpoint
+while that agent's turn is running. Both return an `agent_id`; `prompt_agent`
+uses it for follow-on turns through the same child's retained conversation,
+response chain, cache lineage, WebSocket, and tools. A per-driver
+`tools_factory` creates a new handler around a weak `AgentHandle` for every
+root, child, and grandchild.
+`AgentHandle::spawn()` starts a clean conversation while privately reusing the
+builder's credentials, model, workspace policy, service factory, and tools
+factory; `AgentHandle::fork()` inherits the invoking agent's latest commit.
+Recursive children therefore have the correct parent without a self-reference
+cycle or API-key plumbing. A weak application-owned child registry retains only
+cheap `Nanocodex` handles, and its mutex is released before each follow-up model
+turn. The host does not encode a DAG: given a high-level goal, Code Mode chooses
+worker count, context strategy, concurrency, follow-ups, sequencing, and
+synthesis. Pass a quoted command-line goal to replace the built-in architecture
+decision. Because typed events are optional and orthogonal to turn results, the
+example prints only the root's final answer by default. Set
+`NANOCODEX_SUBAGENT_JSONL=1` to send child lifecycle events to stderr using
+their native request IDs and sequence numbers, without introducing a merged
+event protocol.
+
+[`fork_conversations.rs`](examples/fork_conversations.rs) is the direct API
+tour. It configures a cloneable Tower stack, builds ten meaningful checkpoints,
+forks exact historical turns while the mainline advances, demonstrates a
+latest-checkpoint fork, and proves that later and branch-only facts remain
+isolated.
 
 ### Configure the agent and Tower stack
 

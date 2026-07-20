@@ -229,8 +229,12 @@ or whole-history clone and truncation.
 
 - `fork()` returns a normal `(Nanocodex, AgentEvents)` pair with its own driver,
   Tower service, WebSocket, response chain, and `ToolRuntime`. Immutable tool
-  definitions and MCP provider clients may be shared; shell sessions and Code
-  Mode state may not.
+  definitions, stateless handlers, and MCP provider clients may be shared;
+  shell sessions and Code Mode state may not. Agent-relative handlers use a
+  per-driver tools factory and receive a weak `AgentHandle` bound to the
+  invoking driver. The handle creates either a clean child with builder-owned
+  private configuration or a contextual fork, so callers never pass API keys
+  into tools and recursive delegation cannot accidentally target the root.
 - Never clone the current standard `ResponsesService` for a branch because its
   clone shares connection state. Retain a factory that can build a fresh
   service stack. Standard services always support forks; deferred cloneable
@@ -239,11 +243,14 @@ or whole-history clone and truncation.
 - Give every branch a unique session/request identity while preserving a shared
   lineage cache key and byte-stable prompt prefix. Decouple those concepts in
   `RequestProfile` before exposing forks.
-- With `store: false`, a child's first model call replays its shared prefix once
-  on the fresh connection without a parent `previous_response_id`. Later child
-  turns use their own delta and response chain. Concurrent branches must
-  actually overlap on distinct connections rather than serialize through a
-  shared connection mutex.
+- Store completed Responses so a child can begin on a fresh connection from its
+  parent's opaque `previous_response_id` without uploading the shared prefix.
+  Keep complete client-owned typed history as the durable source of truth. If
+  the server checkpoint is absent or expired, retry once without the ID and
+  replay the exact byte-stable prefix plus committed history. Later child turns
+  use their own delta and response chain. Concurrent branches must actually
+  overlap on distinct connections rather than serialize through a shared
+  connection mutex.
 
 #### Delivery order
 
@@ -255,9 +262,10 @@ or whole-history clone and truncation.
    and replay benchmarks before adding the public fork operation.
 4. Add fresh service-stack factories, separate lineage/cache identity from
    session identity, and expose latest-committed `fork()`.
-5. Promote historical `fork_from(...)` only with a concrete consumer. Do not
-   add an app-server protocol, persistence journal, side-conversation UI, or
-   generic scheduler in this phase.
+5. Promote historical `fork_from(...)` with the public ledger consumer. Keep
+   Code Mode child orchestration application-owned, and add one thin Ratatui
+   `/btw` consumer over latest-checkpoint forks. Do not add an app-server
+   protocol, persistence journal, or generic core scheduler in this phase.
 
 Gate:
 
@@ -265,15 +273,22 @@ Gate:
   placement; no-active, stale, and terminal-race rejection; cancellation and
   descendant cleanup; and exactly one terminal result/event per accepted turn.
 - Fork tests cover active-turn exclusion, historical checkpoint isolation, and
-  compaction isolation. Branching a large retained trace shares segment
-  pointers, performs no `ResponseItem` clone/flatten, and grows memory with new
-  branch tails rather than branch count times retained history.
-- Captured requests prove that a child first replays the exact byte-stable
-  prefix with the lineage cache key and no parent response ID, then sends only
-  deltas. Concurrent branch tests prove distinct connections and overlapping
-  execution.
+  compaction isolation. Per-driver tool tests prove recursive parentage and that
+  weak fork handles do not retain stopped drivers. Branching a large retained
+  trace shares segment pointers, performs no `ResponseItem` clone/flatten, and
+  grows memory with new branch tails rather than branch count times retained
+  history.
+- Captured requests prove that a healthy child sends only its delta with the
+  lineage cache key and parent response ID. Checkpoint-miss tests prove a single
+  fallback replay of the exact byte-stable prefix and committed history before
+  returning to deltas. Concurrent branch tests prove distinct connections and
+  overlapping execution.
 - Reconnect replay, cache-prefix invariants, the default one-prompt program, and
   all existing result/event consumers remain unchanged.
+- The Code Mode example contrasts an independent child with a checkpoint fork
+  inside one parent turn. The Ratatui `/btw` path keeps main and side events,
+  queues, transcripts, and mutable runtimes isolated while allowing focus to
+  switch without interrupting either turn.
 
 ### Phase 3: bindings and richer consumers (complete foundation)
 
@@ -287,6 +302,9 @@ embedded consumers of the same handle/turn/event contract:
   capabilities and application-defined tools.
 - Browser credentials/endpoints remain application policy. The SDK does not
   introduce an app server, relay, daemon, or JSON-RPC boundary.
+- The Ratatui client may present one application-owned ephemeral `/btw` branch
+  as a side-by-side pane. It consumes the same opaque fork API and does not add
+  transport IDs, branch scheduling, or UI state to the library contract.
 
 The deterministic binding gate covers construction/error translation, one
 persistent Node WebSocket across follow-on turns, incremental response IDs,
@@ -298,7 +316,8 @@ binding-specific alternate lifecycle.
 
 - Optimize representative retained API/JSONL traces and real turns, not type
   aesthetics or isolated parser throughput.
-- Preserve the stable prompt prefix, session cache key, `store: false`, and
+- Preserve the stable prompt prefix, lineage cache key, stored-checkpoint
+  fallback contract, and
   incremental `previous_response_id` path. Prompt caching is a primary runtime
   invariant.
 - Known history remains typed. `RawValue` is appropriate for intentionally
