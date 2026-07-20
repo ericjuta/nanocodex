@@ -37,6 +37,22 @@ pub(in crate::model) fn task_context(
     )
 }
 
+pub(in crate::model) fn turn_aborted() -> ResponseItem {
+    ResponseItem::message(
+        MessageRole::User,
+        [ContentItem::InputText {
+            text: concat!(
+                "<turn_aborted>\n",
+                "The user interrupted the previous turn on purpose. Any running unified exec ",
+                "processes may still be running in the background. If any tools/commands were ",
+                "aborted, they may have partially executed.\n",
+                "</turn_aborted>"
+            )
+            .into(),
+        }],
+    )
+}
+
 fn task_input_with_time_context(
     user_content: Vec<ContentItem>,
     workspace: &str,
@@ -231,6 +247,27 @@ mod tests {
                     }],
                 }),
             ]),
+        );
+    }
+
+    #[test]
+    fn turn_aborted_matches_codex_context_shape() {
+        assert_eq!(
+            serde_json::to_value(turn_aborted()).unwrap(),
+            json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": concat!(
+                        "<turn_aborted>\n",
+                        "The user interrupted the previous turn on purpose. Any running unified ",
+                        "exec processes may still be running in the background. If any ",
+                        "tools/commands were aborted, they may have partially executed.\n",
+                        "</turn_aborted>"
+                    ),
+                }],
+            }),
         );
     }
 

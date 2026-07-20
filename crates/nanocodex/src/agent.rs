@@ -14,13 +14,13 @@ use nanocodex_service::{
     ResponsesServiceResponse, TransportStats,
 };
 use nanocodex_tools::{Tools, ToolsBuildError};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tower::Service;
 use tracing::{Instrument, info_span};
 
 use crate::{
     NanocodexError, Result,
-    model::agent::{CompletedModelTurn, ModelCheckpoint, ModelRun},
+    model::agent::{CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome},
     responses::{FactoryResponses, LayeredResponses, Responses, StandardResponses},
 };
 
@@ -236,12 +236,12 @@ impl AgentHandle {
         request_spawn(&commands).await
     }
 
-    /// Forks the containing agent's latest completed turn.
+    /// Forks the containing agent's latest safe model boundary.
     ///
     /// # Errors
     ///
-    /// Returns an error before the first completed turn or after the containing
-    /// agent driver has stopped.
+    /// Returns an error before the first prompt reaches a safe boundary, or
+    /// after the containing agent driver has stopped.
     pub async fn fork(&self) -> Result<(Nanocodex, AgentEvents)> {
         let commands = self.commands()?;
         request_fork(&commands, None).await
@@ -315,15 +315,17 @@ impl Nanocodex {
         })
     }
 
-    /// Forks from the latest completed turn into an independently driven agent.
+    /// Forks from the latest safe model boundary into an independently driven
+    /// agent.
     ///
     /// The child receives a fresh WebSocket and tool runtime while sharing the
-    /// immutable committed transcript and prompt-cache lineage.
+    /// immutable transcript, inherited incremental delta, and prompt-cache
+    /// lineage. Partial model output and unmatched tool calls are excluded.
     ///
     /// # Errors
     ///
-    /// Returns an error before the first completed turn or when the driver has
-    /// stopped.
+    /// Returns an error before the first prompt reaches a safe boundary, or
+    /// when the driver has stopped.
     pub async fn fork(&self) -> Result<(Self, AgentEvents)> {
         self.request_fork(None).await
     }
@@ -614,7 +616,7 @@ where
             )
         };
         let mut turn_index = 0_u64;
-        let mut latest_checkpoint = inherited_checkpoint;
+        let mut latest_fork_checkpoint = inherited_checkpoint;
         let mut queued_turns = VecDeque::new();
         let mut commands_open = true;
         loop {
@@ -672,7 +674,7 @@ where
             else {
                 handle_idle_command(
                     command,
-                    latest_checkpoint.as_ref(),
+                    latest_fork_checkpoint.as_ref(),
                     &self.spawner,
                     self.workspace.clone(),
                 );
@@ -694,11 +696,19 @@ where
             );
             let (steers, steer_rx) = mpsc::channel(STEER_CAPACITY);
             let (cancel, cancel_rx) = oneshot::channel();
+            let (fork_snapshots, mut fork_snapshot_rx) = watch::channel(None);
+            let mut fork_snapshots_open = true;
             let mut cancel = Some(cancel);
             let mut cancel_result = None;
             let mut execution = Box::pin(
                 model
-                    .execute(prompt, self.workspace.clone(), steer_rx, cancel_rx)
+                    .execute(
+                        prompt,
+                        self.workspace.clone(),
+                        steer_rx,
+                        cancel_rx,
+                        fork_snapshots,
+                    )
                     .instrument(turn_span.clone()),
             );
             let completed = loop {
@@ -707,9 +717,26 @@ where
                 }
                 tokio::select! {
                     biased;
+                    changed = fork_snapshot_rx.changed(), if fork_snapshots_open => {
+                        if changed.is_err() {
+                            fork_snapshots_open = false;
+                            continue;
+                        }
+                        let snapshot = fork_snapshot_rx.borrow_and_update().clone();
+                        if let Some(snapshot) = snapshot {
+                            latest_fork_checkpoint = Some(Arc::new(CommittedCheckpoint {
+                                lineage_id: Arc::clone(&self.spawner.lineage_id),
+                                model: snapshot,
+                            }));
+                        }
+                    }
                     command = self.commands.recv() => {
                         match command {
-                            Some(Command::Prompt { key, prompt, result }) => {
+                            Some(Command::Prompt {
+                                key,
+                                prompt,
+                                result,
+                            }) => {
                                 queued_turns.push_back(QueuedTurn::Pending {
                                     key,
                                     prompt,
@@ -755,7 +782,7 @@ where
                             Some(command @ (Command::Fork { .. } | Command::Spawn { .. })) => {
                                 handle_idle_command(
                                     command,
-                                    latest_checkpoint.as_ref(),
+                                    latest_fork_checkpoint.as_ref(),
                                     &self.spawner,
                                     self.workspace.clone(),
                                 );
@@ -767,46 +794,44 @@ where
                 }
             };
             drop(execution);
-            let was_cancelled = matches!(&completed, Err(NanocodexError::TurnCancelled));
-            if was_cancelled {
-                let service = (self.spawner.service_factory)();
-                let replacement = if let Some(checkpoint) = latest_checkpoint.as_ref() {
-                    ModelRun::from_checkpoint(
+            let (outcome, was_cancelled): (Result<TurnResult>, bool) = match completed {
+                Ok(ModelTurnOutcome::Completed(completed)) => {
+                    let CompletedModelTurn {
+                        final_message,
+                        checkpoint,
+                    } = completed;
+                    let checkpoint = Arc::new(CommittedCheckpoint {
+                        lineage_id: Arc::clone(&self.spawner.lineage_id),
+                        model: checkpoint,
+                    });
+                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                    (
+                        Ok(TurnResult {
+                            final_message,
+                            checkpoint,
+                        }),
+                        false,
+                    )
+                }
+                Ok(ModelTurnOutcome::Cancelled(checkpoint)) => {
+                    let checkpoint = Arc::new(CommittedCheckpoint {
+                        lineage_id: Arc::clone(&self.spawner.lineage_id),
+                        model: checkpoint,
+                    });
+                    latest_fork_checkpoint = Some(Arc::clone(&checkpoint));
+                    model = ModelRun::from_checkpoint(
                         self.events.clone(),
                         Arc::clone(&self.spawner.config),
-                        ResponsesClient::new(service),
+                        ResponsesClient::new((self.spawner.service_factory)()),
                         Arc::clone(&self.transport_stats),
                         self.tools.clone(),
                         Arc::clone(&self.spawner.lineage_id),
                         checkpoint.model.clone(),
-                    )
-                } else {
-                    ModelRun::new(
-                        self.events.clone(),
-                        Arc::clone(&self.spawner.config),
-                        ResponsesClient::new(service),
-                        Arc::clone(&self.transport_stats),
-                        self.tools.clone(),
-                        Arc::clone(&self.spawner.lineage_id),
-                    )
-                };
-                model = replacement;
-            }
-            let outcome = completed.map(|completed| {
-                let CompletedModelTurn {
-                    final_message,
-                    checkpoint,
-                } = completed;
-                let checkpoint = Arc::new(CommittedCheckpoint {
-                    lineage_id: Arc::clone(&self.spawner.lineage_id),
-                    model: checkpoint,
-                });
-                latest_checkpoint = Some(Arc::clone(&checkpoint));
-                TurnResult {
-                    final_message,
-                    checkpoint,
+                    );
+                    (Err(NanocodexError::TurnCancelled), true)
                 }
-            });
+                Err(error) => (Err(error), false),
+            };
             turn_span.record(
                 "status",
                 if was_cancelled {

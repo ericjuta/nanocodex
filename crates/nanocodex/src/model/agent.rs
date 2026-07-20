@@ -9,6 +9,7 @@ use nanocodex_service::{
     ResponsesOutput, ResponsesServiceResponse, TRANSPORT, TransportStats, TurnResult,
 };
 use serde_json::value::RawValue;
+use tokio::sync::watch;
 use tower::Service;
 use tracing::{Instrument, info_span};
 use web_time::Instant;
@@ -23,7 +24,7 @@ use super::{
     display_endpoint, elapsed_ns,
     input::{
         custom_tool_notification, custom_tool_output, function_tool_output, task_context,
-        task_input,
+        task_input, turn_aborted,
     },
     resolve_workspace, terminal_payload,
 };
@@ -43,8 +44,14 @@ pub(crate) struct ModelRun<S> {
     server_reasoning_included: bool,
     session: Option<ModelSessionState>,
     active_tools: Option<ToolRuntimeControl>,
+    active_tool_call: Option<ActiveToolCall>,
     tools: Tools,
     lineage_id: Arc<str>,
+}
+
+pub(crate) enum ModelTurnOutcome {
+    Completed(CompletedModelTurn),
+    Cancelled(ModelCheckpoint),
 }
 
 pub(crate) struct CompletedModelTurn {
@@ -56,6 +63,7 @@ pub(crate) struct CompletedModelTurn {
 pub(crate) struct ModelCheckpoint {
     workspace: String,
     conversation: ConversationState,
+    preserve_inherited_delta: bool,
 }
 
 impl ModelCheckpoint {
@@ -79,6 +87,19 @@ struct ModelSessionState {
     tools: ToolRuntime,
     factory: ResponsesAttemptFactory,
     conversation: ConversationState,
+    preserve_inherited_delta: bool,
+}
+
+struct ActiveToolCall {
+    call_id: String,
+    name: String,
+    kind: CodeCallKind,
+    started_at: Instant,
+}
+
+enum ModelTaskOutcome {
+    Completed(String),
+    Cancelled,
 }
 
 #[derive(Clone)]
@@ -111,7 +132,7 @@ impl ConversationState {
     }
 
     fn clear_delta(&mut self) {
-        self.delta_start = self.context.tail_len();
+        self.delta_start = self.context.len();
     }
 
     fn append(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
@@ -161,8 +182,13 @@ impl ConversationState {
             });
         }
         self.context.commit_tail();
-        self.delta_start = 0;
+        self.delta_start = self.context.len();
         Ok(())
+    }
+
+    fn commit_interrupted(&mut self) {
+        self.reset_for_full_request();
+        self.context.commit_tail();
     }
 }
 
@@ -185,6 +211,7 @@ impl<S> ModelRun<S> {
             server_reasoning_included: false,
             session: None,
             active_tools: None,
+            active_tool_call: None,
             tools,
             lineage_id,
         }
@@ -224,8 +251,10 @@ impl<S> ModelRun<S> {
                 tools: runtime,
                 factory,
                 conversation: checkpoint.conversation,
+                preserve_inherited_delta: checkpoint.preserve_inherited_delta,
             }),
             active_tools: Some(active_tools),
+            active_tool_call: None,
             tools,
             lineage_id,
         }
@@ -280,7 +309,8 @@ where
         workspace: Option<Arc<str>>,
         steers: tokio::sync::mpsc::Receiver<Prompt>,
         mut cancel: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<CompletedModelTurn> {
+        fork_snapshots: watch::Sender<Option<ModelCheckpoint>>,
+    ) -> Result<ModelTurnOutcome> {
         self.started_at = Instant::now();
         self.stats = RunStats::default();
         let transport_before = self.transport_stats.snapshot();
@@ -298,25 +328,12 @@ where
             },
         )?;
 
-        let mut cancelled = false;
-        let outcome = {
-            let task = self.execute_task(task, workspace, steers);
-            tokio::pin!(task);
-            tokio::select! {
-                biased;
-                _ = &mut cancel => {
-                    cancelled = true;
-                    Err(NanocodexError::TurnCancelled)
-                }
-                outcome = &mut task => outcome,
-            }
-        };
-        if cancelled && let Some(tools) = &self.active_tools {
-            tools.cancel().await;
-        }
+        let outcome = self
+            .execute_task(task, workspace, steers, &mut cancel, &fork_snapshots)
+            .await;
         let elapsed = self.started_at.elapsed();
         match outcome {
-            Ok(message) => {
+            Ok(ModelTaskOutcome::Completed(message)) => {
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
                 self.events.emit(
@@ -324,17 +341,18 @@ where
                     terminal_payload("completed", elapsed, &self.config, &self.stats),
                 )?;
                 let checkpoint = self.commit_checkpoint()?;
-                Ok(CompletedModelTurn {
+                Ok(ModelTurnOutcome::Completed(CompletedModelTurn {
                     final_message: message,
                     checkpoint,
-                })
+                }))
             }
-            Err(error) => {
-                let status = if matches!(&error, NanocodexError::TurnCancelled) {
-                    "cancelled"
-                } else {
-                    "failed"
-                };
+            Ok(ModelTaskOutcome::Cancelled) => {
+                if let Some(tools) = &self.active_tools {
+                    tools.cancel().await;
+                }
+                let checkpoint = self.commit_interrupted_checkpoint()?;
+                let elapsed = self.started_at.elapsed();
+                let error = NanocodexError::TurnCancelled;
                 let message = error.to_string();
                 self.events
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
@@ -342,7 +360,19 @@ where
                     .apply_transport(self.transport_stats.since(transport_before));
                 self.events.emit(
                     AgentEventKind::RunFailed,
-                    terminal_payload(status, elapsed, &self.config, &self.stats),
+                    terminal_payload("cancelled", elapsed, &self.config, &self.stats),
+                )?;
+                Ok(ModelTurnOutcome::Cancelled(checkpoint))
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.events
+                    .emit(AgentEventKind::RunError, RunError { message: &message })?;
+                self.stats
+                    .apply_transport(self.transport_stats.since(transport_before));
+                self.events.emit(
+                    AgentEventKind::RunFailed,
+                    terminal_payload("failed", elapsed, &self.config, &self.stats),
                 )?;
                 Err(error)
             }
@@ -354,7 +384,9 @@ where
         task: Prompt,
         requested_workspace: Option<Arc<str>>,
         steers: tokio::sync::mpsc::Receiver<Prompt>,
-    ) -> Result<String> {
+        cancel: &mut tokio::sync::oneshot::Receiver<()>,
+        fork_snapshots: &watch::Sender<Option<ModelCheckpoint>>,
+    ) -> Result<ModelTaskOutcome> {
         let mut session = if let Some(mut session) = self.session.take() {
             if let Some(requested) = requested_workspace.as_deref() {
                 let resolved = match resolve_workspace(Some(requested)) {
@@ -374,7 +406,11 @@ where
                 }
             }
             let user_content = prepare_user_input(&task.instruction).await;
-            session.conversation.clear_delta();
+            if session.preserve_inherited_delta {
+                session.preserve_inherited_delta = false;
+            } else {
+                session.conversation.clear_delta();
+            }
             session.conversation.append([ResponseItem::message(
                 nanocodex_core::MessageRole::User,
                 user_content,
@@ -402,26 +438,53 @@ where
                 tools.default_shell_name(),
                 project_instructions.as_deref(),
             );
-            let mut conversation = ConversationState::new(history)?;
-            match self.perform_warmup(&factory).await {
-                Ok(response_id) => conversation.previous_response_id = Some(response_id),
-                Err(error) if error.responses_error().is_some() => {
-                    conversation.reset_for_full_request();
-                    self.stats.last_response_id = None;
-                }
-                Err(error) => return Err(error),
-            }
-            ModelSessionState {
+            let conversation = ConversationState::new(history)?;
+            let mut session = ModelSessionState {
                 workspace,
                 tools,
                 factory,
                 conversation,
+                preserve_inherited_delta: false,
+            };
+            Self::publish_fork_snapshot(&mut session, fork_snapshots);
+            let warmup = {
+                let warmup = self.perform_warmup(&session.factory);
+                tokio::pin!(warmup);
+                tokio::select! {
+                    biased;
+                    _ = &mut *cancel => None,
+                    outcome = &mut warmup => Some(outcome),
+                }
+            };
+            let Some(warmup) = warmup else {
+                self.session = Some(session);
+                return Ok(ModelTaskOutcome::Cancelled);
+            };
+            match warmup {
+                Ok(response_id) => session.conversation.previous_response_id = Some(response_id),
+                Err(error) if error.responses_error().is_some() => {
+                    session.conversation.reset_for_full_request();
+                    self.stats.last_response_id = None;
+                }
+                Err(error) => return Err(error),
             }
+            session
         };
 
-        let outcome = self.drive_session(&mut session, steers).await;
+        let outcome = {
+            let task = self.drive_session(&mut session, steers, fork_snapshots);
+            tokio::pin!(task);
+            tokio::select! {
+                biased;
+                _ = &mut *cancel => None,
+                outcome = &mut task => Some(outcome),
+            }
+        };
         self.session = Some(session);
-        outcome
+        match outcome {
+            Some(outcome) => outcome.map(ModelTaskOutcome::Completed),
+            None => Ok(ModelTaskOutcome::Cancelled),
+        }
     }
 
     fn commit_checkpoint(&mut self) -> Result<ModelCheckpoint> {
@@ -435,13 +498,69 @@ where
         Ok(ModelCheckpoint {
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
+            preserve_inherited_delta: false,
         })
+    }
+
+    fn commit_interrupted_checkpoint(&mut self) -> Result<ModelCheckpoint> {
+        let aborted_output = if let Some(call) = self.active_tool_call.take() {
+            let duration_ns = elapsed_ns(call.started_at);
+            let output = ToolOutputBody::Text(format!(
+                "Wall time: {:.3} seconds\naborted by user",
+                call.started_at.elapsed().as_secs_f64()
+            ));
+            self.stats.tool_wall_duration_ns += duration_ns;
+            self.events.emit(
+                AgentEventKind::ToolResult,
+                ToolResultEvent {
+                    call_id: &call.call_id,
+                    tool: &call.name,
+                    status: "cancelled",
+                    duration_ns,
+                    result: &output,
+                    metadata: None,
+                },
+            )?;
+            Some(match call.kind {
+                CodeCallKind::Custom => custom_tool_output(call.call_id, output),
+                CodeCallKind::Function => function_tool_output(call.call_id, output),
+            })
+        } else {
+            None
+        };
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(NanocodexError::InvalidAttemptState {
+                detail: "cancelled turn did not have a model session",
+            })?;
+        session.conversation.append(aborted_output);
+        session.conversation.append([turn_aborted()]);
+        session.conversation.commit_interrupted();
+        Ok(ModelCheckpoint {
+            workspace: session.workspace.clone(),
+            conversation: session.conversation.clone(),
+            preserve_inherited_delta: false,
+        })
+    }
+
+    fn publish_fork_snapshot(
+        session: &mut ModelSessionState,
+        snapshots: &watch::Sender<Option<ModelCheckpoint>>,
+    ) {
+        session.conversation.context.commit_tail();
+        snapshots.send_replace(Some(ModelCheckpoint {
+            workspace: session.workspace.clone(),
+            conversation: session.conversation.clone(),
+            preserve_inherited_delta: true,
+        }));
     }
 
     async fn drive_session(
         &mut self,
         session: &mut ModelSessionState,
         mut steers: tokio::sync::mpsc::Receiver<Prompt>,
+        fork_snapshots: &watch::Sender<Option<ModelCheckpoint>>,
     ) -> Result<String> {
         // Match Codex's ordering: always sample the turn's initial prompt once
         // before injecting input that arrived while that first request ran.
@@ -451,6 +570,7 @@ where
                 self.drain_steers(&mut session.conversation, &mut steers)
                     .await?;
             }
+            Self::publish_fork_snapshot(session, fork_snapshots);
             let call_index = self.stats.model_calls + 1;
             let response = self
                 .perform_model_call(call_index, &session.conversation, &session.factory)
@@ -582,7 +702,7 @@ where
                 CodeCallKind::Function => function_tool_output(call.call_id, output),
             }]);
         }
-        let started_at = Instant::now();
+        let started_at = self.track_active_tool_call(&call);
         let context = ToolContext {
             model: MODEL,
             session_id: self.events.request_id(),
@@ -612,6 +732,7 @@ where
         .instrument(tool_span.clone())
         .await;
         prepare_output_images(&mut execution.output).await;
+        self.active_tool_call = None;
         let duration_ns = elapsed_ns(started_at);
         tool_span.record("status", status(execution.success));
         tool_span.record("otel.status_code", otel_status(execution.success));
@@ -643,6 +764,17 @@ where
             }),
         );
         Ok(outputs)
+    }
+
+    fn track_active_tool_call(&mut self, call: &CodeCall) -> Instant {
+        let started_at = Instant::now();
+        self.active_tool_call = Some(ActiveToolCall {
+            call_id: call.call_id.clone(),
+            name: call.name.clone(),
+            kind: call.kind,
+            started_at,
+        });
+        started_at
     }
 
     async fn maybe_compact(

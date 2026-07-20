@@ -11,8 +11,8 @@ than assume it is present in their inherited prompt context.
 - Fast live branching matters more than provider-side prompt privacy.
 - Nanocodex must remain a headless, library-first SDK: no app server and no
   generic core scheduler.
-- `/btw` currently provides one ephemeral fork of the latest completed root
-  turn.
+- `/btw` provides one ephemeral fork of the latest safe root model/tool
+  boundary, carrying the prior response ID plus its exact client-owned delta.
 - Branches share the workspace but receive fresh drivers, WebSockets, and tool
   runtimes.
 - The release should prefer correctness and explicit lifecycle behavior over

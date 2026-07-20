@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     );
 
     // Fork commands remain responsive while a root turn runs. fork() samples
-    // the latest completed checkpoint; fork_from() selects an exact old result.
+    // the latest resumable checkpoint; fork_from() selects an exact old result.
     let mainline = agent
         .prompt("Record the mainline-only fact `release=Tuesday`.")
         .await?;

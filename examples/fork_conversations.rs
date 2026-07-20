@@ -80,8 +80,8 @@ async fn main() -> Result<()> {
         checkpoints.push(result);
     }
 
-    // `fork()` samples the latest completed turn, which is deterministically
-    // turn 10 here. The checkpoint's response ID remains private.
+    // `fork()` samples the latest safe model/tool boundary, which is
+    // deterministically completed turn 10 here. The response ID remains private.
     let (latest, latest_events) = agent.fork().await?;
     observers.push(observe_events("latest@10", latest_events));
 

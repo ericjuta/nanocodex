@@ -56,7 +56,7 @@ pub enum NanocodexError {
     #[error("the turn was cancelled")]
     TurnCancelled,
 
-    #[error("the agent has no completed turn to fork")]
+    #[error("the agent has no safe conversation boundary to fork")]
     ForkBeforeCompletedTurn,
 
     #[error("the completed turn belongs to a different conversation lineage")]

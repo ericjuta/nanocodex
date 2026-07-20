@@ -223,6 +223,26 @@ The segmented fork-and-append remains constant-time as retained history grows;
 the copy-on-write baseline scales linearly because the first branch append
 copies the shared vector.
 
+The active-boundary path additionally seals the current delta, snapshots it,
+and appends one item to the parent. Its median times on the same machine were:
+
+| Retained items | Immutable boundary | `Arc<Vec>` COW boundary | Speedup |
+| ---: | ---: | ---: | ---: |
+| 100 | 531.6 ns | 13.08 us | 24.6x |
+| 1,000 | 823.9 ns | 204.95 us | 248.8x |
+| 10,000 | 987.1 ns | 1.391 ms | 1,409x |
+
+Incremental iteration over only the last item measured 33.6 ns, 29.9 ns, and
+25.8 ns for histories containing 100, 1,000, and 10,000 sealed segments. This
+guards the wire path against accidentally walking the whole retained history
+when constructing `previous_response_id + delta` requests.
+
+The deterministic WebSocket suite separately verifies the wire contract: a
+latest fork includes an active prompt or the complete tool-result-plus-steer
+delta, retries with complete local history when the stored response is absent,
+and remains distinct from `fork_from(&completed_turn)`, which stays pinned to
+the exact historical checkpoint.
+
 ## Reproduce
 
 From a directory containing `OPENAI_API_KEY` in `.env`:

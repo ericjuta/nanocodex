@@ -49,7 +49,7 @@ Decision context:
   read-only specialist branches.
 - Fast live branching matters more than provider-side prompt privacy.
 - We must remain a headless, library-first SDK: no app server and no generic core scheduler.
-- `/btw` currently provides one ephemeral fork of the latest completed root turn.
+- `/btw` currently provides one ephemeral fork of the latest safe root boundary.
 - Branches share the workspace but receive fresh drivers, WebSockets, and tool runtimes.
 - The release should prefer correctness and explicit lifecycle behavior over adding more UI surface.
 
@@ -116,7 +116,7 @@ impl ChildKind {
                 "Starts a reusable clean agent without the invoking agent's conversation history, runs its first task, and returns its agent_id and report."
             }
             Self::Fork => {
-                "Starts a reusable agent from the invoking agent's latest completed checkpoint, runs its first task, and returns its agent_id and report."
+                "Starts a reusable agent from the invoking agent's latest safe model/tool boundary, runs its first task, and returns its agent_id and report."
             }
         }
     }
@@ -286,7 +286,7 @@ async fn main() -> Result<()> {
     let tools_agents = Arc::downgrade(&child_agents);
     let (agent, events) = Nanocodex::builder(api_key)
         .instructions(
-            "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest completed context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
+            "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest safe context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
         )
         .thinking(Thinking::Low)
         .tools_factory(move |agent| {

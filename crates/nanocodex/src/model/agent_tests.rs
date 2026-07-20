@@ -278,7 +278,83 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
 }
 
 #[tokio::test]
-async fn cancellation_targets_one_turn_and_resumes_from_the_last_commit() -> Result<()> {
+async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()> {
+    let workspace = temporary_workspace("steer-tool")?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let initial = next_json(&mut socket).await?;
+        assert_eq!(initial["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({cmd: \"printf started > tool-started; while [ ! -f release-tool ]; do sleep 0.01; done; printf shit\"}); text(result.output);"
+                })],
+            ),
+        )
+        .await?;
+
+        let steered = next_json(&mut socket).await?;
+        assert_eq!(steered["previous_response_id"], "resp-tool");
+        let input = steered["input"]
+            .as_array()
+            .ok_or_else(|| eyre!("steered request input was not an array"))?;
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "custom_tool_call_output");
+        assert_eq!(input[0]["call_id"], "call-exec");
+        assert!(input[0].to_string().contains("shit"));
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["text"], "print shat instead");
+        send_final(&mut socket, "resp-steered").await
+    });
+
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, mut events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    let turn = agent.prompt("print shit a lot of times").await?;
+    timeout(std::time::Duration::from_secs(5), async {
+        while !workspace.join("tool-started").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("tool process did not start"))?;
+
+    turn.steer("print shat instead").await?;
+    assert!(!workspace.join("release-tool").exists());
+    std::fs::write(workspace.join("release-tool"), [])?;
+    assert_eq!(turn.result().await?.final_message, "done");
+    drop(agent);
+
+    let mut saw_steer = false;
+    while let Some(event) = events.recv().await {
+        saw_steer |= event.kind == nanocodex_core::AgentEventKind::RunSteered;
+    }
+    assert!(saw_steer);
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_retains_interrupted_prompt_and_resumes_from_the_abort_boundary() -> Result<()>
+{
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let (second_seen, second_seen_rx) = tokio::sync::oneshot::channel();
@@ -298,16 +374,19 @@ async fn cancellation_targets_one_turn_and_resumes_from_the_last_commit() -> Res
         second_seen
             .send(())
             .map_err(|()| eyre!("second-request signal receiver dropped"))?;
+        send_json(
+            &mut first_socket,
+            json!({
+                "type": "response.output_text.delta",
+                "delta": "partial text that must not enter history"
+            }),
+        )
+        .await?;
 
         let (stream, _) = listener.accept().await?;
         let mut replacement = accept_async(stream).await?;
         let queued = next_json(&mut replacement).await?;
-        assert_eq!(queued["previous_response_id"], "resp-first");
-        assert_eq!(queued["input"].as_array().map(Vec::len), Some(1));
-        assert_eq!(
-            queued["input"][0]["content"][0]["text"],
-            "run after cancellations"
-        );
+        assert_interrupted_replay(&queued);
         send_final(&mut replacement, "resp-follow-up").await
     });
 
@@ -374,6 +453,137 @@ async fn cancellation_targets_one_turn_and_resumes_from_the_last_commit() -> Res
         ["completed", "cancelled", "cancelled", "completed"]
     );
 
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+fn assert_interrupted_replay(request: &Value) {
+    assert!(request.get("previous_response_id").is_none());
+    assert_eq!(request["input"].as_array().map(Vec::len), Some(8));
+    assert_eq!(request["input"][0]["type"], "additional_tools");
+    assert_eq!(request["input"][1]["role"], "developer");
+    assert_eq!(request["input"][2]["role"], "user");
+    assert_eq!(request["input"][3]["content"][0]["text"], "first prompt");
+    assert_eq!(request["input"][4]["content"][0]["text"], "done");
+    assert_eq!(request["input"][5]["content"][0]["text"], "cancel me");
+    assert!(
+        request["input"][6]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("<turn_aborted>"))
+    );
+    assert_eq!(
+        request["input"][7]["content"][0]["text"],
+        "run after cancellations"
+    );
+    assert!(
+        !request
+            .to_string()
+            .contains("partial text that must not enter history")
+    );
+}
+
+#[tokio::test]
+async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut first).await?);
+        send_warmup(&mut first, "resp-warmup").await?;
+
+        let generation = next_json(&mut first).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut first,
+            completed_response(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({cmd: \"printf started > tool-started; sleep 30\"}); text(result.output);"
+                })],
+            ),
+        )
+        .await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut replacement = accept_async(stream).await?;
+        let resumed = next_json(&mut replacement).await?;
+        assert!(resumed.get("previous_response_id").is_none());
+        assert_eq!(resumed["input"].as_array().map(Vec::len), Some(8));
+        assert_eq!(resumed["input"][3]["content"][0]["text"], "run a long tool");
+        assert_eq!(resumed["input"][4]["type"], "custom_tool_call");
+        assert_eq!(resumed["input"][4]["call_id"], "call-exec");
+        assert_eq!(resumed["input"][5]["type"], "custom_tool_call_output");
+        assert_eq!(resumed["input"][5]["call_id"], "call-exec");
+        assert!(resumed["input"][5].to_string().contains("aborted by user"));
+        assert!(
+            resumed["input"][6]["content"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("<turn_aborted>"))
+        );
+        assert_eq!(resumed["input"][7]["content"][0]["text"], "continue");
+        send_final(&mut replacement, "resp-follow-up").await
+    });
+
+    let workspace = temporary_workspace("cancel-tool")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, mut events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+
+    let interrupted = agent.prompt("run a long tool").await?;
+    loop {
+        let event = events
+            .recv()
+            .await
+            .ok_or_else(|| eyre!("event stream closed before the tool call"))?;
+        if event.kind == nanocodex_core::AgentEventKind::ToolCall {
+            break;
+        }
+    }
+    timeout(std::time::Duration::from_secs(5), async {
+        while !workspace.join("tool-started").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("tool process did not start"))?;
+
+    interrupted.cancel().await?;
+    assert!(matches!(
+        interrupted.result().await,
+        Err(NanocodexError::TurnCancelled)
+    ));
+    assert_eq!(
+        agent
+            .prompt("continue")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    drop(agent);
+
+    let mut saw_cancelled_tool = false;
+    while let Some(event) = events.recv().await {
+        if event.kind == nanocodex_core::AgentEventKind::ToolResult {
+            let payload = event.decode_payload::<Value>()?;
+            saw_cancelled_tool |= payload["call_id"] == "call-exec"
+                && payload["status"] == "cancelled"
+                && payload.to_string().contains("aborted by user");
+        }
+    }
+    assert!(saw_cancelled_tool);
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
@@ -1196,6 +1406,320 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
     assert!(output.contains("\"model.compaction.started\""));
     assert!(output.contains("\"model.compaction.completed\""));
     assert!(output.contains("\"compactions\":1"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn latest_fork_during_streaming_inherits_the_active_prompt_delta() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (root_started, root_started_rx) = tokio::sync::oneshot::channel();
+    let (release_root, release_root_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut root = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut root).await?);
+        send_warmup(&mut root, "resp-warmup").await?;
+
+        let active = next_json(&mut root).await?;
+        assert_eq!(active["previous_response_id"], "resp-warmup");
+        assert!(active.to_string().contains("active root prompt"));
+        root_started
+            .send(())
+            .map_err(|()| eyre!("root request signal receiver dropped"))?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut branch = accept_async(stream).await?;
+        let fork = next_json(&mut branch).await?;
+        assert_eq!(fork["previous_response_id"], "resp-warmup");
+        let fork_text = fork.to_string();
+        assert!(fork_text.contains("active root prompt"));
+        assert!(fork_text.contains("BTW question"));
+        send_final(&mut branch, "resp-branch").await?;
+
+        release_root_rx
+            .await
+            .map_err(|_| eyre!("root release sender dropped"))?;
+        send_final(&mut root, "resp-root").await
+    });
+
+    let workspace = temporary_workspace("active-prompt-fork")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, root_events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    let root = agent.prompt("active root prompt").await?;
+    root_started_rx
+        .await
+        .map_err(|_| eyre!("root request was not observed"))?;
+    let (fork, fork_events) = agent.fork().await?;
+    let branch = fork.prompt("BTW question").await?;
+    assert_eq!(branch.result().await?.final_message, "done");
+    release_root
+        .send(())
+        .map_err(|()| eyre!("root release receiver dropped"))?;
+    assert_eq!(root.result().await?.final_message, "done");
+
+    drop((agent, fork, root_events, fork_events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpoint_miss()
+-> Result<()> {
+    let workspace = temporary_workspace("active-tool-steer-fork")?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (boundary_seen, boundary_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_root, release_root_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut root = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut root).await?);
+        send_warmup(&mut root, "resp-warmup").await?;
+
+        let initial = next_json(&mut root).await?;
+        assert_eq!(initial["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut root,
+            completed_response(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({cmd: \"printf started > tool-started; while [ ! -f release-tool ]; do sleep 0.01; done; printf shit\"}); text(result.output);"
+                })],
+            ),
+        )
+        .await?;
+
+        let continuation = next_json(&mut root).await?;
+        assert_eq!(continuation["previous_response_id"], "resp-tool");
+        assert_eq!(continuation["input"].as_array().map(Vec::len), Some(2));
+        assert_eq!(continuation["input"][0]["type"], "custom_tool_call_output");
+        assert!(continuation["input"][0].to_string().contains("shit"));
+        assert_eq!(
+            continuation["input"][1]["content"][0]["text"],
+            "print shat instead"
+        );
+        boundary_seen
+            .send(())
+            .map_err(|()| eyre!("boundary signal receiver dropped"))?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut branch = accept_async(stream).await?;
+        let incremental = next_json(&mut branch).await?;
+        assert_eq!(incremental["previous_response_id"], "resp-tool");
+        assert_eq!(incremental["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(incremental["input"][0]["type"], "custom_tool_call_output");
+        assert!(incremental["input"][0].to_string().contains("shit"));
+        assert_eq!(
+            incremental["input"][1]["content"][0]["text"],
+            "print shat instead"
+        );
+        assert_eq!(
+            incremental["input"][2]["content"][0]["text"],
+            "BTW question"
+        );
+        send_json(
+            &mut branch,
+            json!({
+                "type": "error",
+                "error": {
+                    "code": "previous_response_not_found",
+                    "message": "checkpoint expired"
+                }
+            }),
+        )
+        .await?;
+
+        let replay = next_json(&mut branch).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        let replay_text = replay.to_string();
+        assert!(replay_text.contains("active root prompt"));
+        assert!(replay_text.contains("call-exec"));
+        assert!(replay_text.contains("shit"));
+        assert!(replay_text.contains("print shat instead"));
+        assert!(replay_text.contains("BTW question"));
+        send_final(&mut branch, "resp-branch").await?;
+
+        release_root_rx
+            .await
+            .map_err(|_| eyre!("root release sender dropped"))?;
+        send_final(&mut root, "resp-root").await
+    });
+
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, root_events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    let root = agent.prompt("active root prompt").await?;
+    timeout(std::time::Duration::from_secs(5), async {
+        while !workspace.join("tool-started").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("tool process did not start"))?;
+    root.steer("print shat instead").await?;
+    std::fs::write(workspace.join("release-tool"), [])?;
+    boundary_seen_rx
+        .await
+        .map_err(|_| eyre!("root boundary request was not observed"))?;
+
+    let (fork, fork_events) = agent.fork().await?;
+    assert_eq!(
+        fork.prompt("BTW question")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    release_root
+        .send(())
+        .map_err(|()| eyre!("root release receiver dropped"))?;
+    assert_eq!(root.result().await?.final_message, "done");
+
+    drop((agent, fork, root_events, fork_events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn latest_and_historical_forks_keep_distinct_boundaries_during_an_active_turn() -> Result<()>
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (active_seen, active_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_active, release_active_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut root = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut root).await?);
+        send_warmup(&mut root, "resp-warmup").await?;
+        let first = next_json(&mut root).await?;
+        assert!(first.to_string().contains("completed root prompt"));
+        send_final(&mut root, "resp-first").await?;
+
+        let active = next_json(&mut root).await?;
+        assert_eq!(active["previous_response_id"], "resp-first");
+        assert!(active.to_string().contains("active root prompt"));
+        active_seen
+            .send(())
+            .map_err(|()| eyre!("active signal receiver dropped"))?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut latest = accept_async(stream).await?;
+        let latest_request = next_json(&mut latest).await?;
+        assert_eq!(latest_request["previous_response_id"], "resp-first");
+        assert_eq!(latest_request["input"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            latest_request["input"][0]["content"][0]["text"],
+            "active root prompt"
+        );
+        assert_eq!(
+            latest_request["input"][1]["content"][0]["text"],
+            "latest branch prompt"
+        );
+        send_final(&mut latest, "resp-latest").await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut historical = accept_async(stream).await?;
+        let historical_request = next_json(&mut historical).await?;
+        assert_eq!(historical_request["previous_response_id"], "resp-first");
+        assert_eq!(
+            historical_request["input"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            historical_request["input"][0]["content"][0]["text"],
+            "historical branch prompt"
+        );
+        assert!(
+            !historical_request
+                .to_string()
+                .contains("active root prompt")
+        );
+        send_final(&mut historical, "resp-historical").await?;
+
+        release_active_rx
+            .await
+            .map_err(|_| eyre!("active release sender dropped"))?;
+        send_final(&mut root, "resp-active").await
+    });
+
+    let workspace = temporary_workspace("latest-vs-historical-fork")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, root_events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    let completed = agent
+        .prompt("completed root prompt")
+        .await?
+        .result()
+        .await?;
+    let active = agent.prompt("active root prompt").await?;
+    active_seen_rx
+        .await
+        .map_err(|_| eyre!("active root request was not observed"))?;
+
+    let (latest, latest_events) = agent.fork().await?;
+    assert_eq!(
+        latest
+            .prompt("latest branch prompt")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    let (historical, historical_events) = agent.fork_from(&completed).await?;
+    assert_eq!(
+        historical
+            .prompt("historical branch prompt")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    release_active
+        .send(())
+        .map_err(|()| eyre!("active release receiver dropped"))?;
+    assert_eq!(active.result().await?.final_message, "done");
+
+    drop((
+        agent,
+        latest,
+        historical,
+        root_events,
+        latest_events,
+        historical_events,
+    ));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }

@@ -220,10 +220,12 @@ or whole-history clone and truncation.
 - Serialize requests by walking segment references oldest-first plus the active
   tail. Full replay may traverse the prefix but must not clone or flatten its
   `ResponseItem`s. Healthy turns continue to send only their delta.
-- Create checkpoints only after successful terminal turns. Forking while a turn
-  is active uses the latest committed checkpoint and excludes partial model or
-  tool work. Compaction installs a new root for that lineage without rewriting
-  roots retained by existing branches.
+- Publish an O(1) fork snapshot before each safe sampling step. An active-turn
+  snapshot carries the last completed response ID plus its exact client-owned
+  delta, including paired tool results and applied steers, while excluding
+  partial model output and unmatched tool calls. Terminal checkpoints remain
+  the durable result/recovery boundary. Compaction installs a new root for that
+  lineage without rewriting roots retained by existing branches.
 - Retain an opaque cheap checkpoint in `TurnResult`. Start with
   `agent.fork()` from the latest commit; add `agent.fork_from(&turn_result)` only
   when a consumer demonstrates historical branching.
@@ -263,7 +265,7 @@ or whole-history clone and truncation.
 3. [x] Introduce segmented history and retained committed checkpoints, with memory
    and replay benchmarks before adding the public fork operation.
 4. [x] Add fresh service-stack factories, separate lineage/cache identity from
-   session identity, and expose latest-committed `fork()`.
+   session identity, and expose latest-safe-boundary `fork()`.
 5. [x] Promote historical `fork_from(...)` with the public ledger consumer. Keep
    Code Mode child orchestration application-owned, and add one thin Ratatui
    `/btw` consumer over latest-checkpoint forks. Do not add an app-server

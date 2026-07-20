@@ -12,8 +12,8 @@ can expose as Code Mode tools:
 
 - `AgentHandle::spawn()` creates a clean child while privately reusing builder
   configuration.
-- `AgentHandle::fork()` creates a child from the invoking agent's latest
-  completed checkpoint.
+- `AgentHandle::fork()` creates a child from the invoking agent's latest safe
+  model/tool boundary.
 - `Nanocodex::fork_from(&TurnResult)` creates a branch from an exact historical
   completed turn while the mainline may continue.
 

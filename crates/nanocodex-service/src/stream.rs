@@ -45,6 +45,7 @@ pub struct CodeCall {
     pub kind: CodeCallKind,
 }
 
+#[derive(Clone, Copy)]
 pub enum CodeCallKind {
     Custom,
     Function,

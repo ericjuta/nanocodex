@@ -47,7 +47,7 @@ turn.cancel().await?;
 // Returns Err(TurnCancelled).
 let _cancelled = turn.result().await;
 
-// Fork from the latest completed state.
+// Fork from the latest safe model/tool boundary.
 let (latest, _events) = agent.fork().await?;
 // Fork from the exact older state.
 let (historical, _events) = agent.fork_from(&checkpoint).await?;
@@ -79,7 +79,7 @@ NanocodexBuilder
 
 AgentHandle, supplied to tools_factory(...)
        ├── spawn()  clean child
-       └── fork()   child from latest committed checkpoint
+       └── fork()   child from latest safe model/tool boundary
 ```
 
 That is the complete ownership model. See the runnable
@@ -289,9 +289,11 @@ nanocodex
 ```
 
 The TUI retains one session across prompts. Enter submits, Tab explicitly queues
-a follow-up while work is active, and `/cancel` stops the focused turn. After a
-completed turn, `/btw <question>` opens a fast latest-checkpoint fork in a
-vertical pane while the mainline continues. The headless `nanocodex run`
+a follow-up while work is active, and `/cancel` stops the focused turn. At any
+safe model/tool boundary, `/btw <question>` opens a fast fork in a vertical pane
+while the mainline continues. The fork inherits the last completed response ID
+plus complete tool results and applied steers after that response; partial model
+output and unmatched tool calls remain excluded. The headless `nanocodex run`
 adapter emits flushed JSONL for scripts and Harbor.
 
 To measure streaming cadence without recording response text, enable the shared

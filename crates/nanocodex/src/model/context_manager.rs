@@ -47,8 +47,8 @@ impl ContextManager {
         self.items.clone()
     }
 
-    pub(super) fn tail_len(&self) -> usize {
-        self.items.tail().len()
+    pub(super) fn len(&self) -> usize {
+        self.items.len()
     }
 
     pub(super) fn record_items(&mut self, items: impl IntoIterator<Item = ResponseItem>) {
@@ -298,6 +298,7 @@ pub(super) fn is_contextual_user_message(item: &ResponseItem) -> bool {
         .any(|text| {
             matches_marked_text("# AGENTS.md instructions", "</INSTRUCTIONS>", text)
                 || matches_marked_text("<environment_context>", "</environment_context>", text)
+                || matches_marked_text("<turn_aborted>", "</turn_aborted>", text)
         })
 }
 
@@ -452,6 +453,9 @@ mod tests {
         )));
         assert!(!is_contextual_user_message(&message(
             "# AGENTS.md instructions are useful"
+        )));
+        assert!(is_contextual_user_message(&message(
+            "<turn_aborted>\ninterrupted\n</turn_aborted>"
         )));
     }
 

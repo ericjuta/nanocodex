@@ -4,11 +4,14 @@ use nanocodex_core::{EventSink, ModelConfig, Prompt, Thinking};
 use nanocodex_service::{ResponsesClient, ResponsesService, TransportStats};
 use nanocodex_tools::Tools;
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use crate::model::agent::ModelRun;
+use crate::{
+    NanocodexError,
+    model::agent::{ModelRun, ModelTurnOutcome},
+};
 
 #[wasm_bindgen]
 extern "C" {
@@ -95,10 +98,23 @@ impl WasmNanocodex {
                 let (steers, steer_rx) = mpsc::channel(1);
                 drop(steers);
                 let (_cancel, cancel_rx) = tokio::sync::oneshot::channel();
+                let (fork_snapshots, _fork_snapshot_rx) = watch::channel(None);
                 let outcome = model
-                    .execute(command.prompt, workspace.clone(), steer_rx, cancel_rx)
+                    .execute(
+                        command.prompt,
+                        workspace.clone(),
+                        steer_rx,
+                        cancel_rx,
+                        fork_snapshots,
+                    )
                     .await
-                    .map(|completed| completed.final_message)
+                    .and_then(|outcome| match outcome {
+                        ModelTurnOutcome::Completed(completed) => Ok(completed.final_message),
+                        ModelTurnOutcome::Cancelled(checkpoint) => {
+                            drop(checkpoint);
+                            Err(NanocodexError::TurnCancelled)
+                        }
+                    })
                     .map_err(|error| error.to_string());
                 drop(command.result.send(outcome));
             }
