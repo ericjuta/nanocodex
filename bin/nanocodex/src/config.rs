@@ -38,6 +38,14 @@ pub(crate) struct AgentArgs {
     #[arg(long, env = "OPENAI_REASONING_EFFORT", default_value_t)]
     thinking: Thinking,
 
+    /// Responses service tier. `fast` maps to the API's `priority` tier.
+    #[arg(
+        long,
+        env = "OPENAI_SERVICE_TIER",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
+    service_tier: Option<String>,
+
     /// Replace the standard system/developer instructions.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     instructions: Option<String>,
@@ -108,6 +116,11 @@ impl AgentArgs {
             .thinking(self.thinking)
             .workspace(self.cwd)
             .responses(responses);
+        let builder = if let Some(service_tier) = self.service_tier {
+            builder.service_tier(service_tier)
+        } else {
+            builder
+        };
         let builder = if let Some(child_agents) = &child_agents {
             let tools = tools.clone();
             let child_agents = Arc::downgrade(child_agents);
@@ -187,12 +200,18 @@ pub(crate) fn default_auth_file() -> Result<PathBuf> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
     use nanocodex::OpenAiAuthMode;
 
-    use super::select_auth;
+    use super::{AgentArgs, select_auth};
 
     static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        agent: AgentArgs,
+    }
 
     fn auth_file() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -246,5 +265,13 @@ mod tests {
 
         assert!(error.to_string().contains("no ChatGPT tokens"));
         std::fs::remove_file(auth_file).unwrap();
+    }
+
+    #[test]
+    fn parses_service_tier_flag() {
+        let cli = TestCli::parse_from(["nanocodex", "--service-tier", "fast"]);
+
+        assert_eq!(cli.agent.service_tier.as_deref(), Some("fast"));
+    }
     }
 }
