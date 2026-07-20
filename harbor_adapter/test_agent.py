@@ -747,14 +747,15 @@ class InterruptedRunContractTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 agent.populate_context_post_run(AgentContext())
 
-    def test_jsonl_read_retries_a_partially_propagated_final_line(self) -> None:
+    def test_jsonl_read_retries_a_slowly_propagated_final_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.jsonl"
             complete = {"type": "run.completed", "payload": {}}
             path.write_text('{"type":"run.com', encoding="utf-8")
 
             def finish_write() -> None:
-                time.sleep(0.02)
+                # Longer than the old adapter's complete retry window.
+                time.sleep(0.6)
                 path.write_text(json.dumps(complete) + "\n", encoding="utf-8")
 
             writer = threading.Thread(target=finish_write)
@@ -764,8 +765,47 @@ class InterruptedRunContractTests(unittest.TestCase):
             finally:
                 writer.join()
 
+    def test_jsonl_read_rejects_stable_malformed_records_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            path.write_text("not-json\n", encoding="utf-8")
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "failed to read JSONL"):
+                NanocodexAgent._read_jsonl(path)
+
+            self.assertLess(time.monotonic() - started, 0.5)
+
 
 class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_atomically_publishes_the_event_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = object.__new__(NanocodexAgent)
+            agent.logs_dir = Path(directory)
+            agent.context_id = None
+            agent.session_id = "session-1"
+            agent._model = "test-model"
+            agent._effort = "low"
+            agent._web_search = False
+            agent._subagents = False
+            agent._agents_md_path = None
+            agent._stage_api_key = AsyncMock()
+            agent._remove_staged_api_key = AsyncMock()
+            agent.exec_as_agent = AsyncMock(
+                return_value=SimpleNamespace(stdout="", stderr="")
+            )
+            environment = SimpleNamespace(capabilities=SimpleNamespace(mounted=True))
+
+            await agent.run("test", environment, AgentContext())
+
+            command = agent.exec_as_agent.await_args.args[1]
+            self.assertIn("set -o pipefail", command)
+            self.assertIn('tee "$events_tmp"', command)
+            self.assertIn(
+                'mv "$events_tmp" /logs/agent/events.jsonl', command
+            )
+            self.assertNotIn("tee /logs/agent/events.jsonl", command)
+
     async def test_cancellation_is_recorded_and_reraised(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = object.__new__(NanocodexAgent)

@@ -48,6 +48,7 @@ class NanocodexAgent(BaseInstalledAgent):
     SUPPORTS_ATIF = True
     _BINARY = "/installed-agent/nanocodex"
     _EVENTS = "/logs/agent/events.jsonl"
+    _EVENTS_TMP = "/logs/agent/events.jsonl.tmp"
     _STDERR = "/logs/agent/stderr.log"
     _API_KEY_FILE = "/installed-agent/.openai-api-key"
     _REMOTE_AGENTS_MD = "/app/AGENTS.md"
@@ -186,7 +187,7 @@ class NanocodexAgent(BaseInstalledAgent):
         )
         await self._stage_agents_md(environment)
         arguments = self._run_arguments(instruction)
-        command = (
+        agent_command = (
             f'api_key=$(<{self._API_KEY_FILE}) && test -n "$api_key" && '
             f'rm -f {self._API_KEY_FILE} && OPENAI_API_KEY="$api_key" '
             + (
@@ -196,7 +197,14 @@ class NanocodexAgent(BaseInstalledAgent):
             )
             + "PATH=$PATH:/opt/nanocodex-verifier/bin "
             + " ".join(shlex.quote(argument) for argument in arguments)
-            + f" 2> {self._STDERR} | tee {self._EVENTS}"
+        )
+        command = (
+            f"events_tmp={shlex.quote(self._EVENTS_TMP)}; "
+            'rm -f "$events_tmp"; set +e; set -o pipefail; '
+            f'{agent_command} 2> {shlex.quote(self._STDERR)} | tee "$events_tmp"; '
+            "status=$?; "
+            f'if [ -f "$events_tmp" ]; then mv "$events_tmp" {shlex.quote(self._EVENTS)}; fi; '
+            'exit "$status"'
         )
         try:
             await self._stage_api_key(environment)
@@ -499,23 +507,31 @@ class NanocodexAgent(BaseInstalledAgent):
 
     @staticmethod
     def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-        error: OSError | json.JSONDecodeError | None = None
-        values: list[Any] = []
-        for attempt in range(10):
+        deadline = time.monotonic() + 30.0
+        while True:
             try:
+                text = path.read_text(encoding="utf-8")
                 values = [
                     json.loads(line)
-                    for line in path.read_text(encoding="utf-8").splitlines()
+                    for line in text.splitlines()
                     if line.strip()
                 ]
-                error = None
                 break
-            except (OSError, json.JSONDecodeError) as current_error:
-                error = current_error
-                if attempt < 9:
-                    time.sleep(0.05)
-        if error is not None:
-            raise RuntimeError(f"failed to read JSONL from {path}: {error}") from error
+            except OSError as error:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"failed to read JSONL from {path}: {error}"
+                    ) from error
+                time.sleep(0.05)
+            except json.JSONDecodeError as error:
+                # A bind-mounted file can become visible before its current final
+                # record. Stable malformed JSONL ends in a newline and should fail
+                # immediately; a partial EOF is allowed time to finish propagating.
+                if text.endswith(("\n", "\r")) or time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"failed to read JSONL from {path}: {error}"
+                    ) from error
+                time.sleep(0.05)
         if not all(isinstance(value, dict) for value in values):
             raise RuntimeError(f"all JSONL values in {path} must be objects")
         return values
