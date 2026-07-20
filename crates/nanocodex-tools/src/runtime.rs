@@ -460,7 +460,15 @@ fn built_in_name(tools: &Tools, name: &str) -> bool {
 pub struct ToolRuntime {
     registry: Arc<ToolRegistry>,
     code_mode: code_mode::CodeModeRuntime,
+    sessions: Arc<ShellSessions>,
     default_shell_name: &'static str,
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ToolRuntimeControl {
+    code_mode: code_mode::CodeModeControl,
+    sessions: Arc<ShellSessions>,
 }
 
 impl ToolRuntime {
@@ -478,7 +486,7 @@ impl ToolRuntime {
                 workspace.clone(),
                 Arc::clone(&sessions),
             )),
-            Arc::new(shell::WriteStdinHandler::new(sessions)),
+            Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
             Arc::new(plan::PlanHandler::new()),
             Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
             Arc::new(view_image::ViewImageHandler::new(workspace)),
@@ -494,6 +502,7 @@ impl ToolRuntime {
         Self {
             registry: Arc::new(ToolRegistry::from_ordered(handlers)),
             code_mode: code_mode::CodeModeRuntime::new(code_mode_workspace),
+            sessions,
             default_shell_name,
         }
     }
@@ -506,10 +515,21 @@ impl ToolRuntime {
         self
     }
 
+    #[must_use]
     pub const fn default_shell_name(&self) -> &'static str {
         self.default_shell_name
     }
 
+    #[doc(hidden)]
+    #[must_use]
+    pub fn control(&self) -> ToolRuntimeControl {
+        ToolRuntimeControl {
+            code_mode: self.code_mode.control(),
+            sessions: Arc::clone(&self.sessions),
+        }
+    }
+
+    #[must_use]
     pub fn model_specs(&self) -> Vec<ToolDefinition> {
         vec![
             code_mode::exec_spec(self.registry.definitions()),
@@ -525,6 +545,16 @@ impl ToolRuntime {
 
     pub async fn wait_for_code(&self, input: &str, context: ToolContext<'_>) -> CodeModeExecution {
         self.code_mode.wait(input, context).await
+    }
+}
+
+impl ToolRuntimeControl {
+    #[doc(hidden)]
+    pub async fn cancel(&self) {
+        tokio::join!(
+            self.code_mode.terminate_all(),
+            self.sessions.terminate_all()
+        );
     }
 }
 

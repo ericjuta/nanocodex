@@ -7,7 +7,8 @@ use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use crate::{
-    AgentError, AgentHandle, Nanocodex, NanocodexError, Prompt, Responses, Thinking, Tools,
+    AgentError, AgentHandle, Nanocodex, NanocodexError, Prompt, Responses, ResponsesError,
+    Thinking, Tools,
 };
 
 #[tokio::test]
@@ -37,15 +38,14 @@ async fn follow_on_prompts_reuse_the_session_socket_and_context() -> Result<()> 
     let workspace = temporary_workspace("follow-on")?;
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (agent, mut events) = Nanocodex::builder("test-key")
-        .prompt("custom prompt")
+        .instructions("custom prompt")
         .thinking(Thinking::Low)
+        .workspace(&workspace)
         .responses(responses)
         .session_id("model-test")
         .build()?;
 
-    let first = agent
-        .prompt(Prompt::new("first prompt").workspace(workspace.to_string_lossy()))
-        .await?;
+    let first = agent.prompt(Prompt::new("first prompt")).await?;
     assert_eq!(first.result().await?.final_message, "done");
     let second = agent.prompt(Prompt::new("second prompt")).await?;
     assert_eq!(second.result().await?.final_message, "done");
@@ -110,19 +110,18 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (agent, mut events) = Nanocodex::builder("test-key")
         .thinking(Thinking::Low)
+        .workspace(&workspace)
         .responses(responses)
         .session_id("model-test")
         .build()?;
-    let turn = agent
-        .prompt(Prompt::new("initial task").workspace(workspace.to_string_lossy()))
-        .await?;
+    let turn = agent.prompt(Prompt::new("initial task")).await?;
     first_seen_rx
         .await
         .map_err(|_| eyre!("first request was not observed"))?;
     for index in 0..8 {
-        agent.steer(format!("constraint {index}")).await?;
+        turn.steer(format!("constraint {index}")).await?;
     }
-    let overflow = agent.steer("constraint 8").await.unwrap_err();
+    let overflow = turn.steer("constraint 8").await.unwrap_err();
     assert!(matches!(
         overflow,
         NanocodexError::Agent(AgentError::SteerQueueFull)
@@ -153,6 +152,110 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
     assert_eq!(
         terminal.as_ref().map(|payload| &payload["steers"]),
         Some(&json!(8))
+    );
+
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_targets_one_turn_and_resumes_from_the_last_commit() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (second_seen, second_seen_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first_socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut first_socket).await?);
+        send_warmup(&mut first_socket, "resp-warmup").await?;
+
+        let first = next_json(&mut first_socket).await?;
+        assert_eq!(first["previous_response_id"], "resp-warmup");
+        send_final(&mut first_socket, "resp-first").await?;
+
+        let cancelled = next_json(&mut first_socket).await?;
+        assert_eq!(cancelled["previous_response_id"], "resp-first");
+        assert_eq!(cancelled["input"][0]["content"][0]["text"], "cancel me");
+        second_seen
+            .send(())
+            .map_err(|()| eyre!("second-request signal receiver dropped"))?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut replacement = accept_async(stream).await?;
+        let queued = next_json(&mut replacement).await?;
+        assert_eq!(queued["previous_response_id"], "resp-first");
+        assert_eq!(queued["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            queued["input"][0]["content"][0]["text"],
+            "run after cancellations"
+        );
+        send_final(&mut replacement, "resp-follow-up").await
+    });
+
+    let workspace = temporary_workspace("cancel-turn")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, mut events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+
+    let first = agent.prompt(Prompt::new("first prompt")).await?;
+    assert_eq!(first.result().await?.final_message, "done");
+
+    let cancelled = agent.prompt("cancel me").await?;
+    second_seen_rx
+        .await
+        .map_err(|_| eyre!("second request was not observed"))?;
+    let queued = agent.prompt("cancel before running").await?;
+    let queued_control = queued.control();
+    let follow_up = agent.prompt("run after cancellations").await?;
+
+    assert!(matches!(
+        queued.steer("wrong target").await,
+        Err(NanocodexError::Agent(AgentError::TurnNotActiveToSteer))
+    ));
+    queued.cancel().await?;
+    assert!(matches!(
+        queued_control.cancel().await,
+        Err(NanocodexError::Agent(AgentError::TurnNotCancellable))
+    ));
+
+    let cancellation = cancelled.control();
+    cancellation.cancel().await?;
+    assert!(matches!(
+        cancelled.result().await,
+        Err(NanocodexError::Agent(AgentError::TurnCancelled))
+    ));
+    assert!(matches!(
+        queued.result().await,
+        Err(NanocodexError::Agent(AgentError::TurnCancelled))
+    ));
+    assert!(matches!(
+        cancellation.cancel().await,
+        Err(NanocodexError::Agent(AgentError::TurnNotCancellable))
+    ));
+    assert_eq!(follow_up.result().await?.final_message, "done");
+    drop((queued_control, cancellation, agent));
+
+    let mut terminal_statuses = Vec::new();
+    while let Some(event) = events.recv().await {
+        match event.kind {
+            nanocodex_core::AgentEventKind::RunCompleted
+            | nanocodex_core::AgentEventKind::RunFailed => {
+                let payload = event.decode_payload::<Value>()?;
+                terminal_statuses.push(payload["status"].as_str().unwrap_or_default().to_owned());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        terminal_statuses,
+        ["completed", "cancelled", "cancelled", "completed"]
     );
 
     timeout(std::time::Duration::from_secs(5), server)
@@ -363,7 +466,7 @@ async fn code_mode_notify_adds_a_named_exec_output_to_the_next_request() -> Resu
 }
 
 #[tokio::test]
-async fn prepares_images_and_recovers_from_invalid_image_requests() -> Result<()> {
+async fn prepares_images_and_stops_on_invalid_image_requests() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
@@ -419,20 +522,20 @@ async fn prepares_images_and_recovers_from_invalid_image_requests() -> Result<()
         )
         .await?;
 
-        let retry = next_json(&mut socket).await?;
-        assert_eq!(retry["previous_response_id"], "resp-image");
-        let output = retry["input"][0]["output"]
-            .as_array()
-            .ok_or_else(|| eyre!("sanitized image tool output was not content"))?;
-        assert!(output.iter().all(|item| item["type"] != "input_image"));
-        assert!(output.iter().any(|item| {
-            item["type"] == "input_text" && item["text"].as_str() == Some("Invalid image")
-        }));
-        send_final(&mut socket, "resp-final").await
+        Ok::<(), eyre::Report>(())
     });
 
     let workspace = temporary_workspace("images")?;
-    run_model(&endpoint, &workspace, "inspect images").await?;
+    let error = run_model(&endpoint, &workspace, "inspect images")
+        .await
+        .expect_err("invalid tool image should fail the turn");
+    let error = error
+        .downcast_ref::<NanocodexError>()
+        .ok_or_else(|| eyre!("invalid image returned the wrong error type"))?;
+    assert!(matches!(
+        error.responses_error(),
+        Some(ResponsesError::InvalidImageRequest { .. })
+    ));
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
@@ -1035,11 +1138,12 @@ async fn historical_fork_runs_while_the_mainline_turn_is_in_flight() -> Result<(
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (agent, root_events) = Nanocodex::builder("test-key")
         .thinking(Thinking::Low)
+        .workspace(&workspace)
         .responses(responses)
         .session_id("model-test")
         .build()?;
     let first = agent
-        .prompt(Prompt::new("first prompt").workspace(workspace.to_string_lossy()))
+        .prompt(Prompt::new("first prompt"))
         .await?
         .result()
         .await?;
@@ -1104,6 +1208,7 @@ async fn per_agent_tool_factory_binds_recursive_forks_to_the_invoking_driver() -
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (root, root_events) = Nanocodex::builder("test-key")
         .thinking(Thinking::Low)
+        .workspace(&workspace)
         .responses(responses)
         .session_id("model-test")
         .tools_factory(move |handle| {
@@ -1116,7 +1221,7 @@ async fn per_agent_tool_factory_binds_recursive_forks_to_the_invoking_driver() -
         .await
         .ok_or_else(|| eyre!("root tool factory did not receive a fork handle"))?;
 
-    root.prompt(Prompt::new("root turn").workspace(workspace.to_string_lossy()))
+    root.prompt(Prompt::new("root turn"))
         .await?
         .result()
         .await?;
@@ -1194,7 +1299,7 @@ async fn clean_spawn_reuses_private_configuration_without_history_or_lineage() -
     let workspace = temporary_workspace("clean-spawn-tools")?;
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (root, root_events) = Nanocodex::builder("private-test-key")
-        .prompt("shared private configuration")
+        .instructions("shared private configuration")
         .thinking(Thinking::Low)
         .responses(responses)
         .session_id("root-lineage")
@@ -1276,11 +1381,12 @@ async fn missing_stored_checkpoint_replays_local_history_once() -> Result<()> {
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (agent, root_events) = Nanocodex::builder("test-key")
         .thinking(Thinking::Low)
+        .workspace(&workspace)
         .responses(responses)
         .session_id("model-test")
         .build()?;
     let first = agent
-        .prompt(Prompt::new("root prompt").workspace(workspace.to_string_lossy()))
+        .prompt(Prompt::new("root prompt"))
         .await?
         .result()
         .await?;
@@ -1336,10 +1442,11 @@ fn assert_warmup(warmup: &Value) {
 }
 
 async fn run_model(endpoint: &str, workspace: &Path, instruction: &str) -> Result<String> {
-    let task = Prompt::new(instruction).workspace(workspace.to_string_lossy().into_owned());
+    let task = Prompt::new(instruction);
     let responses = Responses::builder().websocket_url(endpoint).build();
     let (agent, events) = Nanocodex::builder("test-key")
         .thinking(Thinking::Low)
+        .workspace(workspace)
         .responses(responses)
         .session_id("model-test")
         .build()?;

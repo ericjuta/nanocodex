@@ -127,6 +127,10 @@ impl Tools {
 
 pub struct ToolRuntime;
 
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct ToolRuntimeControl;
+
 impl ToolRuntime {
     pub fn new(
         _workspace: impl Into<PathBuf>,
@@ -144,6 +148,12 @@ impl ToolRuntime {
     #[must_use]
     pub const fn default_shell_name(&self) -> &'static str {
         "javascript"
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn control(&self) -> ToolRuntimeControl {
+        ToolRuntimeControl
     }
 
     #[must_use]
@@ -207,6 +217,11 @@ impl ToolRuntime {
     ) -> CodeModeExecution {
         failed("background code-mode cells are unavailable in the WASM runtime")
     }
+}
+
+impl ToolRuntimeControl {
+    #[doc(hidden)]
+    pub async fn cancel(&self) {}
 }
 
 #[expect(

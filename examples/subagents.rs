@@ -285,7 +285,7 @@ async fn main() -> Result<()> {
     let child_agents = Arc::new(ChildAgents::default());
     let tools_agents = Arc::downgrade(&child_agents);
     let (agent, events) = Nanocodex::builder(api_key)
-        .prompt(
+        .instructions(
             "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest completed context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
         )
         .thinking(Thinking::Low)

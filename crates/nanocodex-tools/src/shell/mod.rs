@@ -195,6 +195,21 @@ impl ShellSessions {
         }
         result
     }
+
+    pub(crate) async fn terminate_all(&self) {
+        let sessions = {
+            let mut store = self.sessions.lock().await;
+            store.recency.clear();
+            store
+                .sessions
+                .drain()
+                .map(|(_, session)| session)
+                .collect::<Vec<_>>()
+        };
+        for session in sessions {
+            session.terminate().await;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -602,6 +617,43 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(contents, "survived");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_terminates_shell_descendants() -> Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "nanocodex-cancelled-process-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let marker = directory.join("escaped");
+        let sessions = ShellSessions::new();
+
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    format!("(sleep 1; printf escaped > '{}') & wait", marker.display()),
+                    None,
+                    None,
+                    Some(false),
+                    false,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(result.session_id, Some(1));
+
+        sessions.terminate_all().await;
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        assert!(!marker.exists(), "a cancelled shell descendant escaped");
+        std::fs::remove_dir_all(directory)?;
         Ok(())
     }
 

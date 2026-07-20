@@ -193,38 +193,6 @@ impl ContextManager {
         ResponseHistory::new(repaired)
     }
 
-    pub(super) fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
-        for item in self.items.tail_mut().iter_mut().rev() {
-            if item.is_user_message() {
-                return false;
-            }
-            let (ResponseItem::FunctionCallOutput {
-                output: FunctionOutputBody::Content(output),
-                ..
-            }
-            | ResponseItem::CustomToolCallOutput {
-                output: FunctionOutputBody::Content(output),
-                ..
-            }) = item
-            else {
-                continue;
-            };
-            let mut replaced = false;
-            for content in output {
-                if matches!(content, FunctionOutputContent::InputImage { .. }) {
-                    *content = FunctionOutputContent::InputText {
-                        text: placeholder.into(),
-                    };
-                    replaced = true;
-                }
-            }
-            if replaced {
-                return true;
-            }
-        }
-        false
-    }
-
     fn items_after_last_model_generated_tokens(&self) -> u64 {
         let mut tokens = 0_u64;
         for item in &self.items {

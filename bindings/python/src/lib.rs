@@ -18,12 +18,12 @@ struct Nanocodex {
 #[pymethods]
 impl Nanocodex {
     #[new]
-    #[pyo3(signature = (api_key, *, thinking = "medium", workspace = None, system_prompt = None))]
+    #[pyo3(signature = (api_key, *, thinking = "medium", workspace = None, instructions = None))]
     fn new(
         api_key: String,
         thinking: &str,
         workspace: Option<String>,
-        system_prompt: Option<String>,
+        instructions: Option<String>,
     ) -> PyResult<(Self, AgentEvents)> {
         let thinking = parse_thinking(thinking)?;
         let runtime = build_runtime()?;
@@ -33,8 +33,8 @@ impl Nanocodex {
                 if let Some(workspace) = workspace {
                     builder = builder.workspace(workspace);
                 }
-                if let Some(system_prompt) = system_prompt {
-                    builder = builder.prompt(system_prompt);
+                if let Some(instructions) = instructions {
+                    builder = builder.instructions(instructions);
                 }
                 builder.build()
             })

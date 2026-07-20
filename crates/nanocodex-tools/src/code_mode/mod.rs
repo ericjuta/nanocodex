@@ -35,8 +35,14 @@ const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
 pub(crate) struct CodeModeRuntime {
-    cells: Mutex<CellRegistry>,
+    cells: Arc<Mutex<CellRegistry>>,
     stored: Arc<Mutex<HashMap<String, Value>>>,
+    host: Arc<Mutex<SharedNodeHost>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CodeModeControl {
+    cells: Arc<Mutex<CellRegistry>>,
     host: Arc<Mutex<SharedNodeHost>>,
 }
 
@@ -205,15 +211,22 @@ struct HostFailure {
 impl CodeModeRuntime {
     pub(super) fn new(workspace: PathBuf) -> Self {
         Self {
-            cells: Mutex::new(CellRegistry {
+            cells: Arc::new(Mutex::new(CellRegistry {
                 next_cell_id: 1,
                 live_cells: HashMap::new(),
-            }),
+            })),
             stored: Arc::new(Mutex::new(HashMap::new())),
             host: Arc::new(Mutex::new(SharedNodeHost {
                 workspace,
                 host: None,
             })),
+        }
+    }
+
+    pub(super) fn control(&self) -> CodeModeControl {
+        CodeModeControl {
+            cells: Arc::clone(&self.cells),
+            host: Arc::clone(&self.host),
         }
     }
 
@@ -383,6 +396,25 @@ impl CodeModeRuntime {
             live_cell.join().await;
         }
         execution
+    }
+}
+
+impl CodeModeControl {
+    pub(super) async fn terminate_all(&self) {
+        let cells = {
+            let mut registry = self.cells.lock().await;
+            std::mem::take(&mut registry.live_cells)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
+        for mut cell in cells {
+            cell.terminate().await;
+        }
+
+        let mut shared_host = self.host.lock().await;
+        if let Some(mut host) = shared_host.host.take() {
+            host.terminate().await;
+        }
     }
 }
 

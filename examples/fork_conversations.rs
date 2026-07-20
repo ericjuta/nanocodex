@@ -45,16 +45,16 @@ async fn main() -> Result<()> {
         .layer(ConcurrencyLimitLayer::new(1))
         .build();
 
-    // A fully custom Service<ResponsesAttempt> should instead be supplied with
-    // `Responses::builder().service_factory(|| make_service()).build()` so each
-    // branch gets independent mutable service state. A one-off `.service(...)`
-    // can drive the root but deliberately cannot be forked.
+    // A fully custom Service<ResponsesAttempt> is supplied as
+    // `Responses::builder().service(|| make_service()).build()` so the root,
+    // cancellation replacements, and every branch get independent mutable
+    // service state.
     let tools = Tools::builder().without_defaults().build()?;
     let lineage = format!("fork-ledger-example-{}", process::id());
     let workspace = std::env::current_dir().wrap_err("failed to resolve the current directory")?;
     let (agent, root_events) = Nanocodex::builder(api_key)
         .session_id(&lineage)
-        .prompt(LEDGER_PROMPT)
+        .instructions(LEDGER_PROMPT)
         .thinking(Thinking::Low)
         .tools(tools)
         .workspace(workspace)

@@ -442,7 +442,7 @@ fn sanitize_path_component(value: &str) -> String {
 fn image_output_hint(path: &Path) -> Option<String> {
     let output_dir = path.parent()?;
     let hint = format!(
-        "Generated images are saved to {} as {} by default.\nIf you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.",
+        "Generated images are saved to {} as {} by default.\nIf you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it.\nThe generated image is already displayed to the user. There is no need to render it in the final response as a Markdown image or file link.",
         output_dir.display(),
         path.display()
     );

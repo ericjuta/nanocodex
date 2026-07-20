@@ -19,13 +19,14 @@ const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 /// The single Responses model contract supported by this SDK.
 pub const MODEL: &str = "gpt-5.6-sol";
 
-/// Input for one agent turn.
+/// User input for one agent turn.
+///
+/// Session policy such as the filesystem workspace belongs to the agent
+/// builder rather than an individual prompt.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prompt {
     pub instruction: PromptInput,
-    #[serde(default)]
-    pub workspace: Option<String>,
 }
 
 impl Prompt {
@@ -33,7 +34,6 @@ impl Prompt {
     pub fn new(instruction: impl Into<String>) -> Self {
         Self {
             instruction: PromptInput::Text(instruction.into()),
-            workspace: None,
         }
     }
 
@@ -42,14 +42,7 @@ impl Prompt {
     pub fn content(input: impl IntoIterator<Item = UserInput>) -> Self {
         Self {
             instruction: PromptInput::Content(input.into_iter().collect()),
-            workspace: None,
         }
-    }
-
-    #[must_use]
-    pub fn workspace(mut self, workspace: impl Into<String>) -> Self {
-        self.workspace = Some(workspace.into());
-        self
     }
 }
 
@@ -262,5 +255,31 @@ impl FromStr for Thinking {
                 "invalid reasoning effort {value:?}; expected low, medium, high, xhigh, or max"
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::Prompt;
+
+    #[test]
+    fn prompt_serialization_contains_only_user_input() {
+        let prompt = Prompt::new("inspect the repository");
+        assert_eq!(
+            serde_json::to_value(prompt).unwrap(),
+            json!({ "instruction": "inspect the repository" })
+        );
+    }
+
+    #[test]
+    fn prompt_deserialization_rejects_session_policy() {
+        let error = serde_json::from_value::<Prompt>(json!({
+            "instruction": "inspect the repository",
+            "workspace": "/work/project"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `workspace`"));
     }
 }

@@ -1,4 +1,12 @@
-use std::{collections::VecDeque, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fmt,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use nanocodex_core::{AgentEvents, EventSink, ModelConfig, Prompt, Thinking};
 use nanocodex_service::{
@@ -39,11 +47,47 @@ impl ToolsConfiguration {
 }
 
 /// Completion handle for an accepted turn.
+///
+/// Dropping this handle does not cancel the accepted turn. Use [`Self::cancel`]
+/// before dropping it when the work should stop.
+#[must_use = "a turn continues running when dropped; await result(), control it, or explicitly drop it"]
 pub struct Turn {
+    control: TurnControl,
     result: oneshot::Receiver<Result<TurnResult>>,
 }
 
 impl Turn {
+    /// Returns a cheap cloneable capability targeting this exact turn.
+    #[must_use]
+    pub fn control(&self) -> TurnControl {
+        self.control.clone()
+    }
+
+    /// Injects additional input into this turn at its next safe model boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty prompt, when this turn is queued or no
+    /// longer active, when its steering queue is full, or if the driver stops.
+    pub async fn steer(&self, prompt: impl Into<Prompt>) -> Result<()> {
+        self.control.steer(prompt).await
+    }
+
+    /// Cancels this exact unfinished turn.
+    ///
+    /// A queued turn is removed before execution and acknowledged immediately;
+    /// its result and terminal event retain their FIFO position behind earlier
+    /// turns. An active turn waits for its model and tool resources to stop
+    /// before cancellation is acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this turn has already finished or if the driver
+    /// stops.
+    pub async fn cancel(&self) -> Result<()> {
+        self.control.cancel().await
+    }
+
     /// Waits for and returns the final typed turn result.
     ///
     /// # Errors
@@ -55,6 +99,65 @@ impl Turn {
             .map_err(|_| NanocodexError::Agent(AgentError::TurnStopped))?
     }
 }
+
+/// Cheap cloneable control capability for one accepted turn.
+#[derive(Clone)]
+pub struct TurnControl {
+    key: TurnKey,
+    commands: mpsc::Sender<Command>,
+}
+
+impl TurnControl {
+    /// Injects additional input into the targeted turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty prompt, when the turn is not active, when
+    /// its steering queue is full, or if the driver stops.
+    pub async fn steer(&self, prompt: impl Into<Prompt>) -> Result<()> {
+        let prompt = prompt.into();
+        if prompt.instruction.is_empty() {
+            return Err(NanocodexError::InvalidRequest(
+                "steer instruction must not be empty".to_owned(),
+            ));
+        }
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::Steer {
+                key: self.key,
+                prompt,
+                result,
+            })
+            .await
+            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?;
+        receiver
+            .await
+            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?
+    }
+
+    /// Cancels the targeted unfinished turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the turn has already finished or if the driver
+    /// stops.
+    pub async fn cancel(&self) -> Result<()> {
+        let (result, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::Cancel {
+                key: self.key,
+                result,
+            })
+            .await
+            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?;
+        receiver
+            .await
+            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct TurnKey(u64);
 
 /// Final result of a completed turn.
 #[derive(Clone)]
@@ -81,11 +184,17 @@ struct CommittedCheckpoint {
 
 enum Command {
     Prompt {
+        key: TurnKey,
         prompt: Prompt,
         result: oneshot::Sender<Result<TurnResult>>,
     },
     Steer {
+        key: TurnKey,
         prompt: Prompt,
+        result: oneshot::Sender<Result<()>>,
+    },
+    Cancel {
+        key: TurnKey,
         result: oneshot::Sender<Result<()>>,
     },
     Fork {
@@ -97,11 +206,23 @@ enum Command {
     },
 }
 
+enum QueuedTurn {
+    Pending {
+        key: TurnKey,
+        prompt: Prompt,
+        result: oneshot::Sender<Result<TurnResult>>,
+    },
+    Cancelled {
+        prompt: Prompt,
+        result: oneshot::Sender<Result<TurnResult>>,
+    },
+}
+
 /// Cheap, cloneable command handle for an owned agent driver.
 #[derive(Clone)]
 pub struct Nanocodex {
     commands: mpsc::Sender<Command>,
-    workspace: Option<Arc<str>>,
+    next_turn: Arc<AtomicU64>,
     lineage_id: Arc<str>,
 }
 
@@ -123,8 +244,7 @@ impl AgentHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error after the containing driver has stopped or when its
-    /// Responses configuration cannot create a fresh service.
+    /// Returns an error after the containing driver has stopped.
     pub async fn spawn(&self) -> Result<(Nanocodex, AgentEvents)> {
         let commands = self.commands()?;
         request_spawn(&commands).await
@@ -149,7 +269,7 @@ impl AgentHandle {
 }
 
 impl Nanocodex {
-    /// Builds a running agent with the standard prompt, tools, thinking level,
+    /// Builds a running agent with the standard instructions, tools, thinking level,
     /// and Responses WebSocket stack, returning its prompt handle and ordered
     /// event stream.
     ///
@@ -182,55 +302,33 @@ impl Nanocodex {
     ///
     /// Returns an error for an empty prompt or if the driver stopped.
     pub async fn prompt(&self, prompt: impl Into<Prompt>) -> Result<Turn> {
-        let mut prompt = prompt.into();
+        let prompt = prompt.into();
         if prompt.instruction.is_empty() {
             return Err(NanocodexError::InvalidRequest(
                 "prompt instruction must not be empty".to_owned(),
             ));
         }
-        if prompt.workspace.is_none() {
-            prompt.workspace = self.workspace.as_deref().map(str::to_owned);
-        }
+        let key = TurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
         let (result, receiver) = oneshot::channel();
         if self
             .commands
-            .send(Command::Prompt { prompt, result })
+            .send(Command::Prompt {
+                key,
+                prompt,
+                result,
+            })
             .await
             .is_err()
         {
             return Err(NanocodexError::Agent(AgentError::DriverStopped));
         }
-        Ok(Turn { result: receiver })
-    }
-
-    /// Injects additional input into the active turn.
-    ///
-    /// Accepted input is retained in FIFO order and sampled at the next safe
-    /// model boundary. It remains part of the active turn rather than starting
-    /// a separately awaitable turn. Use [`Self::prompt`] to queue a follow-up.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an empty prompt, when no turn is active, or if the
-    /// driver stopped.
-    pub async fn steer(&self, prompt: impl Into<Prompt>) -> Result<()> {
-        let mut prompt = prompt.into();
-        if prompt.instruction.is_empty() {
-            return Err(NanocodexError::InvalidRequest(
-                "steer instruction must not be empty".to_owned(),
-            ));
-        }
-        // A steer always belongs to the active turn and therefore cannot move
-        // that turn to another workspace.
-        prompt.workspace = self.workspace.as_deref().map(str::to_owned);
-        let (result, receiver) = oneshot::channel();
-        self.commands
-            .send(Command::Steer { prompt, result })
-            .await
-            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?;
-        receiver
-            .await
-            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?
+        Ok(Turn {
+            control: TurnControl {
+                key,
+                commands: self.commands.clone(),
+            },
+            result: receiver,
+        })
     }
 
     /// Forks from the latest completed turn into an independently driven agent.
@@ -240,8 +338,8 @@ impl Nanocodex {
     ///
     /// # Errors
     ///
-    /// Returns an error before the first completed turn, when the driver has
-    /// stopped, or when the configured Responses stack cannot be recreated.
+    /// Returns an error before the first completed turn or when the driver has
+    /// stopped.
     pub async fn fork(&self) -> Result<(Self, AgentEvents)> {
         self.request_fork(None).await
     }
@@ -251,8 +349,8 @@ impl Nanocodex {
     ///
     /// # Errors
     ///
-    /// Returns an error when the result belongs to another conversation, the
-    /// driver stopped, or the configured Responses stack cannot be recreated.
+    /// Returns an error when the result belongs to another conversation or the
+    /// driver stopped.
     pub async fn fork_from(&self, completed: &TurnResult) -> Result<(Self, AgentEvents)> {
         if completed.checkpoint.lineage_id != self.lineage_id {
             return Err(AgentError::CheckpointLineageMismatch.into());
@@ -304,10 +402,10 @@ pub struct NanocodexBuilder<S = StandardResponses> {
 }
 
 impl<S> NanocodexBuilder<S> {
-    /// Replaces the stable system/developer prompt.
+    /// Replaces the stable system/developer instructions.
     #[must_use]
-    pub fn prompt(mut self, prompt: impl Into<Arc<str>>) -> Self {
-        self.config.system_prompt = prompt.into();
+    pub fn instructions(mut self, instructions: impl Into<Arc<str>>) -> Self {
+        self.config.system_prompt = instructions.into();
         self
     }
 
@@ -383,14 +481,12 @@ impl NanocodexBuilder<StandardResponses> {
             let config = Arc::clone(&config);
             move || ResponsesService::standard(Arc::clone(&config))
         });
-        let service = service_factory();
         build_agent(
             config,
             self.tools,
             self.workspace,
             self.session_id,
-            service,
-            Some(service_factory),
+            service_factory,
         )
     }
 }
@@ -423,21 +519,19 @@ where
                     .service(ResponsesService::standard(Arc::clone(&config)))
             }
         });
-        let service = service_factory();
         build_agent(
             config,
             self.tools,
             self.workspace,
             self.session_id,
-            service,
-            Some(service_factory),
+            service_factory,
         )
     }
 }
 
 impl<F, S> NanocodexBuilder<FactoryResponses<F>>
 where
-    F: Fn() -> S + Clone + Send + Sync + 'static,
+    F: Fn() -> S + Send + Sync + 'static,
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
     S::Error: Into<NanocodexError> + Send + 'static,
     S::Future: Send,
@@ -454,43 +548,13 @@ where
         configure(&mut self.config, &self.responses);
         validate(&self.config, self.session_id.as_deref())?;
         let config = Arc::new(self.config);
-        let factory = self.responses.service.0;
-        let service_factory: ServiceFactory<S> = Arc::new(move || factory.clone()());
-        let service = service_factory();
+        let service_factory: ServiceFactory<S> = Arc::new(self.responses.service.0);
         build_agent(
             config,
             self.tools,
             self.workspace,
             self.session_id,
-            service,
-            Some(service_factory),
-        )
-    }
-}
-
-impl<S> NanocodexBuilder<S>
-where
-    S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
-    S::Error: Into<NanocodexError> + Send + 'static,
-    S::Future: Send,
-{
-    /// Builds and spawns the agent with the caller's Responses service stack,
-    /// returning its prompt handle and ordered event stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid configuration or when no Tokio runtime is
-    /// active.
-    pub fn build(mut self) -> Result<(Nanocodex, AgentEvents)> {
-        configure(&mut self.config, &self.responses);
-        validate(&self.config, self.session_id.as_deref())?;
-        build_agent(
-            Arc::new(self.config),
-            self.tools,
-            self.workspace,
-            self.session_id,
-            self.responses.service,
-            None,
+            service_factory,
         )
     }
 }
@@ -511,7 +575,7 @@ struct BranchSpawner<S> {
     config: Arc<ModelConfig>,
     tools: ToolsConfiguration,
     lineage_id: Arc<str>,
-    service_factory: Option<ServiceFactory<S>>,
+    service_factory: ServiceFactory<S>,
 }
 
 impl<S> Clone for BranchSpawner<S> {
@@ -520,7 +584,7 @@ impl<S> Clone for BranchSpawner<S> {
             config: Arc::clone(&self.config),
             tools: self.tools.clone(),
             lineage_id: Arc::clone(&self.lineage_id),
-            service_factory: self.service_factory.clone(),
+            service_factory: Arc::clone(&self.service_factory),
         }
     }
 }
@@ -549,7 +613,7 @@ where
         });
         let mut model = if let Some(checkpoint) = self.initial_checkpoint.take() {
             ModelRun::from_checkpoint(
-                self.events,
+                self.events.clone(),
                 Arc::clone(&self.spawner.config),
                 self.client,
                 Arc::clone(&self.transport_stats),
@@ -559,7 +623,7 @@ where
             )
         } else {
             ModelRun::new(
-                self.events,
+                self.events.clone(),
                 Arc::clone(&self.spawner.config),
                 self.client,
                 Arc::clone(&self.transport_stats),
@@ -569,24 +633,61 @@ where
         };
         let mut turn_index = 0_u64;
         let mut latest_checkpoint = inherited_checkpoint;
-        let mut queued_prompts: VecDeque<(Prompt, oneshot::Sender<Result<TurnResult>>)> =
-            VecDeque::new();
+        let mut queued_turns = VecDeque::new();
         let mut commands_open = true;
         loop {
-            let command = if let Some(prompt) = queued_prompts.pop_front() {
-                Command::Prompt {
-                    prompt: prompt.0,
-                    result: prompt.1,
+            let command = loop {
+                if let Some(queued) = queued_turns.pop_front() {
+                    match queued {
+                        QueuedTurn::Pending {
+                            key,
+                            prompt,
+                            result,
+                        } => {
+                            break Command::Prompt {
+                                key,
+                                prompt,
+                                result,
+                            };
+                        }
+                        QueuedTurn::Cancelled { prompt, result } => {
+                            turn_index += 1;
+                            let turn_span = info_span!(
+                                target: "nanocodex",
+                                parent: None,
+                                "agent.turn",
+                                otel.kind = "internal",
+                                otel.status_code = "ERROR",
+                                session.id = session_id.as_str(),
+                                model = nanocodex_core::MODEL,
+                                thinking = thinking.as_str(),
+                                turn.index = turn_index,
+                                prompt.bytes = prompt.instruction.text_bytes(),
+                                status = "cancelled",
+                            );
+                            let _guard = turn_span.enter();
+                            model
+                                .emit_cancelled_before_start(&prompt, self.workspace.as_deref())?;
+                            drop(result.send(Err(AgentError::TurnCancelled.into())));
+                            continue;
+                        }
+                    }
                 }
-            } else if commands_open {
-                let Some(command) = self.commands.recv().await else {
-                    break;
-                };
-                command
-            } else {
-                break;
+                if commands_open {
+                    let Some(command) = self.commands.recv().await else {
+                        commands_open = false;
+                        continue;
+                    };
+                    break command;
+                }
+                return Ok(());
             };
-            let Command::Prompt { prompt, result } = command else {
+            let Command::Prompt {
+                key,
+                prompt,
+                result,
+            } = command
+            else {
                 handle_idle_command(
                     command,
                     latest_checkpoint.as_ref(),
@@ -595,9 +696,6 @@ where
                 );
                 continue;
             };
-            if self.workspace.is_none() {
-                self.workspace = prompt.workspace.as_deref().map(Arc::from);
-            }
             turn_index += 1;
             let turn_span = info_span!(
                 target: "nanocodex",
@@ -613,32 +711,64 @@ where
                 status = tracing::field::Empty,
             );
             let (steers, steer_rx) = mpsc::channel(STEER_CAPACITY);
+            let (cancel, cancel_rx) = oneshot::channel();
+            let mut cancel = Some(cancel);
+            let mut cancel_result = None;
             let mut execution = Box::pin(
                 model
-                    .execute(prompt, steer_rx)
+                    .execute(prompt, self.workspace.clone(), steer_rx, cancel_rx)
                     .instrument(turn_span.clone()),
             );
             let completed = loop {
                 if !commands_open {
-                    break execution.await;
+                    break execution.as_mut().await;
                 }
                 tokio::select! {
                     biased;
                     command = self.commands.recv() => {
                         match command {
-                            Some(Command::Prompt { prompt, result }) => {
-                                queued_prompts.push_back((prompt, result));
+                            Some(Command::Prompt { key, prompt, result }) => {
+                                queued_turns.push_back(QueuedTurn::Pending {
+                                    key,
+                                    prompt,
+                                    result,
+                                });
                             }
-                            Some(Command::Steer { prompt, result }) => {
+                            Some(Command::Steer { key: target, prompt, result }) => {
+                                if target != key {
+                                    drop(result.send(Err(AgentError::TurnNotActiveToSteer.into())));
+                                    continue;
+                                }
                                 let outcome = steers.try_send(prompt).map_err(|error| match error {
                                     mpsc::error::TrySendError::Full(_) => {
                                         NanocodexError::Agent(AgentError::SteerQueueFull)
                                     }
                                     mpsc::error::TrySendError::Closed(_) => {
-                                        NanocodexError::Agent(AgentError::NoActiveTurnToSteer)
+                                        NanocodexError::Agent(AgentError::TurnNotActiveToSteer)
                                     }
                                 });
                                 drop(result.send(outcome));
+                            }
+                            Some(Command::Cancel { key: target, result: cancellation }) => {
+                                if target != key {
+                                    if cancel_queued_turn(&mut queued_turns, target) {
+                                        drop(cancellation.send(Ok(())));
+                                    } else {
+                                        drop(cancellation.send(Err(
+                                            AgentError::TurnNotCancellable.into(),
+                                        )));
+                                    }
+                                    continue;
+                                }
+                                let Some(cancel) = cancel.take() else {
+                                    drop(cancellation.send(Err(
+                                        AgentError::TurnNotCancellable.into(),
+                                    )));
+                                    continue;
+                                };
+                                let _ = cancel.send(());
+                                cancel_result = Some(cancellation);
+                                break execution.as_mut().await;
                             }
                             Some(command @ (Command::Fork { .. } | Command::Spawn { .. })) => {
                                 handle_idle_command(
@@ -654,6 +784,35 @@ where
                     outcome = &mut execution => break outcome,
                 }
             };
+            drop(execution);
+            let was_cancelled = matches!(
+                &completed,
+                Err(NanocodexError::Agent(AgentError::TurnCancelled))
+            );
+            if was_cancelled {
+                let service = (self.spawner.service_factory)();
+                let replacement = if let Some(checkpoint) = latest_checkpoint.as_ref() {
+                    ModelRun::from_checkpoint(
+                        self.events.clone(),
+                        Arc::clone(&self.spawner.config),
+                        ResponsesClient::new(service),
+                        Arc::clone(&self.transport_stats),
+                        self.tools.clone(),
+                        Arc::clone(&self.spawner.lineage_id),
+                        checkpoint.model.clone(),
+                    )
+                } else {
+                    ModelRun::new(
+                        self.events.clone(),
+                        Arc::clone(&self.spawner.config),
+                        ResponsesClient::new(service),
+                        Arc::clone(&self.transport_stats),
+                        self.tools.clone(),
+                        Arc::clone(&self.spawner.lineage_id),
+                    )
+                };
+                model = replacement;
+            }
             let outcome = completed.map(|completed| {
                 let CompletedModelTurn {
                     final_message,
@@ -671,7 +830,9 @@ where
             });
             turn_span.record(
                 "status",
-                if outcome.is_ok() {
+                if was_cancelled {
+                    "cancelled"
+                } else if outcome.is_ok() {
                     "completed"
                 } else {
                     "failed"
@@ -682,9 +843,33 @@ where
                 if outcome.is_ok() { "OK" } else { "ERROR" },
             );
             drop(result.send(outcome));
+            if let Some(cancel_result) = cancel_result {
+                let outcome = if was_cancelled {
+                    Ok(())
+                } else {
+                    Err(AgentError::TurnNotCancellable.into())
+                };
+                drop(cancel_result.send(outcome));
+            }
         }
-        Ok(())
     }
+}
+
+fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) -> bool {
+    let Some(position) = queued_turns
+        .iter()
+        .position(|queued| matches!(queued, QueuedTurn::Pending { key, .. } if *key == target))
+    else {
+        return false;
+    };
+    let Some(queued) = queued_turns.remove(position) else {
+        return false;
+    };
+    let QueuedTurn::Pending { prompt, result, .. } = queued else {
+        return false;
+    };
+    queued_turns.insert(position, QueuedTurn::Cancelled { prompt, result });
+    true
 }
 
 fn handle_idle_command<S>(
@@ -709,7 +894,10 @@ fn handle_idle_command<S>(
             drop(result.send(spawner.spawn_clean(workspace)));
         }
         Command::Steer { result, .. } => {
-            drop(result.send(Err(AgentError::NoActiveTurnToSteer.into())));
+            drop(result.send(Err(AgentError::TurnNotActiveToSteer.into())));
+        }
+        Command::Cancel { result, .. } => {
+            drop(result.send(Err(AgentError::TurnNotCancellable.into())));
         }
         Command::Prompt { .. } => {}
     }
@@ -722,34 +910,27 @@ where
     S::Future: Send,
 {
     fn spawn_fork(&self, checkpoint: &CommittedCheckpoint) -> Result<(Nanocodex, AgentEvents)> {
-        let service_factory = self
-            .service_factory
-            .as_ref()
-            .ok_or(AgentError::ChildUnsupportedForResponsesService)?;
         let session_id = new_session_id();
         let workspace = Some(Arc::<str>::from(checkpoint.model.workspace()));
         spawn_agent_driver(
             self.clone(),
             session_id,
             workspace,
-            service_factory(),
+            (self.service_factory)(),
             Some(checkpoint.model.clone()),
         )
     }
 
     fn spawn_clean(&self, workspace: Option<Arc<str>>) -> Result<(Nanocodex, AgentEvents)> {
-        let service_factory = self
-            .service_factory
-            .as_ref()
-            .ok_or(AgentError::ChildUnsupportedForResponsesService)?;
         let session_id = new_session_id();
         let spawner = Self {
             config: Arc::clone(&self.config),
             tools: self.tools.clone(),
             lineage_id: Arc::from(session_id.as_str()),
-            service_factory: self.service_factory.clone(),
+            service_factory: Arc::clone(&self.service_factory),
         };
-        spawn_agent_driver(spawner, session_id, workspace, service_factory(), None)
+        let service = (self.service_factory)();
+        spawn_agent_driver(spawner, session_id, workspace, service, None)
     }
 }
 
@@ -758,8 +939,7 @@ fn build_agent<S>(
     tools: ToolsConfiguration,
     workspace: Option<PathBuf>,
     session_id: Option<String>,
-    service: S,
-    service_factory: Option<ServiceFactory<S>>,
+    service_factory: ServiceFactory<S>,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
@@ -778,6 +958,7 @@ where
                 })
         })
         .transpose()?;
+    let service = service_factory();
     spawn_agent_driver(
         BranchSpawner {
             config,
@@ -814,7 +995,7 @@ where
     let transport_stats = Arc::new(TransportStats::default());
     let agent = Nanocodex {
         commands,
-        workspace,
+        next_turn: Arc::new(AtomicU64::new(1)),
         lineage_id: Arc::clone(&spawner.lineage_id),
     };
     drop(
@@ -825,7 +1006,7 @@ where
                 client: ResponsesClient::new(service),
                 transport_stats,
                 tools,
-                workspace: agent.workspace.clone(),
+                workspace,
                 spawner,
                 initial_checkpoint,
             }
@@ -878,7 +1059,10 @@ fn new_session_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Ready, time::Duration};
+    use std::{
+        future::{Pending, Ready, pending},
+        time::Duration,
+    };
 
     use super::*;
     use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
@@ -903,13 +1087,36 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PendingService;
+
+    impl Service<ResponsesAttempt> for PendingService {
+        type Response = ResponsesServiceResponse;
+        type Error = NanocodexError;
+        type Future = Pending<std::result::Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: ResponsesAttempt) -> Self::Future {
+            pending()
+        }
+    }
+
     #[tokio::test]
-    async fn accepts_a_caller_composed_tower_stack() {
-        let stack = ServiceBuilder::new()
-            .layer(TimeoutLayer::new(Duration::from_secs(30)))
-            .layer(ConcurrencyLimitLayer::new(1))
-            .service(NeverCalled);
-        let responses = Responses::builder().service(stack).build();
+    async fn accepts_a_caller_composed_tower_service_factory() {
+        let responses = Responses::builder()
+            .service(|| {
+                ServiceBuilder::new()
+                    .layer(TimeoutLayer::new(Duration::from_secs(30)))
+                    .layer(ConcurrencyLimitLayer::new(1))
+                    .service(NeverCalled)
+            })
+            .build();
 
         let (_agent, events) = Nanocodex::builder("test")
             .responses(responses)
@@ -948,19 +1155,48 @@ mod tests {
     #[tokio::test]
     async fn steering_without_an_active_turn_is_typed() {
         let (agent, events) = Nanocodex::new("test").unwrap();
-        let Err(error) = agent.steer("additional direction").await else {
+        let control = TurnControl {
+            key: TurnKey(1),
+            commands: agent.commands.clone(),
+        };
+        let Err(error) = control.steer("additional direction").await else {
             panic!("steer unexpectedly succeeded");
         };
         assert!(matches!(
             error,
-            NanocodexError::Agent(AgentError::NoActiveTurnToSteer)
+            NanocodexError::Agent(AgentError::TurnNotActiveToSteer)
         ));
         drop((agent, events));
     }
 
     #[tokio::test]
+    async fn caller_service_factory_supports_cancellation() {
+        let builds = Arc::new(AtomicU64::new(0));
+        let factory_builds = Arc::clone(&builds);
+        let responses = Responses::builder()
+            .service(move || {
+                factory_builds.fetch_add(1, Ordering::Relaxed);
+                PendingService
+            })
+            .build();
+        let (agent, events) = Nanocodex::builder("test")
+            .responses(responses)
+            .build()
+            .unwrap();
+        let turn = agent.prompt("keep running").await.unwrap();
+
+        turn.cancel().await.unwrap();
+        assert!(matches!(
+            turn.result().await,
+            Err(NanocodexError::Agent(AgentError::TurnCancelled))
+        ));
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        drop((agent, events));
+    }
+
+    #[tokio::test]
     async fn accepts_a_caller_service_factory_for_future_children() {
-        let responses = Responses::builder().service_factory(|| NeverCalled).build();
+        let responses = Responses::builder().service(|| NeverCalled).build();
         let (agent, events) = Nanocodex::builder("test")
             .responses(responses)
             .build()
@@ -969,9 +1205,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_spawn_requires_a_fresh_responses_service_factory() {
+    async fn caller_service_factory_supports_clean_spawn() {
         let (handles, mut received_handles) = mpsc::unbounded_channel();
-        let responses = Responses::builder().service(NeverCalled).build();
+        let responses = Responses::builder().service(|| NeverCalled).build();
         let (agent, events) = Nanocodex::builder("test")
             .responses(responses)
             .tools_factory(move |handle| {
@@ -982,14 +1218,8 @@ mod tests {
             .unwrap();
         let handle = received_handles.recv().await.unwrap();
 
-        let Err(error) = handle.spawn().await else {
-            panic!("clean spawn unexpectedly recreated an opaque Responses service");
-        };
-        assert!(matches!(
-            error,
-            NanocodexError::Agent(AgentError::ChildUnsupportedForResponsesService)
-        ));
-        drop((agent, events));
+        let (child, child_events) = handle.spawn().await.unwrap();
+        drop((child, child_events, agent, events));
     }
 
     #[tokio::test]

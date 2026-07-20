@@ -27,7 +27,7 @@ struct WasmConfig {
     #[serde(default = "default_api_base_url")]
     api_base_url: String,
     #[serde(default)]
-    system_prompt: Option<String>,
+    instructions: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
@@ -43,7 +43,6 @@ struct Command {
 #[wasm_bindgen(js_name = Nanocodex)]
 pub struct WasmNanocodex {
     commands: mpsc::UnboundedSender<Command>,
-    workspace: Option<String>,
 }
 
 #[wasm_bindgen(js_class = Nanocodex)]
@@ -66,7 +65,7 @@ impl WasmNanocodex {
             websocket_url: config.websocket_url,
             api_base_url: config.api_base_url,
             system_prompt: config
-                .system_prompt
+                .instructions
                 .map_or_else(|| ModelConfig::default().system_prompt, Arc::from),
         });
         let (events, mut event_stream) = EventSink::channel(session_id);
@@ -89,23 +88,22 @@ impl WasmNanocodex {
             Tools,
             lineage_id,
         );
+        let workspace = config.workspace.map(Arc::<str>::from);
         let (commands, mut receiver) = mpsc::unbounded_channel::<Command>();
         spawn_local(async move {
             while let Some(command) = receiver.recv().await {
                 let (steers, steer_rx) = mpsc::channel(1);
                 drop(steers);
+                let (_cancel, cancel_rx) = tokio::sync::oneshot::channel();
                 let outcome = model
-                    .execute(command.prompt, steer_rx)
+                    .execute(command.prompt, workspace.clone(), steer_rx, cancel_rx)
                     .await
                     .map(|completed| completed.final_message)
                     .map_err(|error| error.to_string());
                 drop(command.result.send(outcome));
             }
         });
-        Ok(Self {
-            commands,
-            workspace: config.workspace,
-        })
+        Ok(Self { commands })
     }
 
     /// Accept a prompt immediately and return its independently awaitable turn.
@@ -117,8 +115,7 @@ impl WasmNanocodex {
         if instruction.trim().is_empty() {
             return Err(js_error("prompt instruction must not be empty"));
         }
-        let mut prompt = Prompt::new(instruction);
-        prompt.workspace.clone_from(&self.workspace);
+        let prompt = Prompt::new(instruction);
         let (result, receiver) = oneshot::channel();
         self.commands
             .send(Command { prompt, result })

@@ -46,20 +46,23 @@ pub enum AgentError {
     #[error("the agent driver stopped before the turn completed")]
     TurnStopped,
 
-    #[error("the agent has no active turn to steer")]
-    NoActiveTurnToSteer,
+    #[error("the targeted turn is queued, completed, or otherwise not active for steering")]
+    TurnNotActiveToSteer,
 
     #[error("the active turn's steering queue is full")]
     SteerQueueFull,
+
+    #[error("the targeted turn has already completed or been cancelled")]
+    TurnNotCancellable,
+
+    #[error("the turn was cancelled")]
+    TurnCancelled,
 
     #[error("the agent has no completed turn to fork")]
     ForkBeforeCompletedTurn,
 
     #[error("the completed turn belongs to a different conversation lineage")]
     CheckpointLineageMismatch,
-
-    #[error("the configured Responses service does not provide a fresh-service factory")]
-    ChildUnsupportedForResponsesService,
 
     #[error("building an agent requires an active Tokio runtime")]
     TokioRuntimeUnavailable,

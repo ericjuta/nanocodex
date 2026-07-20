@@ -28,10 +28,10 @@ use super::{
     },
     resolve_workspace, terminal_payload,
 };
-use crate::{AgentError, NanocodexError, ResponsesError, Result};
+use crate::{AgentError, NanocodexError, Result};
 use nanocodex_tools::{
-    ImageGenerationConfig, NestedToolCall, ToolContext, ToolOutputBody, ToolRuntime, Tools,
-    WebSearchConfig, prepare_output_images, prepare_user_input,
+    ImageGenerationConfig, NestedToolCall, ToolContext, ToolOutputBody, ToolRuntime,
+    ToolRuntimeControl, Tools, WebSearchConfig, prepare_output_images, prepare_user_input,
 };
 
 pub(crate) struct ModelRun<S> {
@@ -43,6 +43,7 @@ pub(crate) struct ModelRun<S> {
     stats: RunStats,
     server_reasoning_included: bool,
     session: Option<ModelSessionState>,
+    active_tools: Option<ToolRuntimeControl>,
     tools: Tools,
     lineage_id: Arc<str>,
 }
@@ -134,10 +135,6 @@ impl ConversationState {
         self.context.shared_items()
     }
 
-    fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
-        self.context.replace_last_turn_images(placeholder)
-    }
-
     fn install_compaction(
         &mut self,
         item: ResponseItem,
@@ -188,6 +185,7 @@ impl<S> ModelRun<S> {
             stats: RunStats::default(),
             server_reasoning_included: false,
             session: None,
+            active_tools: None,
             tools,
             lineage_id,
         }
@@ -203,6 +201,7 @@ impl<S> ModelRun<S> {
         checkpoint: ModelCheckpoint,
     ) -> Self {
         let runtime = tool_runtime(&checkpoint.workspace, &config, &tools);
+        let active_tools = runtime.control();
         let factory = ResponsesAttemptFactory::new(
             request_profile(
                 events.request_id(),
@@ -227,6 +226,7 @@ impl<S> ModelRun<S> {
                 factory,
                 conversation: checkpoint.conversation,
             }),
+            active_tools: Some(active_tools),
             tools,
             lineage_id,
         }
@@ -239,10 +239,48 @@ where
     S::Error: Into<NanocodexError>,
     S::Future: AgentSend,
 {
+    pub(crate) fn emit_cancelled_before_start(
+        &mut self,
+        task: &Prompt,
+        workspace: Option<&str>,
+    ) -> Result<()> {
+        self.started_at = Instant::now();
+        self.stats = RunStats::default();
+        self.events.emit(
+            AgentEventKind::RunStarted,
+            RunStarted {
+                mode: "openai_model",
+                model: MODEL,
+                effort: self.config.thinking.as_str(),
+                transport: TRANSPORT,
+                orchestration: ModelConfig::orchestration(),
+                websocket_url: display_endpoint(&self.config.websocket_url),
+                workspace,
+                instruction_bytes: task.instruction.text_bytes(),
+            },
+        )?;
+        let error = AgentError::TurnCancelled;
+        let message = error.to_string();
+        self.events
+            .emit(AgentEventKind::RunError, RunError { message: &message })?;
+        self.events.emit(
+            AgentEventKind::RunFailed,
+            terminal_payload(
+                "cancelled",
+                self.started_at.elapsed(),
+                &self.config,
+                &self.stats,
+            ),
+        )?;
+        Ok(())
+    }
+
     pub(crate) async fn execute(
         &mut self,
         task: Prompt,
+        workspace: Option<Arc<str>>,
         steers: tokio::sync::mpsc::Receiver<Prompt>,
+        mut cancel: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<CompletedModelTurn> {
         self.started_at = Instant::now();
         self.stats = RunStats::default();
@@ -256,12 +294,27 @@ where
                 transport: TRANSPORT,
                 orchestration: ModelConfig::orchestration(),
                 websocket_url: display_endpoint(&self.config.websocket_url),
-                workspace: task.workspace.as_deref(),
+                workspace: workspace.as_deref(),
                 instruction_bytes: task.instruction.text_bytes(),
             },
         )?;
 
-        let outcome = self.execute_task(task, steers).await;
+        let mut cancelled = false;
+        let outcome = {
+            let task = self.execute_task(task, workspace, steers);
+            tokio::pin!(task);
+            tokio::select! {
+                biased;
+                _ = &mut cancel => {
+                    cancelled = true;
+                    Err(AgentError::TurnCancelled.into())
+                }
+                outcome = &mut task => outcome,
+            }
+        };
+        if cancelled && let Some(tools) = &self.active_tools {
+            tools.cancel().await;
+        }
         let elapsed = self.started_at.elapsed();
         match outcome {
             Ok(message) => {
@@ -282,6 +335,11 @@ where
                 })
             }
             Err(error) => {
+                let status = if matches!(&error, NanocodexError::Agent(AgentError::TurnCancelled)) {
+                    "cancelled"
+                } else {
+                    "failed"
+                };
                 let message = error.to_string();
                 self.events
                     .emit(AgentEventKind::RunError, RunError { message: &message })?;
@@ -289,7 +347,7 @@ where
                     .apply_transport(self.transport_stats.since(transport_before));
                 self.events.emit(
                     AgentEventKind::RunFailed,
-                    terminal_payload("failed", elapsed, &self.config, &self.stats),
+                    terminal_payload(status, elapsed, &self.config, &self.stats),
                 )?;
                 Err(error)
             }
@@ -299,10 +357,11 @@ where
     async fn execute_task(
         &mut self,
         task: Prompt,
+        requested_workspace: Option<Arc<str>>,
         steers: tokio::sync::mpsc::Receiver<Prompt>,
     ) -> Result<String> {
         let mut session = if let Some(mut session) = self.session.take() {
-            if let Some(requested) = task.workspace.as_deref() {
+            if let Some(requested) = requested_workspace.as_deref() {
                 let resolved = match resolve_workspace(Some(requested)) {
                     Ok(resolved) => resolved,
                     Err(error) => {
@@ -328,9 +387,10 @@ where
             )]);
             session
         } else {
-            let workspace = resolve_workspace(task.workspace.as_deref())?;
+            let workspace = resolve_workspace(requested_workspace.as_deref())?;
             let project_instructions = load_project_instructions(Path::new(&workspace))?;
             let tools = tool_runtime(&workspace, &self.config, &self.tools);
+            self.active_tools = Some(tools.control());
             let factory = ResponsesAttemptFactory::new(
                 request_profile(
                     self.events.request_id(),
@@ -398,23 +458,9 @@ where
                     .await?;
             }
             let call_index = self.stats.model_calls + 1;
-            let response = match self
+            let response = self
                 .perform_model_call(call_index, &session.conversation, &session.factory)
-                .await
-            {
-                Ok(response) => response,
-                Err(error)
-                    if matches!(
-                        error.responses_error(),
-                        Some(ResponsesError::InvalidImageRequest { .. })
-                    ) && session
-                        .conversation
-                        .replace_last_turn_images("Invalid image") =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+                .await?;
             session
                 .conversation
                 .update_token_info(response.usage.as_ref());

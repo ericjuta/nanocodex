@@ -57,7 +57,9 @@ async fn generation_uses_codex_images_request_and_persists_result() -> Result<()
     ));
     assert!(matches!(
         content.get(1),
-        Some(ToolOutputContent::InputText { text }) if text.contains("Generated images are saved")
+        Some(ToolOutputContent::InputText { text })
+            if text.contains("Generated images are saved")
+                && text.contains("already displayed to the user")
     ));
     assert_eq!(
         execution.value()["image_url"],

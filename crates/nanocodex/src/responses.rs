@@ -18,8 +18,8 @@ pub struct LayeredResponses<L>(pub(crate) ServiceBuilder<L>);
 #[doc(hidden)]
 pub struct FactoryResponses<F>(pub(crate) F);
 
-/// Responses transport configuration with an optional caller-supplied Tower
-/// service stack.
+/// Responses transport configuration with standard or caller-supplied Tower
+/// service factory policy.
 pub struct Responses<S = StandardResponses> {
     pub(crate) websocket_url: String,
     pub(crate) api_base_url: String,
@@ -60,22 +60,10 @@ impl ResponsesBuilder<StandardResponses> {
         }
     }
 
-    /// Replaces the standard stack with a fully caller-composed Tower service.
-    #[must_use]
-    pub fn service<S>(self, service: S) -> ResponsesBuilder<S> {
-        ResponsesBuilder {
-            responses: Responses {
-                websocket_url: self.responses.websocket_url,
-                api_base_url: self.responses.api_base_url,
-                service,
-            },
-        }
-    }
-
     /// Replaces the standard stack with a factory that constructs one fresh
-    /// caller-composed service for the root and every fork.
+    /// caller-composed service for the root and every child or fork.
     #[must_use]
-    pub fn service_factory<F, S>(self, factory: F) -> ResponsesBuilder<FactoryResponses<F>>
+    pub fn service<F, S>(self, factory: F) -> ResponsesBuilder<FactoryResponses<F>>
     where
         F: Fn() -> S,
     {

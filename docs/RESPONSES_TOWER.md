@@ -5,8 +5,8 @@ Status: implemented.
 ## Ownership and public composition
 
 `Nanocodex::new(api_key)` starts the standard fixed-model agent. The builder
-exposes the system prompt, thinking level, tools, workspace, stable session ID,
-and Responses service while keeping driver mechanics private.
+exposes persistent instructions, thinking level, tools, workspace, stable
+session ID, and Responses service policy while keeping driver mechanics private.
 
 `build()` requires an active Tokio runtime, spawns one stateful driver, and
 returns `(Nanocodex, AgentEvents)`. The driver owns mutable conversation,
@@ -37,9 +37,10 @@ let (agent, events) = Nanocodex::builder(api_key)
     .build()?;
 ```
 
-`Responses::builder().service(stack)` replaces the standard stack with a fully
-caller-composed service. Neither path requires boxing, a process server, JSONL,
-or a global client.
+`Responses::builder().service(|| make_stack())` replaces the standard stack
+with a factory for a fully caller-composed service. Every root, cancellation
+replacement, child, and fork receives independent mutable service state.
+Neither path requires boxing, a process server, JSONL, or a global client.
 
 ## Tower operation boundary
 
@@ -154,5 +155,5 @@ trace without checking private runtime data into the repository.
   turns.
 - Follow-on prompts reuse one socket and send only their new delta.
 - Exactly one terminal event is emitted for every accepted prompt.
-- Standard and caller-composed service paths use the same owned driver and
+- Standard and caller-composed service factories use the same owned driver and
   typed event contract.

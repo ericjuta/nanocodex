@@ -413,6 +413,34 @@ text("after");
 }
 
 #[tokio::test]
+async fn cancellation_terminates_yielded_code_cells() -> Result<()> {
+    let workspace = temporary_workspace("cancelled-cell")?;
+    let tools = test_tools(&workspace);
+    let control = tools.control();
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r"
+await yield_control();
+await new Promise(() => {});
+",
+            test_context(&history),
+        )
+        .await;
+    assert!(execution_output(&execution).contains("Script running with cell ID 1"));
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), control.cancel()).await?;
+    let missing = tools
+        .wait_for_code(r#"{"cell_id":"1"}"#, test_context(&history))
+        .await;
+    assert!(!missing.success);
+    assert!(execution_output(&missing).contains("exec cell 1 was not found"));
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn resumed_cell_notifications_keep_the_original_exec_call_id() -> Result<()> {
     let workspace = temporary_workspace("resumed-cell-notify")?;
     let tools = test_tools(&workspace);
