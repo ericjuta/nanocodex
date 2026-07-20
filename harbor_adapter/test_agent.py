@@ -778,7 +778,7 @@ class InterruptedRunContractTests(unittest.TestCase):
 
 
 class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_run_atomically_publishes_the_event_stream(self) -> None:
+    async def test_run_atomically_publishes_captured_stdout_on_the_host(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             agent = object.__new__(NanocodexAgent)
             agent.logs_dir = Path(directory)
@@ -791,8 +791,9 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
             agent._agents_md_path = None
             agent._stage_api_key = AsyncMock()
             agent._remove_staged_api_key = AsyncMock()
+            stream = '{"type":"run.completed","payload":{}}\n'
             agent.exec_as_agent = AsyncMock(
-                return_value=SimpleNamespace(stdout="", stderr="")
+                return_value=SimpleNamespace(stdout=stream, stderr="")
             )
             environment = SimpleNamespace(capabilities=SimpleNamespace(mounted=True))
 
@@ -801,10 +802,33 @@ class RunCancellationContractTests(unittest.IsolatedAsyncioTestCase):
             command = agent.exec_as_agent.await_args.args[1]
             self.assertIn("set -o pipefail", command)
             self.assertIn('tee "$events_tmp"', command)
-            self.assertIn(
-                'mv "$events_tmp" /logs/agent/events.jsonl', command
-            )
             self.assertNotIn("tee /logs/agent/events.jsonl", command)
+            self.assertNotIn('mv "$events_tmp"', command)
+            self.assertEqual(
+                (agent.logs_dir / "events.jsonl").read_text(encoding="utf-8"),
+                stream,
+            )
+            self.assertFalse((agent.logs_dir / "events.jsonl.host.tmp").exists())
+
+    def test_nonzero_exit_publishes_captured_stdout_before_classification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = object.__new__(NanocodexAgent)
+            agent.logs_dir = Path(directory)
+            agent.logger = logging.getLogger("harbor_adapter.test_agent")
+            agent._compiled_error_patterns = []
+            stream = '{"type":"run.failed","payload":{}}\n'
+            result = SimpleNamespace(return_code=1, stdout=stream, stderr="")
+
+            error = agent._classify_exec_error("test-command", result)
+
+            self.assertIsInstance(error, RuntimeError)
+            self.assertEqual(
+                (agent.logs_dir / "events.jsonl").read_text(encoding="utf-8"),
+                stream,
+            )
+            self.assertFalse((agent.logs_dir / "events.jsonl.host.tmp").exists())
 
     async def test_cancellation_is_recorded_and_reraised(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

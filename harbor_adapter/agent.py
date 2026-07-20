@@ -202,15 +202,14 @@ class NanocodexAgent(BaseInstalledAgent):
             f"events_tmp={shlex.quote(self._EVENTS_TMP)}; "
             'rm -f "$events_tmp"; set +e; set -o pipefail; '
             f'{agent_command} 2> {shlex.quote(self._STDERR)} | tee "$events_tmp"; '
-            "status=$?; "
-            f'if [ -f "$events_tmp" ]; then mv "$events_tmp" {shlex.quote(self._EVENTS)}; fi; '
-            'exit "$status"'
+            'exit "$?"'
         )
         try:
             await self._stage_api_key(environment)
             result = await self.exec_as_agent(environment, command)
         finally:
             await self._remove_staged_api_key(environment)
+        self._publish_events(result.stdout)
         if result.stdout:
             print(result.stdout, end="", flush=True)
         if result.stderr:
@@ -229,6 +228,21 @@ class NanocodexAgent(BaseInstalledAgent):
             "--",
             prompt,
         ]
+
+    def _classify_exec_error(self, command: str, result: Any) -> Exception:
+        # BaseInstalledAgent classifies and raises before returning a nonzero
+        # ExecResult. Publish its complete captured stdout on this path too so
+        # post-run trajectory construction never reads a bind-mounted writer.
+        self._publish_events(result.stdout)
+        return super()._classify_exec_error(command, result)
+
+    def _publish_events(self, stdout: str | None) -> None:
+        if stdout is None:
+            return
+        events = self.logs_dir / Path(self._EVENTS).name
+        temporary = events.with_name(f"{events.name}.host.tmp")
+        temporary.write_text(stdout, encoding="utf-8")
+        temporary.replace(events)
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         try:
