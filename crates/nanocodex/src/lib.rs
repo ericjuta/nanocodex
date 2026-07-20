@@ -13,7 +13,7 @@ mod wasm;
 pub use agent::{AgentHandle, Nanocodex, NanocodexBuilder, Turn, TurnControl, TurnResult};
 #[cfg(not(target_family = "wasm"))]
 pub use async_trait::async_trait;
-pub use error::{AgentError, NanocodexError, ResponsesError, Result};
+pub use error::{NanocodexError, ResponsesError, Result};
 pub use nanocodex_core::responses::RequestProfile;
 pub use nanocodex_core::{
     AgentEvent, AgentEventKind, AgentEvents, AgentMessageContent, ContentItem, CustomToolFormat,

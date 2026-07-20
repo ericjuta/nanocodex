@@ -28,7 +28,7 @@ use super::{
     },
     resolve_workspace, terminal_payload,
 };
-use crate::{AgentError, NanocodexError, Result};
+use crate::{NanocodexError, Result};
 use nanocodex_tools::{
     ImageGenerationConfig, NestedToolCall, ToolContext, ToolOutputBody, ToolRuntime,
     ToolRuntimeControl, Tools, WebSearchConfig, prepare_output_images, prepare_user_input,
@@ -92,12 +92,13 @@ struct ConversationState {
 
 impl ConversationState {
     fn new(history: Vec<ResponseItem>) -> Result<Self> {
-        let canonical_context = history
-            .first()
-            .cloned()
-            .ok_or(AgentError::MalformedResponse {
-                detail: "task input did not include initial context",
-            })?;
+        let canonical_context =
+            history
+                .first()
+                .cloned()
+                .ok_or(NanocodexError::MalformedResponse {
+                    detail: "task input did not include initial context",
+                })?;
         Ok(Self {
             canonical_context: Arc::new(canonical_context),
             context: ContextManager::new(history),
@@ -156,10 +157,9 @@ impl ConversationState {
 
     fn commit(&mut self) -> Result<()> {
         if self.previous_response_id.is_none() {
-            return Err(AgentError::MalformedResponse {
+            return Err(NanocodexError::MalformedResponse {
                 detail: "completed turn did not have a response ID",
-            }
-            .into());
+            });
         }
         self.context.commit_tail();
         self.delta_start = 0;
@@ -259,7 +259,7 @@ where
                 instruction_bytes: task.instruction.text_bytes(),
             },
         )?;
-        let error = AgentError::TurnCancelled;
+        let error = NanocodexError::TurnCancelled;
         let message = error.to_string();
         self.events
             .emit(AgentEventKind::RunError, RunError { message: &message })?;
@@ -307,7 +307,7 @@ where
                 biased;
                 _ = &mut cancel => {
                     cancelled = true;
-                    Err(AgentError::TurnCancelled.into())
+                    Err(NanocodexError::TurnCancelled)
                 }
                 outcome = &mut task => outcome,
             }
@@ -335,7 +335,7 @@ where
                 })
             }
             Err(error) => {
-                let status = if matches!(&error, NanocodexError::Agent(AgentError::TurnCancelled)) {
+                let status = if matches!(&error, NanocodexError::TurnCancelled) {
                     "cancelled"
                 } else {
                     "failed"
@@ -372,11 +372,10 @@ where
                 if resolved != session.workspace {
                     let current = session.workspace.clone();
                     self.session = Some(session);
-                    return Err(AgentError::WorkspaceChanged {
+                    return Err(NanocodexError::WorkspaceChanged {
                         current,
                         requested: resolved,
-                    }
-                    .into());
+                    });
                 }
             }
             let user_content = prepare_user_input(&task.instruction).await;
@@ -434,7 +433,7 @@ where
         let session = self
             .session
             .as_mut()
-            .ok_or(AgentError::InvalidAttemptState {
+            .ok_or(NanocodexError::InvalidAttemptState {
                 detail: "completed turn did not have a model session",
             })?;
         session.conversation.commit()?;
@@ -499,10 +498,9 @@ where
                         message
                     });
                 }
-                return Err(AgentError::MalformedResponse {
+                return Err(NanocodexError::MalformedResponse {
                     detail: "model completed without a final message or exec call",
-                }
-                .into());
+                });
             }
 
             session.conversation.clear_delta();
@@ -668,13 +666,11 @@ where
         if active_context_tokens < auto_compact_token_limit {
             return Ok(());
         }
-        let previous_response_id =
-            conversation
-                .previous_response_id
-                .as_deref()
-                .ok_or(AgentError::MalformedResponse {
-                    detail: "compaction did not have a previous response ID",
-                })?;
+        let previous_response_id = conversation.previous_response_id.as_deref().ok_or(
+            NanocodexError::MalformedResponse {
+                detail: "compaction did not have a previous response ID",
+            },
+        )?;
         let (item, _usage) = self
             .perform_compaction(
                 after_model_call_index,
@@ -763,10 +759,9 @@ where
         let ResponsesOutput::Warmup(response) = success.into_output() else {
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
-            return Err(AgentError::InvalidAttemptState {
+            return Err(NanocodexError::InvalidAttemptState {
                 detail: "warmup returned a non-warmup response",
-            }
-            .into());
+            });
         };
         let duration_ns = elapsed_ns(started_at);
         span.record("status", "completed");
@@ -851,10 +846,9 @@ where
         let ResponsesOutput::Generation(response) = success.into_output() else {
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
-            return Err(AgentError::InvalidAttemptState {
+            return Err(NanocodexError::InvalidAttemptState {
                 detail: "generation returned a non-generation response",
-            }
-            .into());
+            });
         };
         let duration_ns = elapsed_ns(started_at);
         record_model_response(&span, &response);
@@ -940,10 +934,9 @@ where
         let connection_generation = success.connection_generation();
         self.server_reasoning_included |= success.server_reasoning_included();
         let ResponsesOutput::Compaction(response) = success.into_output() else {
-            return Err(AgentError::InvalidAttemptState {
+            return Err(NanocodexError::InvalidAttemptState {
                 detail: "compaction returned a non-compaction response",
-            }
-            .into());
+            });
         };
         let duration_ns = elapsed_ns(started_at);
         self.stats.model_duration_ns += duration_ns;

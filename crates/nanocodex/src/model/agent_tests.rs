@@ -7,8 +7,7 @@ use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
 use crate::{
-    AgentError, AgentHandle, Nanocodex, NanocodexError, Prompt, Responses, ResponsesError,
-    Thinking, Tools,
+    AgentHandle, Nanocodex, NanocodexError, Prompt, Responses, ResponsesError, Thinking, Tools,
 };
 
 #[tokio::test]
@@ -122,10 +121,7 @@ async fn steering_is_bounded_fifo_and_joins_at_the_next_model_boundary() -> Resu
         turn.steer(format!("constraint {index}")).await?;
     }
     let overflow = turn.steer("constraint 8").await.unwrap_err();
-    assert!(matches!(
-        overflow,
-        NanocodexError::Agent(AgentError::SteerQueueFull)
-    ));
+    assert!(matches!(overflow, NanocodexError::SteerQueueFull));
     release_first
         .send(())
         .map_err(|()| eyre!("server release receiver dropped"))?;
@@ -217,27 +213,27 @@ async fn cancellation_targets_one_turn_and_resumes_from_the_last_commit() -> Res
 
     assert!(matches!(
         queued.steer("wrong target").await,
-        Err(NanocodexError::Agent(AgentError::TurnNotActiveToSteer))
+        Err(NanocodexError::TurnNotSteerable)
     ));
     queued.cancel().await?;
     assert!(matches!(
         queued_control.cancel().await,
-        Err(NanocodexError::Agent(AgentError::TurnNotCancellable))
+        Err(NanocodexError::TurnNotCancellable)
     ));
 
     let cancellation = cancelled.control();
     cancellation.cancel().await?;
     assert!(matches!(
         cancelled.result().await,
-        Err(NanocodexError::Agent(AgentError::TurnCancelled))
+        Err(NanocodexError::TurnCancelled)
     ));
     assert!(matches!(
         queued.result().await,
-        Err(NanocodexError::Agent(AgentError::TurnCancelled))
+        Err(NanocodexError::TurnCancelled)
     ));
     assert!(matches!(
         cancellation.cancel().await,
-        Err(NanocodexError::Agent(AgentError::TurnNotCancellable))
+        Err(NanocodexError::TurnNotCancellable)
     ));
     assert_eq!(follow_up.result().await?.final_message, "done");
     drop((queued_control, cancellation, agent));

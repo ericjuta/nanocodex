@@ -9,7 +9,7 @@ use crossterm::event::{
 };
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
-use nanocodex::{AgentError, AgentEvent, AgentEvents, Nanocodex, NanocodexError, TurnControl};
+use nanocodex::{AgentEvent, AgentEvents, Nanocodex, NanocodexError, TurnControl};
 use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval},
@@ -446,7 +446,7 @@ async fn start_turn(
             let finished = finished.clone();
             tokio::spawn(async move {
                 let error = match turn.result().await {
-                    Ok(_) | Err(NanocodexError::Agent(AgentError::TurnCancelled)) => None,
+                    Ok(_) | Err(NanocodexError::TurnCancelled) => None,
                     Err(error) => Some(error.to_string()),
                 };
                 drop(finished.send(FinishedTurn { id, target, error }));
@@ -478,7 +478,7 @@ async fn steer_turn(
                 drop(updates.send(WorkerEvent::SteerAccepted { target, prompt }));
                 return None;
             }
-            Err(NanocodexError::Agent(AgentError::TurnNotActiveToSteer)) => {}
+            Err(NanocodexError::TurnNotSteerable) => {}
             Err(error) => {
                 drop(updates.send(WorkerEvent::SteerFailed {
                     target,
@@ -502,10 +502,10 @@ async fn cancel_turn(
     target: PaneId,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) {
-    let mut outcome = Err(NanocodexError::Agent(AgentError::TurnNotCancellable));
+    let mut outcome = Err(NanocodexError::TurnNotCancellable);
     for turn in turns.into_iter().flatten() {
         match turn.control.cancel().await {
-            Err(NanocodexError::Agent(AgentError::TurnNotCancellable)) => {}
+            Err(NanocodexError::TurnNotCancellable) => {}
             result => {
                 outcome = result;
                 break;

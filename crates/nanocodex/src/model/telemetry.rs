@@ -9,7 +9,7 @@ use serde_json::value::RawValue;
 use web_time::Instant;
 
 #[cfg(not(target_family = "wasm"))]
-use crate::AgentError;
+use crate::NanocodexError;
 use crate::Result;
 use nanocodex_service::{TRANSPORT, TransportStatsDelta};
 use nanocodex_tools::ToolOutputBody;
@@ -190,20 +190,19 @@ impl RunStats {
 pub(super) fn resolve_workspace(requested: Option<&str>) -> Result<String> {
     let requested = PathBuf::from(requested.unwrap_or("."));
     let resolved =
-        std::fs::canonicalize(&requested).map_err(|source| AgentError::ResolveWorkspace {
+        std::fs::canonicalize(&requested).map_err(|source| NanocodexError::ResolveWorkspace {
             path: requested,
             source,
         })?;
     if !resolved.is_dir() {
-        return Err(AgentError::WorkspaceNotDirectory { path: resolved }.into());
+        return Err(NanocodexError::WorkspaceNotDirectory { path: resolved });
     }
     resolved
         .into_os_string()
         .into_string()
-        .map_err(|path| AgentError::WorkspaceNotUtf8 {
+        .map_err(|path| NanocodexError::WorkspaceNotUtf8 {
             path: PathBuf::from(path),
         })
-        .map_err(Into::into)
 }
 
 #[cfg(target_family = "wasm")]

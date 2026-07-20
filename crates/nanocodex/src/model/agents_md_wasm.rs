@@ -1,11 +1,13 @@
 use std::path::Path;
 
-use crate::AgentError;
+use crate::NanocodexError;
 
 #[expect(
     clippy::unnecessary_wraps,
     reason = "matches the native instruction-loader contract"
 )]
-pub(super) fn load_project_instructions(_workspace: &Path) -> Result<Option<String>, AgentError> {
+pub(super) fn load_project_instructions(
+    _workspace: &Path,
+) -> Result<Option<String>, NanocodexError> {
     Ok(None)
 }

@@ -19,7 +19,7 @@ use tower::Service;
 use tracing::{Instrument, info_span};
 
 use crate::{
-    AgentError, NanocodexError, Result,
+    NanocodexError, Result,
     model::agent::{CompletedModelTurn, ModelCheckpoint, ModelRun},
     responses::{FactoryResponses, LayeredResponses, Responses, StandardResponses},
 };
@@ -94,9 +94,7 @@ impl Turn {
     ///
     /// Returns the model-run failure or an error if the driver stopped early.
     pub async fn result(self) -> Result<TurnResult> {
-        self.result
-            .await
-            .map_err(|_| NanocodexError::Agent(AgentError::TurnStopped))?
+        self.result.await.map_err(|_| NanocodexError::TurnStopped)?
     }
 }
 
@@ -129,10 +127,8 @@ impl TurnControl {
                 result,
             })
             .await
-            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?;
-        receiver
-            .await
-            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?
+            .map_err(|_| NanocodexError::AgentStopped)?;
+        receiver.await.map_err(|_| NanocodexError::AgentStopped)?
     }
 
     /// Cancels the targeted unfinished turn.
@@ -149,10 +145,8 @@ impl TurnControl {
                 result,
             })
             .await
-            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?;
-        receiver
-            .await
-            .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?
+            .map_err(|_| NanocodexError::AgentStopped)?;
+        receiver.await.map_err(|_| NanocodexError::AgentStopped)?
     }
 }
 
@@ -262,9 +256,7 @@ impl AgentHandle {
     }
 
     fn commands(&self) -> Result<mpsc::Sender<Command>> {
-        self.commands
-            .upgrade()
-            .ok_or(NanocodexError::Agent(AgentError::DriverStopped))
+        self.commands.upgrade().ok_or(NanocodexError::AgentStopped)
     }
 }
 
@@ -320,7 +312,7 @@ impl Nanocodex {
             .await
             .is_err()
         {
-            return Err(NanocodexError::Agent(AgentError::DriverStopped));
+            return Err(NanocodexError::AgentStopped);
         }
         Ok(Turn {
             control: TurnControl {
@@ -353,7 +345,7 @@ impl Nanocodex {
     /// driver stopped.
     pub async fn fork_from(&self, completed: &TurnResult) -> Result<(Self, AgentEvents)> {
         if completed.checkpoint.lineage_id != self.lineage_id {
-            return Err(AgentError::CheckpointLineageMismatch.into());
+            return Err(NanocodexError::CheckpointLineageMismatch);
         }
         self.request_fork(Some(Arc::clone(&completed.checkpoint)))
             .await
@@ -375,10 +367,8 @@ async fn request_fork(
     commands
         .send(Command::Fork { checkpoint, result })
         .await
-        .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?;
-    receiver
-        .await
-        .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?
+        .map_err(|_| NanocodexError::AgentStopped)?;
+    receiver.await.map_err(|_| NanocodexError::AgentStopped)?
 }
 
 async fn request_spawn(commands: &mpsc::Sender<Command>) -> Result<(Nanocodex, AgentEvents)> {
@@ -386,10 +376,8 @@ async fn request_spawn(commands: &mpsc::Sender<Command>) -> Result<(Nanocodex, A
     commands
         .send(Command::Spawn { result })
         .await
-        .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?;
-    receiver
-        .await
-        .map_err(|_| NanocodexError::Agent(AgentError::DriverStopped))?
+        .map_err(|_| NanocodexError::AgentStopped)?;
+    receiver.await.map_err(|_| NanocodexError::AgentStopped)?
 }
 
 /// Builder for a running agent with deferred Responses service composition.
@@ -668,7 +656,7 @@ where
                             let _guard = turn_span.enter();
                             model
                                 .emit_cancelled_before_start(&prompt, self.workspace.as_deref())?;
-                            drop(result.send(Err(AgentError::TurnCancelled.into())));
+                            drop(result.send(Err(NanocodexError::TurnCancelled)));
                             continue;
                         }
                     }
@@ -736,15 +724,15 @@ where
                             }
                             Some(Command::Steer { key: target, prompt, result }) => {
                                 if target != key {
-                                    drop(result.send(Err(AgentError::TurnNotActiveToSteer.into())));
+                                    drop(result.send(Err(NanocodexError::TurnNotSteerable)));
                                     continue;
                                 }
                                 let outcome = steers.try_send(prompt).map_err(|error| match error {
                                     mpsc::error::TrySendError::Full(_) => {
-                                        NanocodexError::Agent(AgentError::SteerQueueFull)
+                                        NanocodexError::SteerQueueFull
                                     }
                                     mpsc::error::TrySendError::Closed(_) => {
-                                        NanocodexError::Agent(AgentError::TurnNotActiveToSteer)
+                                        NanocodexError::TurnNotSteerable
                                     }
                                 });
                                 drop(result.send(outcome));
@@ -755,14 +743,14 @@ where
                                         drop(cancellation.send(Ok(())));
                                     } else {
                                         drop(cancellation.send(Err(
-                                            AgentError::TurnNotCancellable.into(),
+                                            NanocodexError::TurnNotCancellable,
                                         )));
                                     }
                                     continue;
                                 }
                                 let Some(cancel) = cancel.take() else {
                                     drop(cancellation.send(Err(
-                                        AgentError::TurnNotCancellable.into(),
+                                        NanocodexError::TurnNotCancellable,
                                     )));
                                     continue;
                                 };
@@ -785,10 +773,7 @@ where
                 }
             };
             drop(execution);
-            let was_cancelled = matches!(
-                &completed,
-                Err(NanocodexError::Agent(AgentError::TurnCancelled))
-            );
+            let was_cancelled = matches!(&completed, Err(NanocodexError::TurnCancelled));
             if was_cancelled {
                 let service = (self.spawner.service_factory)();
                 let replacement = if let Some(checkpoint) = latest_checkpoint.as_ref() {
@@ -847,7 +832,7 @@ where
                 let outcome = if was_cancelled {
                     Ok(())
                 } else {
-                    Err(AgentError::TurnNotCancellable.into())
+                    Err(NanocodexError::TurnNotCancellable)
                 };
                 drop(cancel_result.send(outcome));
             }
@@ -886,7 +871,7 @@ fn handle_idle_command<S>(
         Command::Fork { checkpoint, result } => {
             let checkpoint = checkpoint.or_else(|| latest.cloned());
             let outcome = checkpoint
-                .ok_or_else(|| NanocodexError::Agent(AgentError::ForkBeforeCompletedTurn))
+                .ok_or(NanocodexError::ForkBeforeCompletedTurn)
                 .and_then(|checkpoint| spawner.spawn_fork(&checkpoint));
             drop(result.send(outcome));
         }
@@ -894,10 +879,10 @@ fn handle_idle_command<S>(
             drop(result.send(spawner.spawn_clean(workspace)));
         }
         Command::Steer { result, .. } => {
-            drop(result.send(Err(AgentError::TurnNotActiveToSteer.into())));
+            drop(result.send(Err(NanocodexError::TurnNotSteerable)));
         }
         Command::Cancel { result, .. } => {
-            drop(result.send(Err(AgentError::TurnNotCancellable.into())));
+            drop(result.send(Err(NanocodexError::TurnNotCancellable)));
         }
         Command::Prompt { .. } => {}
     }
@@ -953,7 +938,7 @@ where
             path.into_os_string()
                 .into_string()
                 .map(Arc::<str>::from)
-                .map_err(|path| AgentError::WorkspaceNotUtf8 {
+                .map_err(|path| NanocodexError::WorkspaceNotUtf8 {
                     path: PathBuf::from(path),
                 })
         })
@@ -986,7 +971,7 @@ where
     S::Future: Send,
 {
     let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|_| NanocodexError::Agent(AgentError::TokioRuntimeUnavailable))?;
+        .map_err(|_| NanocodexError::TokioRuntimeUnavailable)?;
     let (events, event_stream) = EventSink::channel(session_id);
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
     let tools = spawner.tools.materialize(AgentHandle {
@@ -1145,10 +1130,7 @@ mod tests {
         let Err(error) = agent.fork().await else {
             panic!("fork unexpectedly succeeded");
         };
-        assert!(matches!(
-            error,
-            NanocodexError::Agent(AgentError::ForkBeforeCompletedTurn)
-        ));
+        assert!(matches!(error, NanocodexError::ForkBeforeCompletedTurn));
         drop((agent, events));
     }
 
@@ -1162,10 +1144,7 @@ mod tests {
         let Err(error) = control.steer("additional direction").await else {
             panic!("steer unexpectedly succeeded");
         };
-        assert!(matches!(
-            error,
-            NanocodexError::Agent(AgentError::TurnNotActiveToSteer)
-        ));
+        assert!(matches!(error, NanocodexError::TurnNotSteerable));
         drop((agent, events));
     }
 
@@ -1188,7 +1167,7 @@ mod tests {
         turn.cancel().await.unwrap();
         assert!(matches!(
             turn.result().await,
-            Err(NanocodexError::Agent(AgentError::TurnCancelled))
+            Err(NanocodexError::TurnCancelled)
         ));
         assert_eq!(builds.load(Ordering::Relaxed), 2);
         drop((agent, events));
@@ -1238,17 +1217,11 @@ mod tests {
         let Err(error) = handle.spawn().await else {
             panic!("agent handle unexpectedly kept its driver alive");
         };
-        assert!(matches!(
-            error,
-            NanocodexError::Agent(AgentError::DriverStopped)
-        ));
+        assert!(matches!(error, NanocodexError::AgentStopped));
         let Err(error) = handle.fork().await else {
             panic!("agent handle unexpectedly kept its driver alive");
         };
-        assert!(matches!(
-            error,
-            NanocodexError::Agent(AgentError::DriverStopped)
-        ));
+        assert!(matches!(error, NanocodexError::AgentStopped));
         drop(events);
     }
 
@@ -1256,7 +1229,7 @@ mod tests {
     fn building_requires_a_tokio_runtime() {
         assert!(matches!(
             Nanocodex::new("test"),
-            Err(NanocodexError::Agent(AgentError::TokioRuntimeUnavailable))
+            Err(NanocodexError::TokioRuntimeUnavailable)
         ));
     }
 }

@@ -233,17 +233,17 @@ create another `Turn` or another terminal event.
 `turn.cancel()` targets the same opaque unfinished turn. A queued turn is
 removed without reaching the model; cancellation of an active turn waits until
 model work, Code Mode cells, and shell process groups have stopped. In either
-case the result resolves to the typed `AgentError::TurnCancelled`. Partial model
-and tool work is discarded, and the next surviving prompt resumes from the last
-completed checkpoint. Queued cancellation is acknowledged immediately, while
-its result and terminal event retain FIFO event order behind earlier turns. If
+case the result resolves to the typed `NanocodexError::TurnCancelled`. Partial
+model and tool work is discarded, and the next surviving prompt resumes from
+the last completed checkpoint. Queued cancellation is acknowledged immediately,
+while its result and terminal event retain FIFO event order behind earlier turns. If
 one task must await the result while another controls it, clone
 `turn.control()` before moving the `Turn` into the result task. Completed
 `TurnResult`s are deliberately inert; historical branching remains
 `agent.fork_from(&result)` because a fork creates another owned agent lifecycle.
 
 ```rust
-use nanocodex::{AgentError, Nanocodex, NanocodexError};
+use nanocodex::{Nanocodex, NanocodexError};
 
 # async fn cancellation(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
 let (agent, _) = Nanocodex::new(api_key)?;
@@ -255,7 +255,7 @@ control.steer("Prioritize failing tests.").await?;
 control.cancel().await?;
 assert!(matches!(
     result_task.await?,
-    Err(NanocodexError::Agent(AgentError::TurnCancelled))
+    Err(NanocodexError::TurnCancelled)
 ));
 # Ok(())
 # }

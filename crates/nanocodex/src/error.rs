@@ -1,10 +1,14 @@
-use std::{io, path::PathBuf};
+use std::{error::Error, io, path::PathBuf};
 
 pub use nanocodex_service::ResponsesError;
+use nanocodex_service::ResponsesServiceError;
 
-/// Failures in the model/tool orchestration layer.
+/// Error returned by the Nanocodex library boundary.
 #[derive(Debug, thiserror::Error)]
-pub enum AgentError {
+pub enum NanocodexError {
+    #[error("invalid task request: {0}")]
+    InvalidRequest(String),
+
     #[error("failed to resolve task workspace {path}")]
     ResolveWorkspace {
         path: PathBuf,
@@ -28,26 +32,20 @@ pub enum AgentError {
         source: io::Error,
     },
 
-    #[error("Responses API requested unsupported function {name} in call {call_id}")]
-    UnsupportedFunction { name: String, call_id: String },
-
     #[error("malformed Responses API event: {detail}")]
     MalformedResponse { detail: &'static str },
-
-    #[error("remote compaction returned {count} compaction items; expected exactly one")]
-    InvalidCompactionOutput { count: usize },
 
     #[error("invalid Responses attempt state: {detail}")]
     InvalidAttemptState { detail: &'static str },
 
-    #[error("the agent driver stopped before accepting the prompt")]
-    DriverStopped,
+    #[error("the agent stopped before accepting the command")]
+    AgentStopped,
 
-    #[error("the agent driver stopped before the turn completed")]
+    #[error("the agent stopped before the turn completed")]
     TurnStopped,
 
     #[error("the targeted turn is queued, completed, or otherwise not active for steering")]
-    TurnNotActiveToSteer,
+    TurnNotSteerable,
 
     #[error("the active turn's steering queue is full")]
     SteerQueueFull,
@@ -66,13 +64,6 @@ pub enum AgentError {
 
     #[error("building an agent requires an active Tokio runtime")]
     TokioRuntimeUnavailable,
-}
-
-/// Error returned by the nanocodex library boundary.
-#[derive(Debug, thiserror::Error)]
-pub enum NanocodexError {
-    #[error("invalid task request: {0}")]
-    InvalidRequest(String),
 
     #[error(transparent)]
     Event(#[from] nanocodex_core::EventError),
@@ -82,9 +73,6 @@ pub enum NanocodexError {
 
     #[error(transparent)]
     ResponsesService(#[from] nanocodex_service::ResponsesServiceError),
-
-    #[error(transparent)]
-    Agent(#[from] AgentError),
 
     #[cfg(not(target_family = "wasm"))]
     #[error("failed to build tools for an agent driver")]
@@ -97,16 +85,40 @@ pub enum NanocodexError {
 impl NanocodexError {
     pub(crate) fn responses_error(&self) -> Option<&ResponsesError> {
         match self {
-            Self::Responses(error) => Some(error),
-            Self::ResponsesService(error) => error.responses_error(),
-            Self::InvalidRequest(_)
-            | Self::Event(_)
-            | Self::Agent(_)
-            | Self::ResponsesMiddleware(_) => None,
-            #[cfg(not(target_family = "wasm"))]
-            Self::Tools(_) => None,
+            Self::Responses(error) => return Some(error),
+            Self::ResponsesService(error) => return error.responses_error(),
+            _ => {}
         }
+
+        let mut current = self.source();
+        while let Some(error) = current {
+            if let Some(service) = error.downcast_ref::<ResponsesServiceError>() {
+                return service.responses_error();
+            }
+            if let Some(responses) = error.downcast_ref::<ResponsesError>() {
+                return Some(responses);
+            }
+            current = error.source();
+        }
+        None
     }
 }
 
 pub type Result<T> = std::result::Result<T, NanocodexError>;
+
+#[cfg(test)]
+mod tests {
+    use super::{NanocodexError, ResponsesError};
+    use nanocodex_service::ResponsesServiceError;
+
+    #[test]
+    fn responses_classification_survives_middleware_boxing() {
+        let service = ResponsesServiceError::from(ResponsesError::UnexpectedEnd);
+        let error = NanocodexError::ResponsesMiddleware(Box::new(service));
+
+        assert!(matches!(
+            error.responses_error(),
+            Some(ResponsesError::UnexpectedEnd)
+        ));
+    }
+}

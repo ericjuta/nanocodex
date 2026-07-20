@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queued as well as active turns. Workspace policy now belongs exclusively to
   the agent builder, prompts contain only user input, and ignored `Turn` handles
   produce a compiler warning because dropping one does not cancel its work.
+- Flattened lifecycle failures into `NanocodexError`, so callers match variants
+  such as `TurnCancelled` directly, and preserved Responses failure
+  classification through caller-provided Tower middleware.
 
 ## [0.1.0](https://github.com/gakonst/nanocodex/releases/tag/v0.1.0) - 2026-07-20
 

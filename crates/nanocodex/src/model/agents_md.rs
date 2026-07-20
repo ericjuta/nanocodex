@@ -4,12 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::AgentError;
+use crate::NanocodexError;
 
 const MAX_PROJECT_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 const CANDIDATE_FILENAMES: [&str; 2] = ["AGENTS.override.md", "AGENTS.md"];
 
-pub(super) fn load_project_instructions(workspace: &Path) -> Result<Option<String>, AgentError> {
+pub(super) fn load_project_instructions(
+    workspace: &Path,
+) -> Result<Option<String>, NanocodexError> {
     let root = find_project_root(workspace)?;
     let mut directories = workspace
         .ancestors()
@@ -29,7 +31,7 @@ pub(super) fn load_project_instructions(workspace: &Path) -> Result<Option<Strin
             continue;
         };
         let data = read_bounded(&path, remaining).map_err(|source| {
-            AgentError::ReadProjectInstructions {
+            NanocodexError::ReadProjectInstructions {
                 path: path.clone(),
                 source,
             }
@@ -44,14 +46,14 @@ pub(super) fn load_project_instructions(workspace: &Path) -> Result<Option<Strin
     Ok((!documents.is_empty()).then(|| documents.join("\n\n")))
 }
 
-fn find_project_root(workspace: &Path) -> Result<PathBuf, AgentError> {
+fn find_project_root(workspace: &Path) -> Result<PathBuf, NanocodexError> {
     for directory in workspace.ancestors() {
         let marker = directory.join(".git");
         match fs::metadata(&marker) {
             Ok(_) => return Ok(directory.to_path_buf()),
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
-                return Err(AgentError::ReadProjectInstructions {
+                return Err(NanocodexError::ReadProjectInstructions {
                     path: marker,
                     source,
                 });
@@ -61,7 +63,7 @@ fn find_project_root(workspace: &Path) -> Result<PathBuf, AgentError> {
     Ok(workspace.to_path_buf())
 }
 
-fn instruction_file(directory: &Path) -> Result<Option<PathBuf>, AgentError> {
+fn instruction_file(directory: &Path) -> Result<Option<PathBuf>, NanocodexError> {
     for filename in CANDIDATE_FILENAMES {
         let path = directory.join(filename);
         match fs::metadata(&path) {
@@ -69,7 +71,7 @@ fn instruction_file(directory: &Path) -> Result<Option<PathBuf>, AgentError> {
             Ok(_) => {}
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
-                return Err(AgentError::ReadProjectInstructions { path, source });
+                return Err(NanocodexError::ReadProjectInstructions { path, source });
             }
         }
     }
