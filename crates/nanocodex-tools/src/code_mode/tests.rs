@@ -8,8 +8,8 @@ use super::{CodeModeExecution, NestedToolCall, parse_exec_source};
 use crate::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime, WebSearchConfig};
 
 #[tokio::test]
-async fn starts_each_cell_in_a_fresh_node_host() -> Result<()> {
-    let workspace = temporary_workspace("fresh-node-host")?;
+async fn reuses_one_node_host_across_cells() -> Result<()> {
+    let workspace = temporary_workspace("persistent-node-host")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let context = test_context(&history);
@@ -19,7 +19,7 @@ async fn starts_each_cell_in_a_fresh_node_host() -> Result<()> {
 
     assert!(first.success);
     assert!(second.success);
-    assert_ne!(emitted_text(&first)?, emitted_text(&second)?);
+    assert_eq!(emitted_text(&first)?, emitted_text(&second)?);
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }

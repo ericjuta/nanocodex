@@ -3,7 +3,7 @@ mod output;
 mod protocol;
 mod spec;
 
-use std::{collections::HashMap, process::Stdio, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc, time::Instant};
 
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use tokio::{
     task::JoinHandle,
     time::Duration,
 };
+use tracing::{Instrument, info_span};
 
 use nanocodex_core::ResponseItem;
 use serde_json::value::RawValue;
@@ -36,6 +37,12 @@ const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
 pub(crate) struct CodeModeRuntime {
     cells: Mutex<CellRegistry>,
     stored: Arc<Mutex<HashMap<String, Value>>>,
+    host: Arc<Mutex<SharedNodeHost>>,
+}
+
+struct SharedNodeHost {
+    workspace: PathBuf,
+    host: Option<NodeHost>,
 }
 
 struct CellRegistry {
@@ -196,13 +203,17 @@ struct HostFailure {
 }
 
 impl CodeModeRuntime {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(workspace: PathBuf) -> Self {
         Self {
             cells: Mutex::new(CellRegistry {
                 next_cell_id: 1,
                 live_cells: HashMap::new(),
             }),
             stored: Arc::new(Mutex::new(HashMap::new())),
+            host: Arc::new(Mutex::new(SharedNodeHost {
+                workspace,
+                host: None,
+            })),
         }
     }
 
@@ -213,6 +224,51 @@ impl CodeModeRuntime {
         context: ToolContext<'_>,
     ) -> CodeModeExecution {
         let started_at = Instant::now();
+        let span = info_span!(
+            target: "nanocodex_tools",
+            "code_mode.cell",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            cell.id = tracing::field::Empty,
+            source.bytes = source.len(),
+            source.lines = source.lines().count(),
+            output.max_tokens = tracing::field::Empty,
+            nested.count = tracing::field::Empty,
+            running = tracing::field::Empty,
+            status = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let execution = self
+            .execute_inner(source, tools, context, started_at)
+            .instrument(span.clone())
+            .await;
+        span.record(
+            "status",
+            if execution.success {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        span.record(
+            "otel.status_code",
+            if execution.success { "OK" } else { "ERROR" },
+        );
+        span.record("nested.count", execution.nested_calls.len());
+        span.record(
+            "duration_ns",
+            u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        execution
+    }
+
+    async fn execute_inner(
+        &self,
+        source: &str,
+        tools: Arc<ToolRegistry>,
+        context: ToolContext<'_>,
+        started_at: Instant,
+    ) -> CodeModeExecution {
         let source = match parse_exec_source(source) {
             Ok(source) => source,
             Err(message) => return failed_execution(started_at, &message, Vec::new()),
@@ -221,24 +277,24 @@ impl CodeModeRuntime {
             .max_output_tokens
             .unwrap_or(context.output_token_budget)
             .max(1);
+        tracing::Span::current().record("output.max_tokens", output_token_budget);
         let context = ToolContext {
             output_token_budget,
             ..context
         };
         let cell_id = self.cells.lock().await.allocate_cell_id();
+        tracing::Span::current().record("cell.id", cell_id);
         let stored = self.stored.lock().await.clone();
-        let mut cell = match LiveCell::spawn(
+        let mut cell = LiveCell::spawn(
             cell_id,
             source.code,
             tools,
             OwnedToolContext::from(context),
             stored,
             Arc::clone(&self.stored),
+            Arc::clone(&self.host),
             output_token_budget,
-        ) {
-            Ok(cell) => cell,
-            Err(message) => return failed_execution(started_at, &message, Vec::new()),
-        };
+        );
         let yield_after = source
             .yield_time_ms
             .map_or(INITIAL_YIELD, Duration::from_millis);
@@ -249,6 +305,7 @@ impl CodeModeRuntime {
             Some(output_token_budget),
         )
         .await;
+        tracing::Span::current().record("running", running);
         if running {
             self.cells.lock().await.live_cells.insert(cell_id, cell);
         } else {
@@ -470,29 +527,46 @@ impl LiveCell {
         context: OwnedToolContext,
         stored: HashMap<String, Value>,
         shared_stored: Arc<Mutex<HashMap<String, Value>>>,
+        host: Arc<Mutex<SharedNodeHost>>,
         output_token_budget: usize,
-    ) -> Result<Self, String> {
-        let host = NodeHost::spawn(&tools.workspace)?;
+    ) -> Self {
         let (updates_tx, updates) = mpsc::unbounded_channel();
         let (terminate, terminate_rx) = oneshot::channel();
-        let task = tokio::spawn(run_cell_actor(
-            host,
-            id,
-            source,
-            tools,
-            context,
-            stored,
-            shared_stored,
-            updates_tx,
-            terminate_rx,
-        ));
-        Ok(Self {
+        let actor_span = info_span!(
+            target: "nanocodex_tools",
+            "code_mode.cell_actor",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            cell.id = id,
+            runtime.first_event_ns = tracing::field::Empty,
+            runtime.event_count = tracing::field::Empty,
+            host.reused = tracing::field::Empty,
+            host.wait_ns = tracing::field::Empty,
+            host.termination_ns = tracing::field::Empty,
+            status = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let task = tokio::spawn(
+            run_cell_actor(
+                host,
+                id,
+                source,
+                tools,
+                context,
+                stored,
+                shared_stored,
+                updates_tx,
+                terminate_rx,
+            )
+            .instrument(actor_span),
+        );
+        Self {
             id,
             output_token_budget,
             updates,
             terminate: Some(terminate),
             task: Some(task),
-        })
+        }
     }
 
     async fn terminate(&mut self) {
@@ -516,7 +590,10 @@ impl Drop for LiveCell {
             let _ = terminate.send(());
         }
         if let Some(task) = self.task.take() {
-            task.abort();
+            // The detached actor observes `terminate` and shuts down the shared
+            // host. Aborting here could leave JavaScript running in a process
+            // that a later cell is about to reuse.
+            drop(task);
         }
     }
 }
@@ -668,6 +745,36 @@ fn observed_execution(
 
 impl NodeHost {
     fn spawn(workspace: &std::path::Path) -> Result<Self, String> {
+        let started_at = Instant::now();
+        let span = info_span!(
+            target: "nanocodex_tools",
+            "code_mode.host_spawn",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            status = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let result = span.in_scope(|| Self::spawn_inner(workspace));
+        span.record(
+            "status",
+            if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            },
+        );
+        span.record(
+            "otel.status_code",
+            if result.is_ok() { "OK" } else { "ERROR" },
+        );
+        span.record(
+            "duration_ns",
+            u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        result
+    }
+
+    fn spawn_inner(workspace: &std::path::Path) -> Result<Self, String> {
         let mut child = Command::new("node")
             .args(["--input-type=module", "--eval", RUNTIME])
             .current_dir(workspace)
@@ -723,9 +830,11 @@ impl NodeHost {
         tools: &ToolRegistry,
         context: &OwnedToolContext,
         updates: &mpsc::UnboundedSender<CellUpdate>,
+        actor_started_at: Instant,
     ) -> Result<CellTerminal, HostFailure> {
         let mut pending_calls: FuturesUnordered<BoxFuture<'_, CompletedNestedCall>> =
             FuturesUnordered::new();
+        let mut event_count = 0_u64;
         loop {
             tokio::select! {
                 completed = pending_calls.next(), if !pending_calls.is_empty() => {
@@ -738,6 +847,14 @@ impl NodeHost {
                 }
                 event = self.read_event() => {
                     let event = event?;
+                    event_count = event_count.saturating_add(1);
+                    if event_count == 1 {
+                        tracing::Span::current().record(
+                            "runtime.first_event_ns",
+                            u64::try_from(actor_started_at.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
                     let event_cell_id = event.cell_id();
                     if event_cell_id != cell_id {
                         return Err(HostFailure::new(format!(
@@ -767,6 +884,7 @@ impl NodeHost {
                             stored,
                             ..
                         } => {
+                            tracing::Span::current().record("runtime.event_count", event_count);
                             return Ok(CellTerminal::Completed {
                                 content,
                                 stored,
@@ -778,6 +896,7 @@ impl NodeHost {
                             stored,
                             ..
                         } => {
+                            tracing::Span::current().record("runtime.event_count", event_count);
                             return Ok(CellTerminal::ScriptFailed {
                                 message,
                                 content,
@@ -840,7 +959,7 @@ impl NodeHost {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_cell_actor(
-    mut host: NodeHost,
+    shared_host: Arc<Mutex<SharedNodeHost>>,
     cell_id: u64,
     source: String,
     tools: Arc<ToolRegistry>,
@@ -850,6 +969,31 @@ async fn run_cell_actor(
     updates: mpsc::UnboundedSender<CellUpdate>,
     mut terminate: oneshot::Receiver<()>,
 ) {
+    let started_at = Instant::now();
+    let host_wait_started_at = Instant::now();
+    let mut shared_host = shared_host.lock().await;
+    tracing::Span::current().record(
+        "host.wait_ns",
+        u64::try_from(host_wait_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    );
+    let reused = shared_host.host.is_some();
+    tracing::Span::current().record("host.reused", reused);
+    let mut host = match shared_host.host.take() {
+        Some(host) => host,
+        None => match NodeHost::spawn(&shared_host.workspace) {
+            Ok(host) => host,
+            Err(message) => {
+                tracing::Span::current().record("status", "failed");
+                tracing::Span::current().record("otel.status_code", "ERROR");
+                tracing::Span::current().record(
+                    "duration_ns",
+                    u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                );
+                let _ = updates.send(CellUpdate::HostFailed(message));
+                return;
+            }
+        },
+    };
     let run = async {
         host.start_cell(cell_id, &source, stored, tools.as_ref())
             .await?;
@@ -859,17 +1003,33 @@ async fn run_cell_actor(
             tools.as_ref(),
             &context,
             &updates,
+            started_at,
         )
         .await
     };
     let terminal = tokio::select! {
         biased;
         _ = &mut terminate => {
+            let termination_started_at = Instant::now();
             host.terminate().await;
+            tracing::Span::current().record(
+                "host.termination_ns",
+                u64::try_from(termination_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
+            tracing::Span::current().record("status", "cancelled");
+            tracing::Span::current().record("otel.status_code", "ERROR");
+            tracing::Span::current().record(
+                "duration_ns",
+                u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            );
             return;
         }
         terminal = run => terminal,
     };
+    let success = matches!(terminal, Ok(CellTerminal::Completed { .. }));
+    tracing::Span::current().record("status", if success { "completed" } else { "failed" });
+    tracing::Span::current().record("otel.status_code", if success { "OK" } else { "ERROR" });
+    let host_healthy = terminal.is_ok();
     match terminal {
         Ok(CellTerminal::Completed { content, stored }) => {
             shared_stored.lock().await.extend(stored);
@@ -887,7 +1047,20 @@ async fn run_cell_actor(
             let _ = updates.send(CellUpdate::HostFailed(failure.message));
         }
     }
-    host.terminate().await;
+    if host_healthy {
+        shared_host.host = Some(host);
+    } else {
+        let termination_started_at = Instant::now();
+        host.terminate().await;
+        tracing::Span::current().record(
+            "host.termination_ns",
+            u64::try_from(termination_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+    tracing::Span::current().record(
+        "duration_ns",
+        u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+    );
 }
 
 impl CodeModeNotification {
