@@ -6,6 +6,11 @@ port 4318 and the trace UI is available on port 16686. The checked-in Compose
 service is ephemeral, binds only to localhost, and loses its trace data when it
 is removed.
 
+Every model request asks for `detailed` API-visible reasoning summaries. Their
+streaming deltas remain typed `reasoning.summary.delta` agent events, while the
+completed readable summary and encrypted continuation payload are recorded as
+ordered `reasoning` content on the corresponding `model.call` span.
+
 ## Quick start
 
 Start Jaeger:
@@ -13,6 +18,16 @@ Start Jaeger:
 ```sh
 just otel-up
 ```
+
+Or start Jaeger and launch the interactive TUI with telemetry in one command:
+
+```sh
+just run-otel
+```
+
+`just` loads `OPENAI_API_KEY` from the repository `.env`. Interactive local
+logs are written to `.nanocodex/logs/tui.log`; exported traces appear in
+Jaeger at <http://localhost:16686> under the `nanocodex` service.
 
 Run one live turn that makes a model call, executes the built-in `exec` tool,
 and makes a follow-up model call:
@@ -43,14 +58,53 @@ agent.turn
     └── responses.attempt
 ```
 
+To inspect every turn in one conversation, enter `/trace` in the TUI. It opens
+Jaeger's search page filtered to the focused main or `/btw` session. The local
+Jaeger configuration also turns `session.id` and `parent.session.id` tags into
+links to the corresponding session search. Jaeger returns the session as an
+ordered search result containing one bounded trace per turn; it does not merge
+the turns into one artificial waterfall. Set `NANOCODEX_JAEGER_UI_URL` when the
+query UI is not available at the default `http://127.0.0.1:16686`.
+
+The structure follows init4tech's
+[`teaching-tracing` guidance](https://github.com/init4tech/teaching-tracing): a
+root is one bounded unit of work, futures are instrumented before they are
+spawned, and long-running task/session lifetimes are not held open as spans.
+When a caller has no active span, `agent.turn` is the root. The TUI wraps each
+interaction in a bounded `tui.turn`, so its agent work is directly expandable
+in the same trace:
+
+```text
+tui.turn
+└── agent.turn
+    ├── model.call
+    ├── tool.call
+    └── model.call
+```
+
+Code Mode promise fan-out and attached child agents appear as overlapping
+sibling branches under the active cell/tool operation. A child or follow-up
+prompt made outside an active orchestration is instead a new bounded root and
+remains correlatable through `session.id`, `parent.session.id`,
+`session.lineage_id`, `agent.origin`, and `agent.depth`.
+
 With MCP configured, `mcp.server_start` and `mcp.tool_call` spans appear around
 background discovery and remote dispatch. Useful fields include session and
 model-call identity, response replay mode, connection purpose/generation,
 attempt count, status, duration, input/output tokens, cached input tokens, and
-tool name. Diagnostic spans retain structural metadata such as byte and item
-counts, argument kinds and keys, process exit state, and API-visible reasoning
-summaries. They never include full prompt bodies, hidden reasoning content,
-tool argument values, raw response frames, or the API key.
+tool name. `tui.view_state` traces record whether the TUI is main-only or split,
+which pane is focused, the local BTW ID, and the forked session ID once it is
+available. `tui.main.session_id` and `tui.active.session_id` correlate every
+view transition with the controlled agent, while each bounded `tui.turn` trace
+contains its `agent.turn` directly. Diagnostic spans retain structural metadata such as byte and item
+counts, argument kinds and keys, and process exit state as searchable tags.
+Their ordered Logs/Events contain the complete available conversation: prompts,
+model input and output items, readable reasoning content and summaries, opaque
+encrypted reasoning payloads, tool arguments, and tool outputs. Nanocodex does
+not decrypt encrypted reasoning or reconstruct reasoning absent from the API.
+It does not attach API-key configuration or read `.env` for telemetry, but
+captured conversation and tool content is intentionally unredacted; secure and
+expire Jaeger data accordingly.
 
 Each turn is its own root unit of work so a long-lived embedded agent does not
 produce one unbounded trace. Sequential turns remain searchable as a session
@@ -68,8 +122,9 @@ just otel-down
 
 The manual stress gate uses a deterministic local Responses WebSocket rather
 than spending model tokens. It still drives the real CLI, retained Nanocodex
-session, the session-persistent Code Mode Node host, shell process lifecycle, MCP stdio transport,
-local tracing subscriber, batch OTLP exporter, and Jaeger backend:
+session, the session-persistent Code Mode Node host, shell process lifecycle,
+MCP stdio transport, local tracing subscriber, batch OTLP exporter, and Jaeger
+backend:
 
 ```sh
 just otel-stress
@@ -80,9 +135,12 @@ fans out 16 concurrent MCP calls, then mixes in a synthetic MCP error, malformed
 patch, non-zero shell, bounded high-volume output, yielded/resumed process, and
 unknown JavaScript tool. The gate verifies event counts, exactly one trace root
 per accepted prompt, all parent references, expected success/error span volume,
+shared cell-actor parentage and complete interval overlap for the delayed
+`Promise.all` fan-out,
 presence of structural model/tool fields and API-visible reasoning summaries,
-and absence of prompt, hidden-reasoning, tool-argument, and API-key sentinels
-from exported trace data.
+presence of prompt, readable and encrypted reasoning, and tool-argument
+sentinels in ordered span events, and absence of the separately configured API
+key from exported trace data.
 
 Scale it up without changing code:
 
@@ -96,6 +154,17 @@ the normal workspace suite because it requires the local Jaeger service and is
 intentionally expensive. Its Responses side remains deterministic so failures
 indicate library, tool, exporter, or topology regressions rather than model
 sampling variance.
+
+Run the focused attached-subagent topology gate separately:
+
+```sh
+just otel-subagent-stress
+```
+
+It drives two child agents concurrently from one Code Mode `Promise.all`, then
+queries Jaeger to verify that both child `agent.turn` spans share the parent
+trace, sit below their corresponding `spawn_agent` tool spans, retain their
+independent session identities, and overlap in exported wall-clock intervals.
 
 To measure the cost of span collection/export against the identical workload,
 run the no-OTLP twin with the same arguments:

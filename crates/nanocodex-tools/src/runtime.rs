@@ -6,7 +6,7 @@ use schemars::{JsonSchema, r#gen::SchemaSettings};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::value::{RawValue, to_raw_value};
 use serde_json::{Map, Value, json};
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, info, info_span};
 
 use crate::{
     apply_patch,
@@ -573,6 +573,7 @@ impl ToolRegistry {
         input: Value,
         context: ToolContext<'_>,
     ) -> ToolExecution {
+        let arguments_content = serde_json::to_string(&input).ok();
         let arguments_bytes = serde_json::to_vec(&input).map_or(0, |encoded| encoded.len());
         let arguments_kind = match &input {
             Value::Null => "null",
@@ -617,11 +618,17 @@ impl ToolRegistry {
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
+        if let Some(arguments_content) = &arguments_content {
+            record_tool_content(&span, "tool.arguments", arguments_content);
+        }
         let started_at = std::time::Instant::now();
         let execution = self
             .execute_nested_inner(name, input, context)
             .instrument(span.clone())
             .await;
+        if let Ok(content) = serde_json::to_string(&execution.output) {
+            record_tool_content(&span, "tool.output", &content);
+        }
         span.record(
             "status",
             if execution.success {
@@ -746,6 +753,17 @@ impl ToolRegistry {
     fn entries(&self) -> impl Iterator<Item = (&Arc<dyn Tool>, &ToolDefinition)> {
         self.ordered.iter().zip(&self.definitions)
     }
+}
+
+fn record_tool_content(span: &tracing::Span, kind: &'static str, content: &str) {
+    span.in_scope(|| {
+        info!(
+            target: "nanocodex_tools",
+            content_kind = kind,
+            content,
+            "tool content"
+        );
+    });
 }
 
 fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {

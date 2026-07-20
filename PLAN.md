@@ -131,12 +131,17 @@ applications without coupling the library to a subscriber or exporter.
 
 Outcomes:
 
-1. Define stable tracing spans for agent session, turn, model call, Responses
-   attempt, reconnect/backoff, and tool execution. Include IDs, durations,
-   replay mode, error class, token/cache usage, structural prompt/tool metadata,
-   process outcomes, and API-visible reasoning summaries. Never attach full
-   prompts, Code Mode source, tool argument values, hidden reasoning, or
-   authentication credentials.
+1. Define stable bounded spans for TUI interaction, agent turn, model call,
+   Responses attempt, reconnect/backoff, Code Mode cell, and tool execution.
+   Keep long-lived sessions as correlation identity rather than open spans.
+   Include IDs, lineage/depth, durations, replay mode, error class, token/cache
+   usage, structural prompt/tool metadata, and process outcomes as searchable
+   attributes. Attach complete prompts and instructions, model input/output
+   items, API-visible and encrypted reasoning payloads, Code Mode source, tool
+   arguments, tool results, steering, cancellation, and lifecycle data as
+   unredacted ordered span events. Carry active caller context with accepted
+   prompts so attached child-agent turns render inside their bounded parent
+   orchestration while ordinary and detached turns remain roots.
 2. Keep subscriber choice outside the library. The CLI may install a sensible
    stderr subscriber, while embedders can install OpenTelemetry, metrics, or
    their own tracing stack.
@@ -154,7 +159,9 @@ Gate:
 
 - Existing result-only and follow-on examples remain unchanged.
 - JSONL remains contiguous with one terminal event per accepted prompt.
-- Tracing writes no stdout and no secrets.
+- Tracing writes no stdout and preserves complete ordered runtime content.
+- Parallel Code Mode and attached child-agent work has explicit parentage and
+  measurably overlapping exported intervals rather than serialized spans.
 - Warnings-denied Clippy, workspace tests, public examples, a native CLI smoke,
   and representative retained-trace benchmarks pass.
 

@@ -178,9 +178,9 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     };
     let help = if app.btw.is_some() {
-        "  BackTab switch · Enter send/steer · Tab queue · Esc Esc stop · /close dismiss · Ctrl+C quit"
+        "  BackTab switch · /trace inspect · /close dismiss · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit"
     } else {
-        "  /btw <question> side fork · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit"
+        "  /btw <question> side fork · /trace inspect · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit"
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -419,7 +419,7 @@ mod tests {
                 "\"┌ Message → Main ──────────────────────────────┐\"\n",
                 "\"│                                              │\"\n",
                 "\"└──────────────────────────────────────────────┘\"\n",
-                "\" Ready  /btw <question> side fork · Enter send/s\"\n",
+                "\" Ready  /btw <question> side fork · /trace inspe\"\n",
             )
         );
     }

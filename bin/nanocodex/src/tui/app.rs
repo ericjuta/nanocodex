@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -301,6 +302,7 @@ impl Conversation {
 
 pub(super) struct BtwPane {
     pub(super) id: u64,
+    pub(super) request_id: Option<Arc<str>>,
     pub(super) conversation: Conversation,
 }
 
@@ -493,6 +495,7 @@ impl App {
         self.next_btw_id = self.next_btw_id.saturating_add(1);
         self.btw = Some(BtwPane {
             id,
+            request_id: None,
             conversation: Conversation::new("Forking latest checkpoint"),
         });
         self.focus = PaneId::Btw(id);
@@ -544,9 +547,10 @@ impl App {
         }
     }
 
-    pub(super) fn btw_opened(&mut self, id: u64) {
-        if let Some(conversation) = self.conversation_mut(PaneId::Btw(id)) {
-            conversation.status = if conversation.pending_turns == 0 {
+    pub(super) fn btw_opened(&mut self, id: u64, request_id: Arc<str>) {
+        if let Some(btw) = self.btw.as_mut().filter(|btw| btw.id == id) {
+            btw.request_id = Some(request_id);
+            btw.conversation.status = if btw.conversation.pending_turns == 0 {
                 "Ready".to_owned()
             } else {
                 "Starting".to_owned()
@@ -683,6 +687,22 @@ impl App {
 
     pub(super) fn active_conversation(&self) -> &Conversation {
         self.conversation(self.focus).unwrap_or(&self.main)
+    }
+
+    pub(super) fn set_active_status(&mut self, status: impl Into<String>) {
+        if let Some(conversation) = self.conversation_mut(self.focus) {
+            conversation.status = status.into();
+        }
+    }
+
+    pub(super) fn push_active_error(&mut self, error: impl Into<String>) {
+        if let Some(conversation) = self.conversation_mut(self.focus) {
+            conversation
+                .transcript
+                .push(TranscriptItem::Error(error.into()));
+            "Trace unavailable".clone_into(&mut conversation.status);
+            conversation.scroll_from_bottom = 0;
+        }
     }
 
     fn conversation(&self, target: PaneId) -> Option<&Conversation> {
@@ -938,6 +958,22 @@ mod tests {
         assert!(!app.main.running);
         assert_eq!(app.main.status, "Cancelled");
         assert_eq!(app.main.transcript.len(), 2);
+    }
+
+    #[test]
+    fn reasoning_summary_deltas_are_visible_while_the_turn_is_running() {
+        let mut app = App::new(".".into());
+        app.main.on_agent_event(&event(
+            AgentEventKind::RunStarted,
+            &json!({ "status": "started" }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ReasoningSummaryDelta,
+            &json!({ "model_call_index": 0, "text": "Inspecting the request path" }),
+        ));
+
+        assert_eq!(app.main.reasoning, "Inspecting the request path");
+        assert_eq!(app.main.status, "Inspecting the request path");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 use std::{path::Path, sync::Arc};
 
 use nanocodex_core::{
-    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ReasoningSummary, ResponseItem,
-    ToolDefinition, Usage, responses::RequestProfile,
+    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ToolDefinition, Usage,
+    responses::RequestProfile,
 };
 use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
@@ -11,7 +11,7 @@ use nanocodex_service::{
 use serde_json::value::RawValue;
 use tokio::sync::watch;
 use tower::Service;
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, info, info_span};
 use web_time::Instant;
 
 use super::{
@@ -643,6 +643,14 @@ where
         steers: &mut tokio::sync::mpsc::Receiver<Prompt>,
     ) -> Result<()> {
         while let Ok(steer) = steers.try_recv() {
+            if let Ok(content) = serde_json::to_string(&steer) {
+                info!(
+                    target: "nanocodex",
+                    content_kind = "steer",
+                    content = content.as_str(),
+                    "turn content"
+                );
+            }
             let instruction_bytes = steer.instruction.text_bytes();
             let user_content = prepare_user_input(&steer.instruction).await;
             conversation.append([ResponseItem::message(
@@ -710,18 +718,8 @@ where
             history,
             output_token_budget: nanocodex_tools::DEFAULT_TOOL_OUTPUT_TOKENS,
         };
-        let tool_span = info_span!(
-            target: "nanocodex",
-            "tool.call",
-            otel.kind = "internal",
-            otel.status_code = tracing::field::Empty,
-            tool.name = %call.name,
-            tool.call_id = %call.call_id,
-            tool.arguments.bytes = call.input.len(),
-            model.call_index = call_index,
-            status = tracing::field::Empty,
-            duration_ns = tracing::field::Empty,
-        );
+        let tool_span = model_tool_span(&call, call_index);
+        record_span_content(&tool_span, "tool.arguments", &call.input);
         let mut execution = async {
             if call.name == "exec" {
                 tools.execute_code(&call.input, context).await
@@ -732,6 +730,9 @@ where
         .instrument(tool_span.clone())
         .await;
         prepare_output_images(&mut execution.output).await;
+        if let Ok(content) = serde_json::to_string(&execution.output) {
+            record_span_content(&tool_span, "tool.output", &content);
+        }
         self.active_tool_call = None;
         let duration_ns = elapsed_ns(started_at);
         tool_span.record("status", status(execution.success));
@@ -866,6 +867,9 @@ where
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
+        if let Ok(content) = serde_json::to_string(factory.profile().prefix()) {
+            record_span_content(&span, "model.input", &content);
+        }
         let success = match self
             .client
             .execute(factory.warmup())
@@ -951,13 +955,16 @@ where
             conversation.delta_start,
             previous_response_id,
         );
-        let (input_item_count, input_bytes) = trace_model_input(&request);
+        let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = model_call_span(
             call_index,
             previous_response_id.is_some(),
             input_item_count,
             input_bytes,
         );
+        if let Some(input_content) = &input_content {
+            record_span_content(&span, "model.input", input_content);
+        }
         let success = match self.client.execute(request).instrument(span.clone()).await {
             Ok(success) => success,
             Err(error) => {
@@ -1051,9 +1058,28 @@ where
             previous_response_id,
             trigger,
         );
-        let success = match self.client.execute(request).await {
+        let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
+        let span = info_span!(
+            target: "nanocodex",
+            "model.compaction",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            after_model_call_index,
+            model.input.item_count = input_item_count,
+            model.input.bytes = input_bytes,
+            model.response.id = tracing::field::Empty,
+            status = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        if let Some(input_content) = &input_content {
+            record_span_content(&span, "model.input", input_content);
+        }
+        let success = match self.client.execute(request).instrument(span.clone()).await {
             Ok(success) => success,
             Err(error) => {
+                span.record("status", "failed");
+                span.record("otel.status_code", "ERROR");
+                span.record("duration_ns", elapsed_ns(started_at));
                 return self.compaction_failed(after_model_call_index, started_at, error.into());
             }
         };
@@ -1061,11 +1087,20 @@ where
         let connection_generation = success.connection_generation();
         self.server_reasoning_included |= success.server_reasoning_included();
         let ResponsesOutput::Compaction(response) = success.into_output() else {
+            span.record("status", "failed");
+            span.record("otel.status_code", "ERROR");
             return Err(NanocodexError::InvalidAttemptState {
                 detail: "compaction returned a non-compaction response",
             });
         };
         let duration_ns = elapsed_ns(started_at);
+        span.record("model.response.id", response.id.as_str());
+        if let Ok(content) = serde_json::to_string(&response.item) {
+            record_span_content(&span, "model.output_item", &content);
+        }
+        span.record("status", "completed");
+        span.record("otel.status_code", "OK");
+        span.record("duration_ns", duration_ns);
         self.stats.model_duration_ns += duration_ns;
         if let Some(usage) = &response.usage {
             self.stats.usage.add(usage);
@@ -1141,11 +1176,55 @@ fn unsupported_tool_message(call: &CodeCall) -> Option<String> {
     })
 }
 
-fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize) {
+fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize, Option<String>) {
     let item_count = request.input_item_count();
     let items = request.input_items().collect::<Vec<_>>();
-    let bytes = serde_json::to_vec(&items).map_or(0, |encoded| encoded.len());
-    (item_count, bytes)
+    let content = serde_json::to_string(&items).ok();
+    let bytes = content.as_ref().map_or(0, String::len);
+    (item_count, bytes, content)
+}
+
+fn model_tool_span(call: &CodeCall, call_index: u32) -> tracing::Span {
+    info_span!(
+        target: "nanocodex",
+        "tool.call",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        tool.name = %call.name,
+        tool.call_id = %call.call_id,
+        tool.arguments.bytes = call.input.len(),
+        model.call_index = call_index,
+        status = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+    )
+}
+
+fn record_span_content(span: &tracing::Span, kind: &'static str, content: &str) {
+    span.in_scope(|| {
+        info!(
+            target: "nanocodex",
+            content_kind = kind,
+            content,
+            "trace content"
+        );
+    });
+}
+
+fn record_indexed_span_content(
+    span: &tracing::Span,
+    kind: &'static str,
+    index: usize,
+    content: &str,
+) {
+    span.in_scope(|| {
+        info!(
+            target: "nanocodex",
+            content_kind = kind,
+            output.index = index,
+            content,
+            "trace content"
+        );
+    });
 }
 
 fn model_call_span(
@@ -1177,7 +1256,6 @@ fn model_call_span(
         cached_input_tokens = tracing::field::Empty,
         output_tokens = tracing::field::Empty,
         reasoning.summary_count = tracing::field::Empty,
-        reasoning.summary = tracing::field::Empty,
     )
 }
 
@@ -1189,29 +1267,25 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
     }
     span.record("model.output.item_count", response.output_items.len());
     span.record("model.tool_call_count", response.code_calls.len());
-    let output_bytes =
-        serde_json::to_vec(&response.output_items).map_or(0, |encoded| encoded.len());
+    let output_content = serde_json::to_string(&response.output_items).ok();
+    let output_bytes = output_content.as_ref().map_or(0, String::len);
     span.record("model.output.bytes", output_bytes);
+    let mut summary_count = 0_usize;
+    for (index, item) in response.output_items.iter().enumerate() {
+        let kind = if let ResponseItem::Reasoning { summary, .. } = item {
+            summary_count = summary_count.saturating_add(summary.len());
+            "reasoning"
+        } else {
+            "model.output_item"
+        };
+        if let Ok(content) = serde_json::to_string(item) {
+            record_indexed_span_content(span, kind, index, &content);
+        }
+    }
     if let Some(message) = &response.final_message {
         span.record("assistant.output.bytes", message.len());
     }
-    record_response_reasoning(span, &response.output_items);
-}
-
-fn record_response_reasoning(span: &tracing::Span, items: &[ResponseItem]) {
-    let mut summaries = Vec::new();
-    for item in items {
-        let ResponseItem::Reasoning { summary, .. } = item else {
-            continue;
-        };
-        summaries.extend(summary.iter().map(|summary| match summary {
-            ReasoningSummary::SummaryText { text } => text.as_ref(),
-        }));
-    }
-    span.record("reasoning.summary_count", summaries.len());
-    if !summaries.is_empty() {
-        span.record("reasoning.summary", summaries.join("\n\n"));
-    }
+    span.record("reasoning.summary_count", summary_count);
 }
 
 fn strip_item_id(mut item: ResponseItem) -> ResponseItem {

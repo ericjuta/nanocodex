@@ -293,8 +293,10 @@ a follow-up while work is active, and `/cancel` stops the focused turn. At any
 safe model/tool boundary, `/btw <question>` opens a fast fork in a vertical pane
 while the mainline continues. The fork inherits the last completed response ID
 plus complete tool results and applied steers after that response; partial model
-output and unmatched tool calls remain excluded. The headless `nanocodex run`
-adapter emits flushed JSONL for scripts and Harbor.
+output and unmatched tool calls remain excluded. With local telemetry running,
+`/trace` opens Jaeger filtered to every turn in the focused main or `/btw`
+session. The headless `nanocodex run` adapter emits flushed JSONL for scripts
+and Harbor.
 
 To measure streaming cadence without recording response text, enable the shared
 transport/TUI timing target and JSON logs:

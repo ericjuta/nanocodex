@@ -16,7 +16,7 @@ use nanocodex_service::{
 use nanocodex_tools::{Tools, ToolsBuildError};
 use tokio::sync::{mpsc, oneshot, watch};
 use tower::Service;
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, info, info_span};
 
 use crate::{
     NanocodexError, Result,
@@ -172,6 +172,7 @@ enum Command {
     Prompt {
         key: TurnKey,
         prompt: Prompt,
+        parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<TurnResult>>,
     },
     Steer {
@@ -196,10 +197,12 @@ enum QueuedTurn {
     Pending {
         key: TurnKey,
         prompt: Prompt,
+        parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<TurnResult>>,
     },
     Cancelled {
         prompt: Prompt,
+        parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<TurnResult>>,
     },
 }
@@ -293,12 +296,15 @@ impl Nanocodex {
             ));
         }
         let key = TurnKey(self.next_turn.fetch_add(1, Ordering::Relaxed));
+        let parent = tracing::Span::current();
+        let parent = (!parent.is_disabled()).then_some(parent);
         let (result, receiver) = oneshot::channel();
         if self
             .commands
             .send(Command::Prompt {
                 key,
                 prompt,
+                parent,
                 result,
             })
             .await
@@ -553,13 +559,22 @@ struct AgentDriver<S> {
     workspace: Option<Arc<str>>,
     spawner: BranchSpawner<S>,
     initial_checkpoint: Option<ModelCheckpoint>,
+    origin: AgentOrigin,
 }
 
 struct BranchSpawner<S> {
     config: Arc<ModelConfig>,
     tools: ToolsConfiguration,
     lineage_id: Arc<str>,
+    depth: u32,
     service_factory: ServiceFactory<S>,
+}
+
+#[derive(Clone)]
+struct AgentOrigin {
+    kind: &'static str,
+    depth: u32,
+    parent_session_id: Option<Arc<str>>,
 }
 
 impl<S> Clone for BranchSpawner<S> {
@@ -568,6 +583,7 @@ impl<S> Clone for BranchSpawner<S> {
             config: Arc::clone(&self.config),
             tools: self.tools.clone(),
             lineage_id: Arc::clone(&self.lineage_id),
+            depth: self.depth,
             service_factory: Arc::clone(&self.service_factory),
         }
     }
@@ -626,29 +642,45 @@ where
                         QueuedTurn::Pending {
                             key,
                             prompt,
+                            parent,
                             result,
                         } => {
                             break Command::Prompt {
                                 key,
                                 prompt,
+                                parent,
                                 result,
                             };
                         }
-                        QueuedTurn::Cancelled { prompt, result } => {
+                        QueuedTurn::Cancelled {
+                            prompt,
+                            parent,
+                            result,
+                        } => {
                             turn_index += 1;
-                            let turn_span = info_span!(
-                                target: "nanocodex",
-                                parent: None,
-                                "agent.turn",
-                                otel.kind = "internal",
-                                otel.status_code = "ERROR",
-                                session.id = session_id.as_str(),
-                                model = nanocodex_core::MODEL,
-                                thinking = thinking.as_str(),
-                                turn.index = turn_index,
-                                prompt.bytes = prompt.instruction.text_bytes(),
-                                status = "cancelled",
+                            let prompt_content = serde_json::to_string(&prompt).ok();
+                            let turn_span = agent_turn_span(
+                                parent.as_ref(),
+                                session_id.as_str(),
+                                self.spawner.lineage_id.as_ref(),
+                                &self.origin,
+                                thinking,
+                                turn_index,
+                                prompt.instruction.text_bytes(),
                             );
+                            drop(parent);
+                            turn_span.record("status", "cancelled");
+                            turn_span.record("otel.status_code", "ERROR");
+                            if let Some(prompt_content) = &prompt_content {
+                                turn_span.in_scope(|| {
+                                    info!(
+                                        target: "nanocodex",
+                                        content_kind = "prompt",
+                                        content = prompt_content.as_str(),
+                                        "turn content"
+                                    );
+                                });
+                            }
                             let _guard = turn_span.enter();
                             model
                                 .emit_cancelled_before_start(&prompt, self.workspace.as_deref())?;
@@ -669,6 +701,7 @@ where
             let Command::Prompt {
                 key,
                 prompt,
+                parent,
                 result,
             } = command
             else {
@@ -676,24 +709,33 @@ where
                     command,
                     latest_fork_checkpoint.as_ref(),
                     &self.spawner,
+                    session_id.as_str(),
                     self.workspace.clone(),
                 );
                 continue;
             };
             turn_index += 1;
-            let turn_span = info_span!(
-                target: "nanocodex",
-                parent: None,
-                "agent.turn",
-                otel.kind = "internal",
-                otel.status_code = tracing::field::Empty,
-                session.id = session_id.as_str(),
-                model = nanocodex_core::MODEL,
-                thinking = thinking.as_str(),
-                turn.index = turn_index,
-                prompt.bytes = prompt.instruction.text_bytes(),
-                status = tracing::field::Empty,
+            let prompt_content = serde_json::to_string(&prompt).ok();
+            let turn_span = agent_turn_span(
+                parent.as_ref(),
+                session_id.as_str(),
+                self.spawner.lineage_id.as_ref(),
+                &self.origin,
+                thinking,
+                turn_index,
+                prompt.instruction.text_bytes(),
             );
+            drop(parent);
+            if let Some(prompt_content) = &prompt_content {
+                turn_span.in_scope(|| {
+                    info!(
+                        target: "nanocodex",
+                        content_kind = "prompt",
+                        content = prompt_content.as_str(),
+                        "turn content"
+                    );
+                });
+            }
             let (steers, steer_rx) = mpsc::channel(STEER_CAPACITY);
             let (cancel, cancel_rx) = oneshot::channel();
             let (fork_snapshots, mut fork_snapshot_rx) = watch::channel(None);
@@ -735,11 +777,13 @@ where
                             Some(Command::Prompt {
                                 key,
                                 prompt,
+                                parent,
                                 result,
                             }) => {
                                 queued_turns.push_back(QueuedTurn::Pending {
                                     key,
                                     prompt,
+                                    parent,
                                     result,
                                 });
                             }
@@ -784,6 +828,7 @@ where
                                     command,
                                     latest_fork_checkpoint.as_ref(),
                                     &self.spawner,
+                                    session_id.as_str(),
                                     self.workspace.clone(),
                                 );
                             }
@@ -859,6 +904,41 @@ where
     }
 }
 
+fn agent_turn_span(
+    parent: Option<&tracing::Span>,
+    session_id: &str,
+    lineage_id: &str,
+    origin: &AgentOrigin,
+    thinking: Thinking,
+    turn_index: u64,
+    prompt_bytes: usize,
+) -> tracing::Span {
+    let parent_id = parent.and_then(tracing::Span::id);
+    let parented = parent_id.is_some();
+    let span = info_span!(
+        target: "nanocodex",
+        parent: parent_id,
+        "agent.turn",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        session.id = session_id,
+        session.lineage_id = lineage_id,
+        parent.session.id = tracing::field::Empty,
+        agent.origin = origin.kind,
+        agent.depth = origin.depth,
+        trace.parented = parented,
+        model = nanocodex_core::MODEL,
+        thinking = thinking.as_str(),
+        turn.index = turn_index,
+        prompt.bytes = prompt_bytes,
+        status = tracing::field::Empty,
+    );
+    if let Some(parent_session_id) = &origin.parent_session_id {
+        span.record("parent.session.id", parent_session_id.as_ref());
+    }
+    span
+}
+
 fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) -> bool {
     let Some(position) = queued_turns
         .iter()
@@ -869,10 +949,23 @@ fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) 
     let Some(queued) = queued_turns.remove(position) else {
         return false;
     };
-    let QueuedTurn::Pending { prompt, result, .. } = queued else {
+    let QueuedTurn::Pending {
+        prompt,
+        parent,
+        result,
+        ..
+    } = queued
+    else {
         return false;
     };
-    queued_turns.insert(position, QueuedTurn::Cancelled { prompt, result });
+    queued_turns.insert(
+        position,
+        QueuedTurn::Cancelled {
+            prompt,
+            parent,
+            result,
+        },
+    );
     true
 }
 
@@ -880,6 +973,7 @@ fn handle_idle_command<S>(
     command: Command,
     latest: Option<&Arc<CommittedCheckpoint>>,
     spawner: &BranchSpawner<S>,
+    session_id: &str,
     workspace: Option<Arc<str>>,
 ) where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
@@ -891,11 +985,11 @@ fn handle_idle_command<S>(
             let checkpoint = checkpoint.or_else(|| latest.cloned());
             let outcome = checkpoint
                 .ok_or(NanocodexError::ForkBeforeCompletedTurn)
-                .and_then(|checkpoint| spawner.spawn_fork(&checkpoint));
+                .and_then(|checkpoint| spawner.spawn_fork(&checkpoint, session_id));
             drop(result.send(outcome));
         }
         Command::Spawn { result } => {
-            drop(result.send(spawner.spawn_clean(workspace)));
+            drop(result.send(spawner.spawn_clean(workspace, session_id)));
         }
         Command::Steer { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotSteerable)));
@@ -913,28 +1007,56 @@ where
     S::Error: Into<NanocodexError> + Send + 'static,
     S::Future: Send,
 {
-    fn spawn_fork(&self, checkpoint: &CommittedCheckpoint) -> Result<(Nanocodex, AgentEvents)> {
+    fn spawn_fork(
+        &self,
+        checkpoint: &CommittedCheckpoint,
+        parent_session_id: &str,
+    ) -> Result<(Nanocodex, AgentEvents)> {
         let session_id = new_session_id();
         let workspace = Some(Arc::<str>::from(checkpoint.model.workspace()));
+        let mut spawner = self.clone();
+        spawner.depth = self.depth.saturating_add(1);
         spawn_agent_driver(
-            self.clone(),
+            spawner,
             session_id,
             workspace,
             (self.service_factory)(),
             Some(checkpoint.model.clone()),
+            AgentOrigin {
+                kind: "fork",
+                depth: self.depth.saturating_add(1),
+                parent_session_id: Some(Arc::from(parent_session_id)),
+            },
         )
     }
 
-    fn spawn_clean(&self, workspace: Option<Arc<str>>) -> Result<(Nanocodex, AgentEvents)> {
+    fn spawn_clean(
+        &self,
+        workspace: Option<Arc<str>>,
+        parent_session_id: &str,
+    ) -> Result<(Nanocodex, AgentEvents)> {
         let session_id = new_session_id();
+        let depth = self.depth.saturating_add(1);
         let spawner = Self {
             config: Arc::clone(&self.config),
             tools: self.tools.clone(),
             lineage_id: Arc::from(session_id.as_str()),
+            depth,
             service_factory: Arc::clone(&self.service_factory),
         };
         let service = (self.service_factory)();
-        spawn_agent_driver(spawner, session_id, workspace, service, None)
+        spawn_agent_driver(
+            spawner,
+            session_id,
+            workspace,
+            service,
+            None,
+            AgentOrigin {
+                kind: "spawn",
+                depth,
+                parent_session_id: Some(Arc::from(parent_session_id)),
+            },
+        )
     }
 }
 
@@ -968,12 +1090,18 @@ where
             config,
             tools,
             lineage_id,
+            depth: 0,
             service_factory,
         },
         session_id,
         workspace,
         service,
         None,
+        AgentOrigin {
+            kind: "root",
+            depth: 0,
+            parent_session_id: None,
+        },
     )
 }
 
@@ -983,6 +1111,7 @@ fn spawn_agent_driver<S>(
     workspace: Option<Arc<str>>,
     service: S,
     initial_checkpoint: Option<ModelCheckpoint>,
+    origin: AgentOrigin,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
     S: Service<ResponsesAttempt, Response = ResponsesServiceResponse> + Send + 'static,
@@ -1013,6 +1142,7 @@ where
                 workspace,
                 spawner,
                 initial_checkpoint,
+                origin,
             }
             .run(),
         ),

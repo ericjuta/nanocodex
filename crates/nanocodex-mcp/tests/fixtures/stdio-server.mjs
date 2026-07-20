@@ -28,7 +28,10 @@ lines.on("line", (line) => {
           description: "Echo a message from the deterministic MCP fixture.",
           inputSchema: {
             type: "object",
-            properties: { message: { type: "string" } },
+            properties: {
+              message: { type: "string" },
+              delay_ms: { type: "integer", minimum: 0, maximum: 1000 },
+            },
             required: ["message"],
             additionalProperties: false,
           },
@@ -38,17 +41,20 @@ lines.on("line", (line) => {
   } else if (request.method === "tools/call") {
     const message = request.params.arguments?.message;
     const failed = message === "__fail__";
-    send({
-      jsonrpc: "2.0",
-      id: request.id,
-      result: {
-        content: [{
-          type: "text",
-          text: failed ? "fixture:synthetic failure" : `fixture:${message}`,
-        }],
-        structuredContent: { echoed: message },
-        isError: failed,
-      },
-    });
+    const delayMs = request.params.arguments?.delay_ms ?? 0;
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {
+          content: [{
+            type: "text",
+            text: failed ? "fixture:synthetic failure" : `fixture:${message}`,
+          }],
+          structuredContent: { echoed: message },
+          isError: failed,
+        },
+      });
+    }, delayMs);
   }
 });

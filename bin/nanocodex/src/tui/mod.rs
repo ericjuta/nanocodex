@@ -7,6 +7,8 @@ mod view;
 
 use std::{
     collections::VecDeque,
+    process::{Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -20,11 +22,12 @@ use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval, sleep_until},
 };
+use tracing::{Instrument, info_span};
 
 use self::{
     app::{App, PaneId},
     scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
-    telemetry::StreamTelemetry,
+    telemetry::{StreamTelemetry, ViewTelemetry},
     terminal::TerminalSession,
     transcript::TranscriptItem,
 };
@@ -37,6 +40,8 @@ that side question explicitly requests a mutation.
 
 BTW question:
 ";
+const DEFAULT_JAEGER_UI_URL: &str = "http://127.0.0.1:16686";
+const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
 
 enum WorkerCommand {
     Prompt {
@@ -88,6 +93,7 @@ enum WorkerEvent {
     },
     BtwOpened {
         id: u64,
+        request_id: Arc<str>,
     },
     BtwOpenFailed {
         id: u64,
@@ -104,6 +110,7 @@ enum WorkerEvent {
 
 struct BtwWorker {
     id: u64,
+    request_id: Arc<str>,
     agent: Nanocodex,
     first_prompt: bool,
     turns: VecDeque<TrackedTurn>,
@@ -112,11 +119,18 @@ struct BtwWorker {
 struct TrackedTurn {
     id: u64,
     control: TurnControl,
+    span: tracing::Span,
 }
 
 struct SteerRequest {
     id: u64,
     prompt: String,
+}
+
+#[derive(Clone, Copy)]
+struct TurnTarget<'a> {
+    session_id: &'a str,
+    pane: PaneId,
 }
 
 impl BtwWorker {
@@ -164,14 +178,16 @@ enum UiUpdate {
 
 struct UiModel {
     app: App,
+    root_session_id: Arc<str>,
     agent_events_open: bool,
     worker_updates_open: bool,
 }
 
 impl UiModel {
-    fn new(app: App) -> Self {
+    fn new(app: App, root_session_id: Arc<str>) -> Self {
         Self {
             app,
+            root_session_id,
             agent_events_open: true,
             worker_updates_open: true,
         }
@@ -184,7 +200,8 @@ impl UiModel {
     ) -> Result<UiUpdate> {
         match action {
             UiAction::Terminal(event) => {
-                match handle_terminal_event(event, &mut self.app, commands)? {
+                match handle_terminal_event(event, &mut self.app, &self.root_session_id, commands)?
+                {
                     TerminalAction::Redraw => Ok(UiUpdate::Redraw(RedrawPriority::Immediate)),
                     TerminalAction::Ignore => Ok(UiUpdate::Ignore),
                     TerminalAction::Quit => Ok(UiUpdate::Quit),
@@ -238,6 +255,7 @@ enum Submission {
     Btw(Option<String>),
     CloseBtw,
     Cancel,
+    Trace,
 }
 
 pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Result<()> {
@@ -248,33 +266,32 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     let configured = config.build()?;
     let agent = configured.handle;
     let mut agent_events = configured.events;
+    let root_session_id = Arc::<str>::from(agent_events.request_id());
     let _child_agents = configured.child_agents;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    spawn_agent_worker(agent, worker_rx, update_tx);
+    spawn_agent_worker(agent, Arc::clone(&root_session_id), worker_rx, update_tx);
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
     let mut input_events = EventStream::new();
     let mut ticker = interval(Duration::from_millis(80));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut ui = UiModel::new(App::new(cwd));
+    let mut ui = UiModel::new(App::new(cwd), Arc::clone(&root_session_id));
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
+    let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
 
-    if let Some(prompt) = initial_prompt {
-        ui.app.input = prompt;
-        ui.app.cursor = ui.app.input.len();
-        submit(&mut ui.app, &worker_tx, SubmitIntent::Immediate)?;
-    }
+    submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
 
     loop {
+        view_telemetry.observe(&ui.app);
         let now = Instant::now();
         if scheduler.is_due(now) {
             let render_started = Instant::now();
             terminal.draw(|frame| view::render(frame, &ui.app))?;
             let presented_at = Instant::now();
             scheduler.presented(presented_at);
-            stream_telemetry.frame_presented(render_started, presented_at);
+            stream_telemetry.frame_presented(render_started, presented_at, &ui.app);
         }
 
         let render_deadline = scheduler.deadline();
@@ -296,7 +313,9 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                 }
             }
             event = agent_events.recv(), if ui.agent_events_open => {
-                let received = event.as_ref().and_then(StreamTelemetry::event_received);
+                let received = event
+                    .as_ref()
+                    .and_then(|event| StreamTelemetry::event_received(PaneId::Main, event));
                 let action = event.map_or(UiAction::AgentStreamClosed, UiAction::Agent);
                 let update = ui.update(action, &worker_tx)?;
                 if let Some(received) = received {
@@ -311,8 +330,8 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
             }
             update = update_rx.recv(), if ui.worker_updates_open => {
                 let received = update.as_ref().and_then(|update| match update {
-                    WorkerEvent::BtwAgentEvent { event, .. } => {
-                        StreamTelemetry::event_received(event)
+                    WorkerEvent::BtwAgentEvent { id, event } => {
+                        StreamTelemetry::event_received(PaneId::Btw(*id), event)
                     }
                     _ => None,
                 });
@@ -337,6 +356,20 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     }
 }
 
+fn submit_initial_prompt(
+    app: &mut App,
+    root_session_id: &str,
+    worker: &mpsc::UnboundedSender<WorkerCommand>,
+    initial_prompt: Option<String>,
+) -> Result<()> {
+    if let Some(prompt) = initial_prompt {
+        app.input = prompt;
+        app.cursor = app.input.len();
+        submit(app, root_session_id, worker, SubmitIntent::Immediate)?;
+    }
+    Ok(())
+}
+
 fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
     let now = Instant::now();
     match update {
@@ -358,7 +391,7 @@ fn handle_worker_update(app: &mut App, update: WorkerEvent) {
         WorkerEvent::SteerFailed { target, id, error } => app.steer_failed(target, id, error),
         WorkerEvent::CancelAccepted { target } => app.cancel_accepted(target),
         WorkerEvent::CancelFailed { target, error } => app.cancel_failed(target, error),
-        WorkerEvent::BtwOpened { id } => app.btw_opened(id),
+        WorkerEvent::BtwOpened { id, request_id } => app.btw_opened(id, request_id),
         WorkerEvent::BtwOpenFailed { id, error } => app.btw_failed(id, error),
         WorkerEvent::BtwAgentEvent { id, event } => {
             let _ = app.on_agent_event(PaneId::Btw(id), &event);
@@ -373,6 +406,7 @@ fn handle_worker_update(app: &mut App, update: WorkerEvent) {
 
 fn spawn_agent_worker(
     root: Nanocodex,
+    root_session_id: Arc<str>,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
 ) {
@@ -380,6 +414,7 @@ fn spawn_agent_worker(
         let (finished_tx, mut finished_rx) = mpsc::unbounded_channel::<FinishedTurn>();
         let mut worker = AgentWorker {
             root,
+            root_session_id,
             main_turns: VecDeque::new(),
             next_turn_id: 1,
             btw: None,
@@ -404,6 +439,7 @@ fn spawn_agent_worker(
 
 struct AgentWorker {
     root: Nanocodex,
+    root_session_id: Arc<str>,
     main_turns: VecDeque<TrackedTurn>,
     next_turn_id: u64,
     btw: Option<BtwWorker>,
@@ -431,7 +467,10 @@ impl AgentWorker {
             PaneId::Main => {
                 if let Some(turn) = start_turn(
                     &self.root,
-                    target,
+                    TurnTarget {
+                        session_id: &self.root_session_id,
+                        pane: target,
+                    },
                     prompt,
                     &mut self.next_turn_id,
                     &self.finished,
@@ -453,7 +492,10 @@ impl AgentWorker {
                 let prompt = branch.prepare_prompt(prompt);
                 if let Some(turn) = start_turn(
                     &branch.agent,
-                    target,
+                    TurnTarget {
+                        session_id: &branch.request_id,
+                        pane: target,
+                    },
                     prompt,
                     &mut self.next_turn_id,
                     &self.finished,
@@ -473,7 +515,10 @@ impl AgentWorker {
                 steer_turn(
                     &self.root,
                     &self.main_turns,
-                    target,
+                    TurnTarget {
+                        session_id: &self.root_session_id,
+                        pane: target,
+                    },
                     SteerRequest {
                         id: steer_id,
                         prompt,
@@ -484,8 +529,8 @@ impl AgentWorker {
                 )
                 .await
             }
-            PaneId::Btw(id) => {
-                let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == id) else {
+            PaneId::Btw(branch_id) => {
+                let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == branch_id) else {
                     drop(self.updates.send(WorkerEvent::SteerFailed {
                         target,
                         id: steer_id,
@@ -496,7 +541,10 @@ impl AgentWorker {
                 steer_turn(
                     &branch.agent,
                     &branch.turns,
-                    target,
+                    TurnTarget {
+                        session_id: &branch.request_id,
+                        pane: target,
+                    },
                     SteerRequest {
                         id: steer_id,
                         prompt,
@@ -511,8 +559,9 @@ impl AgentWorker {
         if let Some(turn) = turn {
             match target {
                 PaneId::Main => self.main_turns.push_back(turn),
-                PaneId::Btw(id) => {
-                    if let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == id) {
+                PaneId::Btw(branch_id) => {
+                    if let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == branch_id)
+                    {
                         branch.turns.push_back(turn);
                     }
                 }
@@ -521,25 +570,46 @@ impl AgentWorker {
     }
 
     async fn cancel(&self, target: PaneId) {
-        let turns = match target {
-            PaneId::Main => Some(&self.main_turns),
+        let (turns, session_id) = match target {
+            PaneId::Main => (Some(&self.main_turns), self.root_session_id.as_ref()),
             PaneId::Btw(id) => self
                 .btw
                 .as_ref()
                 .filter(|branch| branch.id == id)
-                .map(|branch| &branch.turns),
+                .map_or((None, ""), |branch| {
+                    (Some(&branch.turns), branch.request_id.as_ref())
+                }),
         };
-        cancel_turn(turns, target, &self.updates).await;
+        cancel_turn(turns, session_id, target, &self.updates).await;
     }
 
     async fn open_btw(&mut self, id: u64, prompt: Option<String>) {
         self.btw = None;
-        match self.root.fork().await {
+        let span = info_span!(
+            target: "nanocodex",
+            parent: None,
+            "tui.btw.open",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            session.id = self.root_session_id.as_ref(),
+            tui.btw.id = id,
+            tui.btw.session_id = tracing::field::Empty,
+            status = tracing::field::Empty,
+        );
+        match self.root.fork().instrument(span.clone()).await {
             Ok((agent, events)) => {
+                let request_id = Arc::<str>::from(events.request_id());
+                span.record("tui.btw.session_id", request_id.as_ref());
+                span.record("status", "completed");
+                span.record("otel.status_code", "OK");
                 forward_btw_events(id, events, self.updates.clone());
-                drop(self.updates.send(WorkerEvent::BtwOpened { id }));
+                drop(self.updates.send(WorkerEvent::BtwOpened {
+                    id,
+                    request_id: Arc::clone(&request_id),
+                }));
                 let mut branch = BtwWorker {
                     id,
+                    request_id,
                     agent,
                     first_prompt: true,
                     turns: VecDeque::new(),
@@ -548,7 +618,10 @@ impl AgentWorker {
                     let prompt = branch.prepare_prompt(prompt);
                     if let Some(turn) = start_turn(
                         &branch.agent,
-                        PaneId::Btw(id),
+                        TurnTarget {
+                            session_id: &branch.request_id,
+                            pane: PaneId::Btw(id),
+                        },
                         prompt,
                         &mut self.next_turn_id,
                         &self.finished,
@@ -562,6 +635,8 @@ impl AgentWorker {
                 self.btw = Some(branch);
             }
             Err(error) => {
+                span.record("status", "failed");
+                span.record("otel.status_code", "ERROR");
                 drop(self.updates.send(WorkerEvent::BtwOpenFailed {
                     id,
                     error: error.to_string(),
@@ -588,30 +663,65 @@ impl AgentWorker {
 
 async fn start_turn(
     agent: &Nanocodex,
-    target: PaneId,
+    target: TurnTarget<'_>,
     prompt: String,
     next_turn_id: &mut u64,
     finished: &mpsc::UnboundedSender<FinishedTurn>,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) -> Option<TrackedTurn> {
-    match agent.prompt(prompt).await {
+    let started_at = Instant::now();
+    let id = *next_turn_id;
+    let span = info_span!(
+        target: "nanocodex",
+        parent: None,
+        "tui.turn",
+        otel.kind = "internal",
+        otel.status_code = tracing::field::Empty,
+        session.id = target.session_id,
+        tui.turn.id = id,
+        tui.pane = telemetry::pane_name(target.pane),
+        tui.btw.id = telemetry::pane_btw_id(target.pane).unwrap_or_default(),
+        status = tracing::field::Empty,
+        duration_ns = tracing::field::Empty,
+    );
+    match agent.prompt(prompt).instrument(span.clone()).await {
         Ok(turn) => {
-            let id = *next_turn_id;
             *next_turn_id = next_turn_id.saturating_add(1);
             let control = turn.control();
             let finished = finished.clone();
-            tokio::spawn(async move {
-                let error = match turn.result().await {
-                    Ok(_) | Err(NanocodexError::TurnCancelled) => None,
-                    Err(error) => Some(error.to_string()),
-                };
-                drop(finished.send(FinishedTurn { id, target, error }));
-            });
-            Some(TrackedTurn { id, control })
+            let task_span = span.clone();
+            tokio::spawn(
+                async move {
+                    let (error, status, otel_status) = match turn.result().await {
+                        Ok(_) => (None, "completed", "OK"),
+                        Err(NanocodexError::TurnCancelled) => (None, "cancelled", "ERROR"),
+                        Err(error) => (Some(error.to_string()), "failed", "ERROR"),
+                    };
+                    task_span.record("status", status);
+                    task_span.record("otel.status_code", otel_status);
+                    task_span.record(
+                        "duration_ns",
+                        telemetry::elapsed_ns(started_at, Instant::now()),
+                    );
+                    drop(finished.send(FinishedTurn {
+                        id,
+                        target: target.pane,
+                        error,
+                    }));
+                }
+                .instrument(span.clone()),
+            );
+            Some(TrackedTurn { id, control, span })
         }
         Err(error) => {
+            span.record("status", "rejected");
+            span.record("otel.status_code", "ERROR");
+            span.record(
+                "duration_ns",
+                telemetry::elapsed_ns(started_at, Instant::now()),
+            );
             drop(updates.send(WorkerEvent::TurnFinished {
-                target,
+                target: target.pane,
                 error: Some(error.to_string()),
             }));
             None
@@ -622,25 +732,55 @@ async fn start_turn(
 async fn steer_turn(
     agent: &Nanocodex,
     turns: &VecDeque<TrackedTurn>,
-    target: PaneId,
+    target: TurnTarget<'_>,
     request: SteerRequest,
     next_turn_id: &mut u64,
     finished: &mpsc::UnboundedSender<FinishedTurn>,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) -> Option<TrackedTurn> {
     for turn in turns {
-        match turn.control.steer(request.prompt.clone()).await {
+        let started_at = Instant::now();
+        let span = info_span!(
+            target: "nanocodex",
+            parent: &turn.span,
+            "tui.steer",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            session.id = target.session_id,
+            tui.turn.id = turn.id,
+            tui.steer.id = request.id,
+            tui.pane = telemetry::pane_name(target.pane),
+            status = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let outcome = turn
+            .control
+            .steer(request.prompt.clone())
+            .instrument(span.clone())
+            .await;
+        span.record(
+            "duration_ns",
+            telemetry::elapsed_ns(started_at, Instant::now()),
+        );
+        match outcome {
             Ok(()) => {
+                span.record("status", "admitted");
+                span.record("otel.status_code", "OK");
                 drop(updates.send(WorkerEvent::SteerAdmitted {
-                    target,
+                    target: target.pane,
                     id: request.id,
                 }));
                 return None;
             }
-            Err(NanocodexError::TurnNotSteerable) => {}
+            Err(NanocodexError::TurnNotSteerable) => {
+                span.record("status", "not_steerable");
+                span.record("otel.status_code", "OK");
+            }
             Err(error) => {
+                span.record("status", "failed");
+                span.record("otel.status_code", "ERROR");
                 drop(updates.send(WorkerEvent::SteerFailed {
-                    target,
+                    target: target.pane,
                     id: request.id,
                     error: error.to_string(),
                 }));
@@ -651,7 +791,7 @@ async fn steer_turn(
     // Completion delivery can lag behind the driver's exact active-turn
     // state. If no retained capability is active, preserve this as a new turn.
     drop(updates.send(WorkerEvent::SteerQueued {
-        target,
+        target: target.pane,
         id: request.id,
         prompt: request.prompt.clone(),
     }));
@@ -668,14 +808,41 @@ async fn steer_turn(
 
 async fn cancel_turn(
     turns: Option<&VecDeque<TrackedTurn>>,
+    session_id: &str,
     target: PaneId,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) {
     let mut outcome = Err(NanocodexError::TurnNotCancellable);
     for turn in turns.into_iter().flatten() {
-        match turn.control.cancel().await {
-            Err(NanocodexError::TurnNotCancellable) => {}
+        let started_at = Instant::now();
+        let span = info_span!(
+            target: "nanocodex",
+            parent: &turn.span,
+            "tui.cancel",
+            otel.kind = "internal",
+            otel.status_code = tracing::field::Empty,
+            session.id = session_id,
+            tui.turn.id = turn.id,
+            tui.pane = telemetry::pane_name(target),
+            status = tracing::field::Empty,
+            duration_ns = tracing::field::Empty,
+        );
+        let result = turn.control.cancel().instrument(span.clone()).await;
+        span.record(
+            "duration_ns",
+            telemetry::elapsed_ns(started_at, Instant::now()),
+        );
+        match result {
+            Err(NanocodexError::TurnNotCancellable) => {
+                span.record("status", "not_cancellable");
+                span.record("otel.status_code", "OK");
+            }
             result => {
+                span.record("status", if result.is_ok() { "accepted" } else { "failed" });
+                span.record(
+                    "otel.status_code",
+                    if result.is_ok() { "OK" } else { "ERROR" },
+                );
                 outcome = result;
                 break;
             }
@@ -724,11 +891,12 @@ fn forward_btw_events(
 fn handle_terminal_event(
     event: Event,
     app: &mut App,
+    root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<TerminalAction> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-            if handle_key(key, app, commands)? {
+            if handle_key(key, app, root_session_id, commands)? {
                 Ok(TerminalAction::Quit)
             } else {
                 Ok(TerminalAction::Redraw)
@@ -757,6 +925,7 @@ fn handle_terminal_event(
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
+    root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -781,7 +950,7 @@ fn handle_key(
         {
             app.insert_char('\n');
         }
-        KeyCode::Enter => submit(app, commands, SubmitIntent::Immediate)?,
+        KeyCode::Enter => submit(app, root_session_id, commands, SubmitIntent::Immediate)?,
         KeyCode::Char(character) => app.insert_char(character),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
@@ -800,7 +969,9 @@ fn handle_key(
                 send_command(commands, WorkerCommand::Cancel { target })?;
             }
         }
-        KeyCode::Tab if app.has_input() => submit(app, commands, SubmitIntent::Queue)?,
+        KeyCode::Tab if app.has_input() => {
+            submit(app, root_session_id, commands, SubmitIntent::Queue)?;
+        }
         KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
         KeyCode::Insert
         | KeyCode::F(_)
@@ -820,6 +991,7 @@ fn handle_key(
 
 fn submit(
     app: &mut App,
+    root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
     intent: SubmitIntent,
 ) -> Result<()> {
@@ -869,6 +1041,16 @@ fn submit(
             app.cancel_pending(target);
             send_command(commands, WorkerCommand::Cancel { target })?;
         }
+        Submission::Trace => {
+            let Some(session_id) = active_session_id(app, root_session_id) else {
+                app.push_active_error("BTW traces are available after the fork finishes");
+                return Ok(());
+            };
+            match open_session_traces(session_id) {
+                Ok(()) => app.set_active_status("Opened session traces in Jaeger"),
+                Err(error) => app.push_active_error(format!("failed to open Jaeger: {error}")),
+            }
+        }
     }
     Ok(())
 }
@@ -897,7 +1079,68 @@ fn classify_submission(input: String) -> Submission {
     if trimmed == "/cancel" {
         return Submission::Cancel;
     }
+    if trimmed == "/trace" {
+        return Submission::Trace;
+    }
     Submission::Prompt(input)
+}
+
+fn active_session_id<'a>(app: &'a App, root_session_id: &'a str) -> Option<&'a str> {
+    match app.focus {
+        PaneId::Main => Some(root_session_id),
+        PaneId::Btw(id) => app
+            .btw
+            .as_ref()
+            .filter(|btw| btw.id == id)
+            .and_then(|btw| btw.request_id.as_deref()),
+    }
+}
+
+fn session_trace_url(base_url: &str, session_id: &str) -> Result<reqwest::Url> {
+    let base = reqwest::Url::parse(base_url).wrap_err("invalid Jaeger UI URL")?;
+    let mut url = base.join("search").wrap_err("invalid Jaeger search URL")?;
+    let tags = serde_json::json!({ "session.id": session_id }).to_string();
+    url.query_pairs_mut()
+        .append_pair("service", "nanocodex")
+        .append_pair("lookback", "1w")
+        .append_pair("limit", "1500")
+        .append_pair("tags", &tags);
+    Ok(url)
+}
+
+fn open_session_traces(session_id: &str) -> Result<()> {
+    let base_url =
+        std::env::var(JAEGER_UI_URL_ENV).unwrap_or_else(|_| DEFAULT_JAEGER_UI_URL.to_owned());
+    let url = session_trace_url(&base_url, session_id)?;
+    let mut command = browser_command(url.as_str());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .wrap_err("browser launcher failed")?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn browser_command(url: &str) -> Command {
+    let mut command = Command::new("open");
+    command.arg(url);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn browser_command(url: &str) -> Command {
+    let mut command = Command::new("cmd");
+    command.args(["/C", "start", "", url]);
+    command
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn browser_command(url: &str) -> Command {
+    let mut command = Command::new("xdg-open");
+    command.arg(url);
+    command
 }
 
 #[cfg(test)]
@@ -913,8 +1156,8 @@ mod tests {
 
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, UiAction, UiModel, UiUpdate,
-        WorkerCommand, WorkerEvent, classify_submission, handle_key, prepare_btw_prompt,
-        spawn_agent_worker,
+        WorkerCommand, WorkerEvent, active_session_id, classify_submission, handle_key,
+        prepare_btw_prompt, session_trace_url, spawn_agent_worker,
     };
     use crate::tui::app::App;
 
@@ -937,8 +1180,44 @@ mod tests {
             Submission::Cancel
         );
         assert_eq!(
+            classify_submission(" /trace ".to_owned()),
+            Submission::Trace
+        );
+        assert_eq!(
             classify_submission("/btw-not-a-command".to_owned()),
             Submission::Prompt("/btw-not-a-command".to_owned())
+        );
+        assert_eq!(
+            classify_submission("/trace-this".to_owned()),
+            Submission::Prompt("/trace-this".to_owned())
+        );
+    }
+
+    #[test]
+    fn jaeger_search_targets_the_focused_session_and_encodes_its_tag() {
+        let mut app = App::new("/workspace".into());
+        assert_eq!(
+            active_session_id(&app, "main-session"),
+            Some("main-session")
+        );
+
+        let btw_id = app.begin_btw();
+        assert_eq!(active_session_id(&app, "main-session"), None);
+        app.btw_opened(btw_id, std::sync::Arc::from("btw session/&"));
+        let session_id = active_session_id(&app, "main-session").unwrap();
+        assert_eq!(session_id, "btw session/&");
+
+        let url = session_trace_url("http://127.0.0.1:16686", session_id).unwrap();
+        assert_eq!(url.path(), "/search");
+        let query = url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("service").map(AsRef::as_ref), Some("nanocodex"));
+        assert_eq!(query.get("lookback").map(AsRef::as_ref), Some("1w"));
+        assert_eq!(query.get("limit").map(AsRef::as_ref), Some("1500"));
+        assert_eq!(
+            query.get("tags").map(AsRef::as_ref),
+            Some(r#"{"session.id":"btw session/&"}"#)
         );
     }
 
@@ -958,7 +1237,10 @@ mod tests {
     #[test]
     fn all_event_sources_cross_the_ui_action_boundary() {
         let (commands, _worker) = mpsc::unbounded_channel();
-        let mut ui = UiModel::new(App::new("/workspace".into()));
+        let mut ui = UiModel::new(
+            App::new("/workspace".into()),
+            std::sync::Arc::from("main-session"),
+        );
 
         assert_eq!(
             ui.update(UiAction::Terminal(Event::Resize(100, 40)), &commands)
@@ -1028,7 +1310,12 @@ mod tests {
             .build()?;
         let (commands, worker_rx) = mpsc::unbounded_channel();
         let (updates, mut update_rx) = mpsc::unbounded_channel();
-        spawn_agent_worker(agent, worker_rx, updates);
+        spawn_agent_worker(
+            agent,
+            std::sync::Arc::from("tui-steer-test"),
+            worker_rx,
+            updates,
+        );
 
         commands.send(WorkerCommand::Prompt {
             target: PaneId::Main,
@@ -1089,9 +1376,9 @@ mod tests {
         app.cursor = app.input.len();
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
-        assert!(!handle_key(escape, &mut app, &commands).unwrap());
+        assert!(!handle_key(escape, &mut app, "main-session", &commands).unwrap());
         assert!(worker.try_recv().is_err());
-        assert!(!handle_key(escape, &mut app, &commands).unwrap());
+        assert!(!handle_key(escape, &mut app, "main-session", &commands).unwrap());
         assert!(matches!(
             worker.try_recv(),
             Ok(WorkerCommand::Cancel {
@@ -1137,7 +1424,7 @@ mod tests {
                         "content": [{ "type": "output_text", "text": text }]
                     }],
                     "usage": null
-                },
+                }
             }),
         )
         .await

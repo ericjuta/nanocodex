@@ -109,8 +109,24 @@
   subscriber. It must never replace contractual events.
 - Do not add a generic event bus, shared mutable collector state, or callback
   framework without a concrete library consumer and an explicit lifecycle.
-- Never emit secrets, `.env` contents, hidden chain of thought, or full prompt
-  bodies into logs or tracing. Retain only API-visible reasoning summaries.
+- Tracing is a full-fidelity record of all data observed by the agent lifecycle.
+  Preserve complete prompts and instructions, model requests and responses,
+  API-visible reasoning content and summaries, opaque encrypted reasoning
+  payloads, tool arguments and results, steering, cancellations, and lifecycle
+  events in their original order. Do not redact, filter, truncate, or omit
+  observed values based on their content or sensitivity.
+- Put large ordered content in span events rather than searchable span
+  attributes. Keep attributes structural: identity, lineage, ordering, sizes,
+  status, timing, token usage, cache behavior, and routing metadata.
+- Follow init4-style span hygiene: a root span represents one bounded unit of
+  work, not a long-lived driver or session. Correlate sequential turn roots with
+  session and lineage attributes. Propagate explicit parents with the work sent
+  across channels, instrument futures before spawning them, and let concurrent
+  child work appear as overlapping sibling branches.
+- Telemetry must observe the normal runtime data path rather than performing
+  additional configuration or environment reads solely to manufacture trace
+  content. Operators must treat the trace backend as a complete copy of agent
+  conversations and tool activity and apply matching access and retention.
 
 ## JSONL adapter contract
 
@@ -152,9 +168,9 @@
   long-session behavior. Discover candidates with `amp threads list
   --include-archived --json` and read selected payloads with `amp threads export
   <thread-id>`.
-- Derive deterministic sanitized fixtures or structural workload summaries from
-  those traces. Never commit raw Codex traces, full prompts, tool arguments,
-  secrets, or user content to the repository.
+- Keep the retained trace corpus outside Git. Commit only deterministic derived
+  fixtures or structural workload summaries that are explicitly intended to be
+  source-controlled test data.
 - Give every TUI phase a measured baseline and an explicit regression gate for
   the costs it changes: state-update throughput, frame construction and layout,
   rendered frame count, changed-cell/output volume, allocations or retained

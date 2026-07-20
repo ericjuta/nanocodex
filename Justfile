@@ -90,6 +90,14 @@ otel-up:
     done
     @echo "Jaeger UI: http://127.0.0.1:16686"
 
+# Launch the interactive TUI with OTLP export, loading OPENAI_API_KEY from .env.
+run-otel: otel-up
+    @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }
+    @echo "Building and launching the Nanocodex TUI..."
+    @cargo run --manifest-path bin/nanocodex/Cargo.toml -- \
+        --otel-endpoint http://127.0.0.1:4318 \
+        --otel-environment local-tui
+
 # Run a tool-using turn and retain events and diagnostic logs independently.
 otel-demo:
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }
@@ -115,6 +123,14 @@ otel-stress turns="32" parallel_calls="16":
         cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
         --test observability_stress -- \
         --ignored --exact retained_turns_and_hostile_tools_preserve_trace_topology \
+        --nocapture --test-threads=1
+
+# Verify that attached child-agent turns share and overlap in their parent trace.
+otel-subagent-stress:
+    @curl --fail --silent --show-error http://127.0.0.1:16686/ >/dev/null || { echo "run 'just otel-up' first" >&2; exit 2; }
+    cargo test --locked --manifest-path bin/nanocodex/Cargo.toml \
+        --test observability_stress -- \
+        --ignored --exact attached_subagents_share_the_parent_trace_and_overlap \
         --nocapture --test-threads=1
 
 # Run the identical workload without installing the OTLP layer for comparison.

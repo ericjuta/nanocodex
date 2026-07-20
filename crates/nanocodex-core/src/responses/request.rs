@@ -402,6 +402,7 @@ impl<'a> ResponseCreate<'a> {
             parallel_tool_calls: false,
             reasoning: ReasoningControls {
                 effort: config.thinking.as_str(),
+                summary: "detailed",
                 context: "all_turns",
             },
             store: true,
@@ -423,6 +424,7 @@ impl<'a> ResponseCreate<'a> {
 #[derive(Clone, Copy, Serialize)]
 struct ReasoningControls {
     effort: &'static str,
+    summary: &'static str,
     context: &'static str,
 }
 
@@ -472,7 +474,7 @@ mod tests {
         assert_eq!(request["generate"], false);
         assert!(request.get("tools").is_none());
         assert!(request.get("instructions").is_none());
-        assert!(request["reasoning"].get("summary").is_none());
+        assert_eq!(request["reasoning"]["summary"], json!("detailed"));
         assert!(request["reasoning"].get("mode").is_none());
         assert!(request.get("context_management").is_none());
     }
