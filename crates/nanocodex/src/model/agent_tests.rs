@@ -131,45 +131,62 @@ async fn assistant_events_preserve_commentary_and_final_answer_phases() -> Resul
     drop(agent);
 
     let mut deltas = Vec::new();
-    let mut final_message = None;
+    let mut messages = Vec::new();
+    let mut timeline = Vec::new();
     while let Some(event) = events.recv().await {
         match event.kind {
             nanocodex_core::AgentEventKind::AssistantDelta => {
                 deltas.push(event.decode_payload::<Value>()?);
             }
             nanocodex_core::AgentEventKind::AssistantMessage => {
-                final_message = Some(event.decode_payload::<Value>()?);
+                let message = event.decode_payload::<Value>()?;
+                timeline.push(message["phase"].clone());
+                messages.push(message);
+            }
+            nanocodex_core::AgentEventKind::ToolCall => {
+                timeline.push(json!("tool.call"));
+            }
+            nanocodex_core::AgentEventKind::ToolResult => {
+                timeline.push(json!("tool.result"));
             }
             _ => {}
         }
     }
-    assert_eq!(
-        deltas,
-        [
-            json!({
-                "model_call_index": 1,
-                "item_id": "msg-commentary",
-                "phase": "commentary",
-                "text": "I’ll verify."
-            }),
-            json!({
-                "model_call_index": 2,
-                "item_id": "msg-final",
-                "phase": "final_answer",
-                "text": "Done."
-            })
-        ]
-    );
-    assert_eq!(
-        final_message,
-        Some(json!({ "text": "Done.", "phase": "final_answer" }))
-    );
+    assert_assistant_phase_events(&deltas, &messages, &timeline);
 
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
     std::fs::remove_dir_all(workspace)?;
     Ok(())
+}
+
+fn assert_assistant_phase_events(deltas: &[Value], messages: &[Value], timeline: &[Value]) {
+    let expected_messages = [
+        json!({
+            "model_call_index": 1,
+            "item_id": "msg-commentary",
+            "phase": "commentary",
+            "text": "I’ll verify."
+        }),
+        json!({
+            "model_call_index": 2,
+            "item_id": "msg-final",
+            "phase": "final_answer",
+            "text": "Done."
+        }),
+    ];
+    assert_eq!(deltas, expected_messages);
+    assert_eq!(messages, expected_messages);
+    assert_eq!(
+        timeline,
+        [
+            json!("commentary"),
+            json!("tool.call"),
+            json!("tool.result"),
+            json!("final_answer")
+        ]
+    );
 }
 
 #[tokio::test]

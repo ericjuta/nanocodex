@@ -3,7 +3,7 @@ use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
-use nanocodex_core::{MessagePhase, ModelConfig, Usage};
+use nanocodex_core::{ModelConfig, Usage};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use web_time::Instant;
@@ -250,12 +250,6 @@ pub(super) struct RunStarted<'a> {
 pub(super) struct RunSteered {
     pub(super) steer_index: u32,
     pub(super) instruction_bytes: usize,
-}
-
-#[derive(Serialize)]
-pub(super) struct AssistantMessage<'a> {
-    pub(super) text: &'a str,
-    pub(super) phase: MessagePhase,
 }
 
 #[derive(Serialize)]
