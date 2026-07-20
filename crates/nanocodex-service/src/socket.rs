@@ -28,7 +28,14 @@ const EVENT_IDLE_TIMEOUT: Duration = if cfg!(test) {
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_COMPATIBILITY_VERSION: &str = "0.1337.0";
 
+const CODEX_COMPATIBILITY_USER_AGENT: &str = concat!(
+    "codex_cli_rs/0.1337.0 (nanocodex/",
+    env!("CARGO_PKG_VERSION"),
+    ")"
+);
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub(crate) struct ConnectionMetadata {
@@ -133,9 +140,17 @@ impl ResponsesSocket {
             "x-responsesapi-include-timing-metrics",
             HeaderValue::from_static("true"),
         );
+        for (name, value) in [
+            ("originator", CODEX_ORIGINATOR),
+            ("version", CODEX_COMPATIBILITY_VERSION),
+        ] {
+            request
+                .headers_mut()
+                .insert(name, HeaderValue::from_static(value));
+        }
         request.headers_mut().insert(
             header::USER_AGENT,
-            HeaderValue::from_static(concat!("nanocodex/", env!("CARGO_PKG_VERSION"))),
+            HeaderValue::from_static(CODEX_COMPATIBILITY_USER_AGENT),
         );
         let (socket, response) = timeout(CONNECT_TIMEOUT, connect_async(request))
             .await
@@ -659,6 +674,27 @@ mod tests {
                         .get("x-openai-internal-codex-responses-lite")
                         .and_then(|v| v.to_str().ok()),
                     Some("true")
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("originator")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("codex_cli_rs")
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("version")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("0.1337.0")
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("codex_cli_rs/0.1337.0 (nanocodex/0.1.0)")
                 );
                 Ok(response)
             })
