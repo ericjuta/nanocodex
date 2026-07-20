@@ -70,7 +70,7 @@ duration-aware pending queue -----> bounded worker permits
   group, wait a bounded grace period, kill descendants, collect final bytes,
   clean the container, and publish exactly one result.
 - Resume reconciles retained terminal results and live container identities
-  before requeueing anything. It must not infer completion from directory
+  before requeuing anything. It must not infer completion from directory
   existence or a stale lock file.
 
 ### Parallel scheduling
