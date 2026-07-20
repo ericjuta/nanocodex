@@ -60,6 +60,16 @@ struct AssistantTextDelta<'a> {
     text: &'a str,
 }
 
+#[derive(Serialize)]
+struct AssistantMessage<'a> {
+    model_call_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<MessagePhase>,
+    text: String,
+}
+
 struct AssistantStreamItem {
     item_id: Option<Box<str>>,
     phase: Option<MessagePhase>,
@@ -161,7 +171,10 @@ pub(crate) async fn receive(
                     "Responses reasoning delta entered the agent event stream"
                 );
             }
-            ServerEvent::OutputItemDone { item } => done_items.push(item),
+            ServerEvent::OutputItemDone { item } => {
+                emit_assistant_message(events, call_index, &item)?;
+                done_items.push(item);
+            }
             ServerEvent::Completed { mut response } => {
                 let output_items = if response.output.is_empty() {
                     done_items
@@ -185,6 +198,33 @@ pub(crate) async fn receive(
             _ => {}
         }
     }
+}
+
+fn emit_assistant_message(
+    events: &EventSink,
+    call_index: u32,
+    item: &ResponseItem,
+) -> Result<(), ResponsesServiceError> {
+    let ResponseItem::Message {
+        id,
+        role: MessageRole::Assistant,
+        content,
+        phase,
+        ..
+    } = item
+    else {
+        return Ok(());
+    };
+    events.emit(
+        AgentEventKind::AssistantMessage,
+        AssistantMessage {
+            model_call_index: call_index,
+            item_id: id.as_deref(),
+            phase: *phase,
+            text: output_text(content),
+        },
+    )?;
+    Ok(())
 }
 
 pub(crate) async fn receive_compaction(
@@ -325,16 +365,18 @@ fn final_message(items: &[ResponseItem]) -> Option<String> {
         let ResponseItem::Message { content, .. } = item else {
             return None;
         };
-        Some(
-            content
-                .iter()
-                .filter_map(|part| match part {
-                    ContentItem::OutputText { text, .. } => Some(text.as_ref()),
-                    ContentItem::InputText { .. }
-                    | ContentItem::InputImage { .. }
-                    | ContentItem::InputAudio { .. } => None,
-                })
-                .collect(),
-        )
+        Some(output_text(content))
     })
+}
+
+fn output_text(content: &[ContentItem]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentItem::OutputText { text, .. } => Some(text.as_ref()),
+            ContentItem::InputText { .. }
+            | ContentItem::InputImage { .. }
+            | ContentItem::InputAudio { .. } => None,
+        })
+        .collect()
 }

@@ -1,8 +1,8 @@
 use std::{path::Path, sync::Arc};
 
 use nanocodex_core::{
-    AgentEventKind, EventSink, MODEL, MessagePhase, ModelConfig, Prompt, ReasoningSummary,
-    ResponseItem, ToolDefinition, Usage, responses::RequestProfile,
+    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ReasoningSummary, ResponseItem,
+    ToolDefinition, Usage, responses::RequestProfile,
 };
 use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
@@ -14,10 +14,9 @@ use tracing::{Instrument, info_span};
 use web_time::Instant;
 
 use super::{
-    AssistantMessage, CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted,
-    ModelCallFailed, ModelCallStarted, RunError, RunStarted, RunStats, RunSteered,
-    ToolCallArguments, ToolCallEvent, ToolResultEvent, WarmupCompleted, WarmupFailed,
-    WarmupStarted,
+    CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
+    ModelCallStarted, RunError, RunStarted, RunStats, RunSteered, ToolCallArguments, ToolCallEvent,
+    ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted,
     agents_md::load_project_instructions,
     compaction,
     context_manager::ContextManager,
@@ -318,13 +317,6 @@ where
         let elapsed = self.started_at.elapsed();
         match outcome {
             Ok(message) => {
-                self.events.emit(
-                    AgentEventKind::AssistantMessage,
-                    AssistantMessage {
-                        text: &message,
-                        phase: MessagePhase::FinalAnswer,
-                    },
-                )?;
                 self.stats
                     .apply_transport(self.transport_stats.since(transport_before));
                 self.events.emit(
