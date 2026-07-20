@@ -11,6 +11,9 @@ authors = ["Nanocodex Contributors"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/gakonst/nanocodex"
 repository = "https://github.com/gakonst/nanocodex"
+readme = "README.md"
+keywords = ["ai", "agents", "openai", "sdk", "websocket"]
+categories = ["api-bindings", "asynchronous", "development-tools"]
 publish = true
 
 [workspace.dependencies]
@@ -50,9 +53,12 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 rmcp = { version = "1.8.0", default-features = false, features = ["client", "reqwest-tls-no-provider", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 schemars = "0.8.22"
+self-replace = "1.5.0"
+semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 sha1 = "0.11.0"
+sha2 = "0.10.9"
 simd-json = "=0.15.1"
 smallvec = { version = "1.15.1", features = ["serde"] }
 sonic-rs = "0.5.8"
@@ -76,6 +82,21 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+debug = "none"
+strip = "symbols"
+panic = "unwind"
+codegen-units = 16
+
+# Release artifacts favor runtime performance over build time, matching Reth's
+# maxperf profile without raising the minimum CPU level of portable binaries.
+[profile.maxperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 # Optimized enough for representative CPU profiles while retaining full symbols.
 [profile.profiling]

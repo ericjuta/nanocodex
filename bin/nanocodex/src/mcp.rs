@@ -7,31 +7,31 @@ use nanocodex::{Mcp, McpServer};
 #[derive(Args, Default)]
 pub(crate) struct McpArgs {
     /// Add a named Streamable HTTP MCP server (`NAME=URL`). Repeatable.
-    #[arg(long = "mcp", global = true, value_name = "NAME=URL")]
+    #[arg(long = "mcp", value_name = "NAME=URL")]
     http: Vec<NamedValue>,
 
     /// Add a named stdio MCP server executable (`NAME=COMMAND`). Repeatable.
-    #[arg(long = "mcp-stdio", global = true, value_name = "NAME=COMMAND")]
+    #[arg(long = "mcp-stdio", value_name = "NAME=COMMAND")]
     stdio: Vec<NamedValue>,
 
     /// Append one argument to a named stdio MCP server (`NAME=ARG`). Repeatable.
-    #[arg(long = "mcp-arg", global = true, value_name = "NAME=ARG")]
+    #[arg(long = "mcp-arg", value_name = "NAME=ARG")]
     arguments: Vec<NamedValue>,
 
     /// Resolve a named HTTP server's bearer token from an environment variable (`NAME=ENV`).
-    #[arg(long = "mcp-bearer-env", global = true, value_name = "NAME=ENV")]
+    #[arg(long = "mcp-bearer-env", value_name = "NAME=ENV")]
     bearer_env: Vec<NamedValue>,
 
     /// Resolve an HTTP header from an environment variable (`NAME:HEADER=ENV`). Repeatable.
-    #[arg(long = "mcp-header-env", global = true, value_name = "NAME:HEADER=ENV")]
+    #[arg(long = "mcp-header-env", value_name = "NAME:HEADER=ENV")]
     header_env: Vec<NamedHeaderValue>,
 
     /// Seconds allowed for each MCP initialize and tools/list operation.
-    #[arg(long, global = true, default_value_t = 30)]
+    #[arg(long, default_value_t = 30)]
     mcp_startup_timeout: u64,
 
     /// Seconds allowed for one remote MCP tool call.
-    #[arg(long, global = true, default_value_t = 300)]
+    #[arg(long, default_value_t = 300)]
     mcp_tool_timeout: u64,
 }
 

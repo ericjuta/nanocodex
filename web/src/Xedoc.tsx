@@ -2,7 +2,9 @@
 
 import {
   ArrowUpRight,
+  Check,
   ChevronRight,
+  Copy,
   GitBranch,
   GitPullRequest,
   Moon,
@@ -248,6 +250,9 @@ const homeEvalMetrics = evalComparison
     ]
   : [];
 
+const installCommand =
+  "curl -fsSL https://raw.githubusercontent.com/gakonst/nanocodex/master/install | bash";
+
 export function Xedoc() {
   const [theme, setTheme] = useState<Theme>(() => {
     const initialTheme = document.documentElement.dataset.theme;
@@ -278,6 +283,7 @@ export function Xedoc() {
   const [proposalState, setProposalState] = useState<ProposalState>("ready");
   const [proposalTitle, setProposalTitle] = useState("");
   const [commitRailOpen, setCommitRailOpen] = useState(false);
+  const [installCopied, setInstallCopied] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const headerCenterRef = useRef<HTMLDivElement>(null);
   const codeBrowserRef = useRef<CodeBrowserHandle>(null);
@@ -558,6 +564,78 @@ export function Xedoc() {
                       entire product.
                     </p>
                   </header>
+
+                  <section
+                    className="home-release-section"
+                    aria-labelledby="home-release-title"
+                  >
+                    <div className="home-release-heading">
+                      <div>
+                        <p className="eyebrow">Install the CLI</p>
+                        <h2 id="home-release-title">One binary. Kept current.</h2>
+                      </div>
+                      <a
+                        href="https://github.com/gakonst/nanocodex/releases/latest"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Latest release <ArrowUpRight aria-hidden="true" />
+                      </a>
+                    </div>
+                    <div className="home-install-command">
+                      <code>{installCommand}</code>
+                      <button
+                        type="button"
+                        aria-label="Copy install command"
+                        onClick={() => {
+                          void navigator.clipboard
+                            .writeText(installCommand)
+                            .then(() => {
+                              setInstallCopied(true);
+                              window.setTimeout(
+                                () => setInstallCopied(false),
+                                1_500
+                              );
+                            });
+                        }}
+                      >
+                        {installCopied ? (
+                          <Check aria-hidden="true" />
+                        ) : (
+                          <Copy aria-hidden="true" />
+                        )}
+                        {installCopied ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                    <div className="home-release-grid">
+                      <article>
+                        <span>Update</span>
+                        <code>nanocodex update</code>
+                        <p>
+                          Downloads the host binary, verifies its SHA-256, and
+                          replaces the current executable.
+                        </p>
+                      </article>
+                      <article>
+                        <span>Embed</span>
+                        <code>cargo add nanocodex</code>
+                        <p>
+                          All seven public Rust crates ship together under one
+                          version in dependency order.
+                        </p>
+                      </article>
+                      <article>
+                        <span>Inspect</span>
+                        <a href="https://github.com/gakonst/nanocodex/blob/master/CHANGELOG.md">
+                          Release changelog <ArrowUpRight aria-hidden="true" />
+                        </a>
+                        <p>
+                          Conventional commits are grouped in full; GitHub
+                          release notes credit every pull request contributor.
+                        </p>
+                      </article>
+                    </div>
+                  </section>
 
                   {evalComparison ? (
                     <section

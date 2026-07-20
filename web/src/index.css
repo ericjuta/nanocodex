@@ -361,6 +361,7 @@ html[data-theme="dark"] .button--medium:focus-visible {
 }
 
 .home-copy h2,
+.home-release-section h2,
 .home-progress-section > h2 {
   color: var(--text);
   font-size: 24px;
@@ -374,6 +375,130 @@ html[data-theme="dark"] .button--medium:focus-visible {
 
 .home-copy li + li {
   margin-top: 6px;
+}
+
+.home-release-section {
+  margin-top: 30px;
+  padding: 18px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-medium);
+}
+
+.home-release-heading {
+  display: flex;
+  gap: 20px;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.home-release-heading h2 {
+  margin-top: 4px;
+}
+
+.home-release-heading > a,
+.home-release-grid article > a {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.home-release-heading > a {
+  padding-bottom: 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.home-release-heading a:hover,
+.home-release-heading a:focus-visible,
+.home-release-grid article > a:hover,
+.home-release-grid article > a:focus-visible {
+  color: var(--blue);
+}
+
+.home-release-heading svg,
+.home-release-grid article > a svg {
+  width: 12px;
+  height: 12px;
+}
+
+.home-install-command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  margin-top: 14px;
+  padding: 10px 10px 10px 12px;
+  background: var(--surface-subtle);
+  border-radius: var(--radius-small);
+}
+
+.home-install-command code {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-install-command button {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 9px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-small);
+  cursor: pointer;
+}
+
+.home-install-command button:hover,
+.home-install-command button:focus-visible {
+  border-color: var(--border);
+}
+
+.home-install-command button svg {
+  width: 12px;
+  height: 12px;
+}
+
+.home-release-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.home-release-grid article {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+}
+
+.home-release-grid article > span {
+  color: var(--text-muted);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.home-release-grid article > code,
+.home-release-grid article > a {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-release-grid article > p {
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 .home-progress-section {
@@ -1931,6 +2056,7 @@ html[data-theme="dark"] .button--medium:focus-visible {
   }
 
   .home-copy h2,
+  .home-release-section h2,
   .home-progress-section > h2 {
     font-size: 22px;
   }
@@ -3097,5 +3223,23 @@ html[data-theme="dark"] .button--medium:focus-visible {
 
   .home-copy {
     gap: 24px;
+  }
+
+  .home-release-section {
+    padding: 15px;
+  }
+
+  .home-release-heading {
+    align-items: flex-start;
+  }
+
+  .home-release-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .home-install-command code {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }

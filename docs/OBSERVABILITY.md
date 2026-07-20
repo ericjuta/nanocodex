@@ -116,11 +116,12 @@ The CLI accepts the same exporter configuration directly:
 
 ```sh
 cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- \
+  run \
   --otel-endpoint http://127.0.0.1:4318 \
   --otel-environment local-demo \
   --log-format json \
   --log-file .nanocodex/otel-demo/tracing.jsonl \
-  run --thinking=low "Inspect the repository and summarize it."
+  --thinking=low "Inspect the repository and summarize it."
 ```
 
 `--otel-endpoint` is a collector base URL. Nanocodex appends `/v1/traces`

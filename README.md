@@ -2,8 +2,8 @@
 
 Nanocodex is a small, library-first Rust agents SDK built around the OpenAI
 Responses WebSocket API. It keeps the useful coding-agent loop—persistent
-conversations, shell and patch tools, Code Mode, MCP, steering, queueing, and
-conversation forks—without requiring an app server or making a durable agent
+conversations, shell and patch tools, Code Mode, MCP, steering, cancellation,
+queueing, and conversation forks—without requiring an app server or making a durable agent
 control plane part of every application.
 
 It is best understood as a deliberate alternative to embedding Codex, not as a
@@ -98,8 +98,9 @@ for a smaller embeddable boundary:
   detached agents, and long-lived mailbox-driven collaboration.
 - Multi-agent tools are application-defined. Nanocodex does not yet provide
   Codex's central task registry, execution budgets, residency controls,
-  interruption, or cancellation propagation. Unbounded recursive orchestration
-  can spend tokens quickly.
+  or recursive cancellation propagation. A caller can cancel one exact live
+  turn, but application-defined parent/child trees must propagate that policy
+  themselves. Unbounded recursive orchestration can spend tokens quickly.
 - The caller owns sandboxing, permissions, and tool policy. There is no built-in
   approval product or compatibility app server.
 - Code Mode requires Node.js 12.22 or newer on `PATH`. Browser and computer-use
@@ -119,17 +120,32 @@ Install the repository binary and launch it from the workspace you want the
 agent to edit:
 
 ```sh
-cargo install --path bin/nanocodex
+curl -fsSL https://raw.githubusercontent.com/gakonst/nanocodex/master/install | bash
 export OPENAI_API_KEY=...
 nanocodex
 ```
+
+The installer selects the macOS or Linux release for the host architecture,
+verifies it against the release's `SHA256SUMS`, and installs it under
+`~/.nanocodex/bin`. Windows binaries are available on the
+[latest GitHub Release](https://github.com/gakonst/nanocodex/releases/latest).
+An existing release installation updates itself with:
+
+```sh
+nanocodex update
+```
+
+Source builds remain available with `cargo install --path bin/nanocodex` from
+a checkout. See the [release changelog](CHANGELOG.md) and
+[release process](docs/RELEASING.md) for the versioned artifacts and crate
+publishing contract.
 
 The Ratatui interface keeps one agent and WebSocket alive across follow-on
 prompts, streams assistant output, shows tool activity, accepts prompts while a
 turn is running, and retains prompt history and scrollback for the session.
 Press Enter to submit, Ctrl+J or Shift+Enter for a newline, Up/Down for prompt
 history, PageUp/PageDown or the mouse wheel to scroll, Esc to clear the
-composer, and Ctrl+C to exit. Use `--cwd`, `--thinking`, `--system-prompt`,
+composer, and Ctrl+C to exit. Use `--cwd`, `--thinking`, `--instructions`,
 `--web-search`, and `--image-generation` to configure the session; `--prompt`
 submits an initial turn immediately.
 
@@ -138,8 +154,9 @@ checkpoint into a right-hand side conversation. The main thread keeps running
 on its original WebSocket. Press BackTab to switch panes and `/close` to dismiss
 an idle BTW branch. While a turn is running, Enter steers that turn at its next
 safe model/tool boundary and Tab explicitly queues a follow-up turn. Pending
-steers and queued turns remain visibly separate. Active or queued BTW turns must
-finish first because the public cancellation contract is not yet exposed.
+steers and queued turns remain visibly separate. `/cancel` stops the active turn
+in the focused pane; queued follow-ups then continue from the last completed
+checkpoint. Cancellation also terminates live Code Mode and shell process trees.
 
 The headless adapter remains available for scripts and evals. Its stdout is
 flushed JSONL only:
@@ -169,11 +186,12 @@ complete walkthrough is in [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
 
 ## Use it as a library
 
-Until the crates are published, depend on the repository directly:
+The public crates share one version and are published to crates.io. Most
+applications only need the top-level crate:
 
 ```toml
 [dependencies]
-nanocodex = { git = "https://github.com/gakonst/nanocodex" }
+nanocodex = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -196,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`Nanocodex::new` uses the standard prompt, medium thinking, built-in tools,
+`Nanocodex::new` uses the standard instructions, medium thinking, built-in tools,
 persistent WebSocket, and retry/reconnect policy. Node.js 12.22 or newer must be
 available on `PATH` for model-generated code mode.
 
@@ -206,11 +224,42 @@ available on `PATH` for model-generated code mode.
 AgentEvents)`. `Nanocodex` is a cheap, cloneable command handle. Calling
 `prompt(...)` accepts and queues a turn, then immediately returns a `Turn`; the
 agent continues independently until `turn.result()` is awaited.
-`steer(...)` instead targets the currently active turn. It acknowledges only
+`turn.steer(...)` instead targets that exact turn. It acknowledges only
 after the instruction enters that turn's bounded FIFO and returns a typed error
-when no turn is active or the steering queue is full. Steering is sampled only
-between complete model responses and tool outputs; it does not create another
-`Turn` or another terminal event.
+when the turn is queued, completed, or its steering queue is full. Steering is
+sampled only between complete model responses and tool outputs; it does not
+create another `Turn` or another terminal event.
+
+`turn.cancel()` targets the same opaque unfinished turn. A queued turn is
+removed without reaching the model; cancellation of an active turn waits until
+model work, Code Mode cells, and shell process groups have stopped. In either
+case the result resolves to the typed `AgentError::TurnCancelled`. Partial model
+and tool work is discarded, and the next surviving prompt resumes from the last
+completed checkpoint. Queued cancellation is acknowledged immediately, while
+its result and terminal event retain FIFO event order behind earlier turns. If
+one task must await the result while another controls it, clone
+`turn.control()` before moving the `Turn` into the result task. Completed
+`TurnResult`s are deliberately inert; historical branching remains
+`agent.fork_from(&result)` because a fork creates another owned agent lifecycle.
+
+```rust
+use nanocodex::{AgentError, Nanocodex, NanocodexError};
+
+# async fn cancellation(api_key: String) -> Result<(), Box<dyn std::error::Error>> {
+let (agent, _) = Nanocodex::new(api_key)?;
+let turn = agent.prompt("Run a long repository investigation.").await?;
+let control = turn.control();
+let result_task = tokio::spawn(async move { turn.result().await });
+
+control.steer("Prioritize failing tests.").await?;
+control.cancel().await?;
+assert!(matches!(
+    result_task.await?,
+    Err(NanocodexError::Agent(AgentError::TurnCancelled))
+));
+# Ok(())
+# }
+```
 
 The session retains the complete typed conversation history. A follow-on prompt
 does **not** need the previous `final_message`, transcript, response ID, or tool
@@ -463,10 +512,12 @@ isolated.
 
 ### Configure the agent and Tower stack
 
-`Nanocodex::builder(api_key)` exposes deliberate overrides for the system
-prompt, thinking level, tools, workspace, stable session ID, and Responses
-stack. `.prompt(...)` on the builder replaces the system/developer prompt;
-`.prompt(...)` on the built handle submits a user turn.
+`Nanocodex::builder(api_key)` exposes deliberate overrides for the persistent
+instructions, thinking level, tools, workspace, stable session ID, and
+Responses stack. `.instructions(...)` configures the stable system/developer
+instructions; `.prompt(...)` on the built handle submits only user input. The
+workspace is fixed for the owned session at build time and cannot be changed by
+a later prompt or steer.
 
 Add `tower = { version = "0.5", features = ["limit", "timeout"] }` when
 composing the middleware used below.
@@ -484,7 +535,7 @@ fn build_agent(api_key: String) -> nanocodex::Result<(Nanocodex, AgentEvents)> {
         .build();
 
     Nanocodex::builder(api_key)
-        .prompt("You are a concise repository maintenance agent.")
+        .instructions("You are a concise repository maintenance agent.")
         .thinking(Thinking::Medium)
         .workspace("/work/project")
         .responses(responses)
@@ -495,9 +546,12 @@ fn build_agent(api_key: String) -> nanocodex::Result<(Nanocodex, AgentEvents)> {
 Tower layers are deferred until the standard persistent-WebSocket service is
 created. Callers can add deadlines, concurrency limits, load shedding, tracing,
 metrics, circuit breaking, or error mapping without boxing the client or
-rebuilding agent orchestration. `Responses::builder().service(stack)` replaces
-the standard service with any caller-composed
-`tower::Service<ResponsesAttempt>`.
+rebuilding agent orchestration. `Responses::builder().service(|| make_stack())`
+replaces the standard service with a factory for any caller-composed
+`tower::Service<ResponsesAttempt>`. The factory is invoked for the root and
+again whenever cancellation, clean child spawning, or forking needs independent
+mutable service and connection state. One-off service stacks are deliberately
+not part of the API.
 
 See [`docs/RESPONSES_TOWER.md`](docs/RESPONSES_TOWER.md) for the implemented
 operation boundary, layer ordering, retry safety, and benchmark evidence.

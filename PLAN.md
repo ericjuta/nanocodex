@@ -24,7 +24,7 @@ transport to their users.
   Callers never pass previous final messages, response IDs, reasoning items, or
   tool results back into the session.
 - The default is one fixed model contract with medium thinking, the standard
-  prompt, built-in tools, persistent Responses WebSocket, and bounded typed
+  instructions, built-in tools, persistent Responses WebSocket, and bounded typed
   retry/reconnect policy.
 - `Tools::builder().tool(...)` accepts both `#[tool]` functions and complete
   `Tool` implementations in the same heterogeneous registry.
@@ -86,8 +86,8 @@ Socket tasks and mutable driver details stay private.
 - The standard retry policy classifies typed transient failures, honors server
   delay hints, reconnects, and safely replays committed history.
 - `ResponsesClient<S>` stays generic over the caller's concrete service.
-- Deferred `.layer(...)` composition and complete `.service(...)` replacement
-  are public builder paths.
+- Deferred `.layer(...)` composition and factory-only `.service(|| ...)`
+  replacement are public builder paths.
 - Large replay history is shared, known API items are typed, unknown items are
   retained only at their genuinely dynamic boundary, and partial failures are
   never committed.
@@ -165,10 +165,7 @@ CLI-to-library-to-Code-Mode-to-MCP round trip. The cached MCP BM25 index handles
 10,000 repeated searches in roughly 88 ms in the release profile on the
 development machine.
 
-### Phase 2: lifecycle control, steering, and branching
-
-Do not expose this surface until Phase 1 is stable and a real multi-turn
-consumer exists.
+### Phase 2: lifecycle control, steering, and branching (implemented)
 
 The local Codex implementation establishes useful behavioral invariants but is
 not the implementation template. It accepts steering only for an active regular
@@ -190,10 +187,11 @@ or whole-history clone and truncation.
 - Route explicit steering and cancellation over a private bounded control
   channel owned by the active run. Prefer command receipt in the completion
   race so every accepted control has a deterministic linearization point.
-- `agent.steer(...)` targets the latest active regular turn. A `Turn`-scoped
-  method may target its opaque internal key, but ordinary prompting must not
-  expose or require turn IDs. Reject no-active, queued, stale, mismatched, and
-  non-steerable targets with typed errors.
+- `turn.steer(...)` and `turn.cancel()` target that exact turn through an opaque
+  internal key; ordinary prompting never exposes or requires turn IDs. A
+  cloneable `turn.control()` lets result and control ownership live in separate
+  tasks. Steering rejects queued and terminal targets. Cancellation removes a
+  queued turn or stops the active one, and rejects terminal targets.
 - A steering acknowledgement means the input entered the active FIFO, not that
   the model has sampled it. Drain that FIFO only between complete model
   responses: after any tool call and its output have been committed, before the
@@ -204,8 +202,13 @@ or whole-history clone and truncation.
   original accepted prompt. Multiple steers remain distinct ordered user
   messages in the next request.
 - Cancellation follows the same control path, yields a typed terminal result,
-  and terminates subprocess groups and descendants. Queue capacities and
-  scheduling policy remain private.
+  removes queued work before execution, and terminates subprocess groups and
+  descendants for active work. Queue capacities and scheduling policy remain
+  private.
+- A queued cancellation is acknowledged when the driver replaces that FIFO
+  entry with a cancelled tombstone. Its result and terminal event remain at the
+  original queue position so the per-agent event stream never interleaves turn
+  lifecycles without public turn IDs.
 
 #### 2.2 Persistent committed history
 
@@ -237,9 +240,8 @@ or whole-history clone and truncation.
   into tools and recursive delegation cannot accidentally target the root.
 - Never clone the current standard `ResponsesService` for a branch because its
   clone shares connection state. Retain a factory that can build a fresh
-  service stack. Standard services always support forks; deferred cloneable
-  layer factories may recreate their stack; an arbitrary replacement service
-  must provide an explicit factory or return a typed unsupported error.
+  service stack. Standard services, deferred cloneable layers, and arbitrary
+  replacement services all provide factories that recreate independent stacks.
 - Give every branch a unique session/request identity while preserving a shared
   lineage cache key and byte-stable prompt prefix. Decouple those concepts in
   `RequestProfile` before exposing forks.
@@ -254,15 +256,15 @@ or whole-history clone and truncation.
 
 #### Delivery order
 
-1. Refactor the driver to receive commands during an active turn without
+1. [x] Refactor the driver to receive commands during an active turn without
    changing the public prompt API; prove existing queue order first.
-2. Add explicit steering at safe response boundaries, then cancellation through
+2. [x] Add explicit steering at safe response boundaries, then cancellation through
    the same owned control path.
-3. Introduce segmented history and retained committed checkpoints, with memory
+3. [x] Introduce segmented history and retained committed checkpoints, with memory
    and replay benchmarks before adding the public fork operation.
-4. Add fresh service-stack factories, separate lineage/cache identity from
+4. [x] Add fresh service-stack factories, separate lineage/cache identity from
    session identity, and expose latest-committed `fork()`.
-5. Promote historical `fork_from(...)` with the public ledger consumer. Keep
+5. [x] Promote historical `fork_from(...)` with the public ledger consumer. Keep
    Code Mode child orchestration application-owned, and add one thin Ratatui
    `/btw` consumer over latest-checkpoint forks. Do not add an app-server
    protocol, persistence journal, or generic core scheduler in this phase.
@@ -309,8 +311,8 @@ embedded consumers of the same handle/turn/event contract:
 The deterministic binding gate covers construction/error translation, one
 persistent Node WebSocket across follow-on turns, incremental response IDs,
 stable cache/session headers, custom JavaScript tools, unified events, and the
-browser host contract. Full cancellation remains part of Phase 2 rather than a
-binding-specific alternate lifecycle.
+browser host contract. Native cancellation remains owned by the Phase 2 turn
+lifecycle rather than a binding-specific alternate runtime.
 
 ## Performance policy
 
@@ -376,11 +378,12 @@ past investigations.
 ## Codex parity checkpoint
 
 The local upstream review is complete through
-`openai/codex@35eaf3ffb0bf2001486c68c47a3d946b34d16634`. Nanocodex adopted the
+`openai/codex@8431dc590a5bba9a1185d5579a5aabfbc469e50b`. Nanocodex adopted the
 272,000-token Sol context window and 244,800-token automatic compaction
-threshold. Audio forwarding remains deferred until the supported model
-advertises audio input. Review and classify every later upstream commit before
-advancing this checkpoint.
+threshold, the generated-image no-duplicate-render hint from `7e51abbbd1`, and
+terminal invalid-tool-image handling from `8431dc590a`. Audio forwarding remains
+deferred until the supported model advertises audio input. Review and classify
+every later upstream commit before advancing this checkpoint.
 
 ## Deferred and out of scope
 

@@ -62,7 +62,7 @@ jobs:
           cache-on-failure: true
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo doc --workspace --all-features --no-deps
+      - run: cargo doc --workspace --all-features --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -131,6 +131,26 @@ jobs:
           maturin develop --manifest-path bindings/python/Cargo.toml
           python -m unittest discover -s bindings/python/tests -v
 
+  web:
+    name: website
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --prefix web
+      - name: Type-check and build the website
+        working-directory: web
+        run: npm run typecheck && npx --no-install vite build
+
   codeql:
     name: CodeQL actions
     runs-on: ubuntu-latest
@@ -154,7 +174,7 @@ jobs:
   ci-success:
     name: ci success
     if: always()
-    needs: [test, quality, policy, bindings, codeql]
+    needs: [test, quality, policy, bindings, web, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -164,10 +184,12 @@ jobs:
           QUALITY: ${{ needs.quality.result }}
           POLICY: ${{ needs.policy.result }}
           BINDINGS: ${{ needs.bindings.result }}
+          WEB: ${{ needs.web.result }}
           CODEQL: ${{ needs.codeql.result }}
         run: |
           test "$TEST" = success
           test "$QUALITY" = success
           test "$POLICY" = success
           test "$BINDINGS" = success
+          test "$WEB" = success
           test "$CODEQL" = success

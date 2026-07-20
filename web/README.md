@@ -48,6 +48,11 @@ development instrument, not a general product ranking. The comparison links
 each disagreement back to its retained trial so compatibility gaps can be
 inspected directly.
 
+The homepage also exposes the release contract: the checksum-verifying install
+command, in-place `nanocodex update`, the crates.io SDK entry point, and links
+to the latest GitHub Release and grouped conventional-commit changelog. GitHub
+release notes also credit each pull request contributor.
+
 Navigation stays available whenever an input is not active: `H`, `T`, `C`, `R`,
 and `E` switch between Home, Code, Commits, Requests, and Evals. The repository
 homepage is the root route. In Code, `Ctrl+P` searches the left tree and `Ctrl+F` opens the

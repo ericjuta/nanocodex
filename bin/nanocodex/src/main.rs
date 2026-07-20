@@ -4,8 +4,9 @@ mod observability;
 mod run;
 mod subagents;
 mod tui;
+mod update;
 
-use clap::{Parser, Subcommand, builder::NonEmptyStringValueParser};
+use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use eyre::Result;
 
 use config::AgentArgs;
@@ -14,7 +15,8 @@ use observability::ObservabilityArgs;
 #[derive(Parser)]
 #[command(
     version,
-    about = "An interactive coding agent and headless JSONL runner"
+    about = "An interactive coding agent and headless JSONL runner",
+    subcommand_negates_reqs = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -34,7 +36,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run one prompt and stream JSONL events to stdout.
-    Run(run::Run),
+    Run(Box<RunCommand>),
+    /// Update this executable to the latest GitHub release.
+    Update(update::Update),
+}
+
+#[derive(Args)]
+struct RunCommand {
+    #[command(flatten)]
+    run: run::Run,
+
+    #[command(flatten)]
+    agent: AgentArgs,
+
+    #[command(flatten)]
+    observability: ObservabilityArgs,
 }
 
 #[tokio::main]
@@ -44,11 +60,15 @@ async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
-    let _observability = cli
-        .observability
-        .install(cli.command.is_none(), cli.agent.cwd())?;
     match cli.command {
-        Some(Command::Run(command)) => command.run(cli.agent).await,
-        None => tui::run(cli.agent, cli.prompt).await,
+        Some(Command::Run(command)) => {
+            let _observability = command.observability.install(false, command.agent.cwd())?;
+            command.run.run(command.agent).await
+        }
+        Some(Command::Update(command)) => command.run().await,
+        None => {
+            let _observability = cli.observability.install(true, cli.agent.cwd())?;
+            tui::run(cli.agent, cli.prompt).await
+        }
     }
 }
