@@ -1,239 +1,333 @@
 use std::{
-    io::Write,
-    path::PathBuf,
+    collections::HashMap,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use eyre::{OptionExt, Result, WrapErr};
+use eyre::{Result, WrapErr};
 use nanocodex::{
-    AgentEvent, Nanocodex, Thinking, Tool, ToolContext, ToolDefinition, ToolExecution, ToolInput,
-    Tools, async_trait,
+    AgentEventKind, AgentEvents, AgentHandle, Nanocodex, Thinking, Tool, ToolContext,
+    ToolDefinition, ToolExecution, ToolInput, ToolResult, Tools, async_trait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::mpsc;
 
-#[derive(Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum EventSource {
-    Parent,
-    Subagent { id: u64, task: Arc<str> },
-}
-
-struct RoutedEvent {
-    source: EventSource,
-    event: AgentEvent,
-}
-
-#[derive(Serialize)]
-struct UnifiedEvent<'a> {
-    stream_seq: u64,
-    source: &'a EventSource,
-    #[serde(flatten)]
-    event: &'a AgentEvent,
-}
-
-/// An application-owned tool whose implementation happens to run another agent.
-struct SpawnAgent {
-    api_key: Arc<str>,
-    workspace: PathBuf,
-    events: mpsc::UnboundedSender<RoutedEvent>,
-    next_id: AtomicU64,
-}
-
-impl SpawnAgent {
-    fn new(
-        api_key: impl Into<Arc<str>>,
-        workspace: impl Into<PathBuf>,
-        events: mpsc::UnboundedSender<RoutedEvent>,
-    ) -> Self {
-        Self {
-            api_key: api_key.into(),
-            workspace: workspace.into(),
-            events,
-            next_id: AtomicU64::new(1),
-        }
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentTask {
+    role: String,
+    task: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SpawnAgentArgs {
+struct FollowUpTask {
+    agent_id: u64,
     task: String,
 }
 
+#[derive(Serialize)]
+struct WorkerResult {
+    agent_id: u64,
+    kind: &'static str,
+    role: String,
+    report: String,
+}
+
+#[derive(Serialize)]
+struct FollowUpResult {
+    agent_id: u64,
+    report: String,
+}
+
+const ORCHESTRATION_BRIEF: &str = r"We are choosing Nanocodex's next orchestration slice.
+
+Decision context:
+- The primary user experience is one long-running root agent with 3-8 short-lived, mostly
+  read-only specialist branches.
+- Fast live branching matters more than provider-side prompt privacy.
+- We must remain a headless, library-first SDK: no app server and no generic core scheduler.
+- `/btw` currently provides one ephemeral fork of the latest completed root turn.
+- Branches share the workspace but receive fresh drivers, WebSockets, and tool runtimes.
+- The release should prefer correctness and explicit lifecycle behavior over adding more UI surface.
+
+Candidate next slices:
+A. Multiple named `/btw` panes.
+B. Turn cancellation plus safe branch cleanup.
+C. Durable serializable conversation snapshots with checkpoint acceleration.
+
+Treat this as private product context that independent agents do not inherit.";
+
+const DEFAULT_GOAL: &str = r"Recommend which candidate orchestration slice should be implemented
+next. Investigate the repository and return an evidence-backed decision, the most important
+tradeoffs, a minimal vertical implementation plan, and concrete acceptance tests.
+
+Use Code Mode and the available child-agent tools wherever they improve the result. You own the
+orchestration: decide how to decompose the work, which workers need inherited context, what can run
+concurrently, which workers deserve follow-up prompts, whether another synthesis pass is useful,
+and when enough evidence has been gathered.";
+
+#[derive(Default)]
+struct ChildAgents {
+    next_id: AtomicU64,
+    agents: tokio::sync::Mutex<HashMap<u64, Nanocodex>>,
+}
+
+impl ChildAgents {
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    async fn insert(&self, id: u64, agent: Nanocodex) {
+        self.agents.lock().await.insert(id, agent);
+    }
+
+    async fn get(&self, id: u64) -> Option<Nanocodex> {
+        self.agents.lock().await.get(&id).cloned()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChildKind {
+    Spawn,
+    Fork,
+}
+
+impl ChildKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn_agent",
+            Self::Fork => "fork_agent",
+        }
+    }
+
+    const fn result_name(self) -> &'static str {
+        match self {
+            Self::Spawn => "independent",
+            Self::Fork => "fork",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Spawn => {
+                "Starts a reusable clean agent without the invoking agent's conversation history, runs its first task, and returns its agent_id and report."
+            }
+            Self::Fork => {
+                "Starts a reusable agent from the invoking agent's latest completed checkpoint, runs its first task, and returns its agent_id and report."
+            }
+        }
+    }
+
+    fn prompt(self, task: String) -> String {
+        match self {
+            Self::Spawn => format!(
+                "Act as an independent research subagent with no inherited conversation. Complete \
+                 only this delegated task. You may inspect the workspace with read-only Code Mode \
+                 commands, but must not modify files or run destructive commands. Return a compact \
+                 evidence-backed report.\n\nDelegated task:\n{task}"
+            ),
+            Self::Fork => task,
+        }
+    }
+}
+
+/// Application-defined Code Mode tool for either a clean or contextual child.
+struct ChildAgent {
+    agent: AgentHandle,
+    agents: Weak<ChildAgents>,
+    kind: ChildKind,
+}
+
+fn show_child_lifecycle(label: String, mut events: AgentEvents) {
+    if std::env::var_os("NANOCODEX_SUBAGENT_JSONL").is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if matches!(
+                event.kind,
+                AgentEventKind::RunStarted
+                    | AgentEventKind::RunCompleted
+                    | AgentEventKind::RunFailed
+            ) {
+                eprintln!("{}", json!({ "agent": label.as_str(), "event": event }));
+            }
+        }
+    });
+}
+
+impl ChildAgent {
+    const fn new(agent: AgentHandle, agents: Weak<ChildAgents>, kind: ChildKind) -> Self {
+        Self {
+            agent,
+            agents,
+            kind,
+        }
+    }
+}
+
 #[async_trait]
-impl Tool for SpawnAgent {
+impl Tool for ChildAgent {
     fn name(&self) -> &'static str {
-        "spawn_agent"
+        self.kind.name()
     }
 
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::function(
             self.name(),
-            "Runs one focused task in an independent Nanocodex session and returns its final message.",
+            self.kind.description(),
             json!({
                 "type": "object",
                 "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "A short worker role for result attribution."
+                    },
                     "task": {
                         "type": "string",
-                        "description": "A complete, self-contained task for the subagent."
+                        "description": "A complete, focused task for the child agent."
                     }
                 },
-                "required": ["task"],
+                "required": ["role", "task"],
                 "additionalProperties": false
             }),
         )
     }
 
-    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolExecution {
-        let args: SpawnAgentArgs = match input.decode_json() {
-            Ok(args) => args,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
-        let source = EventSource::Subagent {
-            id: self.next_id.fetch_add(1, Ordering::Relaxed),
-            task: Arc::from(args.task.as_str()),
-        };
+    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let AgentTask { role, task } = input.decode_json()?;
+        let agents = self
+            .agents
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("child-agent registry stopped"))?;
+        let (child, events) = match self.kind {
+            ChildKind::Spawn => self.agent.spawn().await,
+            ChildKind::Fork => self.agent.fork().await,
+        }?;
+        let agent_id = agents.next_id();
 
-        // Children get the normal local coding tools but not this SpawnAgent
-        // value, so delegation is one level deep unless the application chooses
-        // to construct a recursive registry itself.
-        let child_tools = match Tools::builder().without_defaults().build() {
-            Ok(tools) => tools,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
-        let (child, mut child_events) = match Nanocodex::builder(self.api_key.to_string())
-            .prompt(
-                "You are a focused subagent. Complete only the delegated task and return a concise result to the parent agent.",
-            )
-            .thinking(Thinking::Low)
-            .tools(child_tools)
-            .workspace(self.workspace.clone())
-            .build()
-        {
-            Ok(child) => child,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
+        show_child_lifecycle(
+            format!("agent-{agent_id}:{}:{role}", self.kind.result_name()),
+            events,
+        );
 
-        let turn = match child.prompt(args.task).await {
-            Ok(turn) => turn,
-            Err(error) => return ToolExecution::error(error.to_string()),
-        };
-        let mut result = Box::pin(turn.result());
-        let mut events_open = true;
-        let outcome = loop {
-            tokio::select! {
-                outcome = &mut result => break outcome,
-                event = child_events.recv(), if events_open => match event {
-                    Some(event) => drop(self.events.send(RoutedEvent {
-                        source: source.clone(),
-                        event,
-                    })),
-                    None => events_open = false,
-                }
-            }
-        };
+        let result = child.prompt(self.kind.prompt(task)).await?.result().await?;
+        agents.insert(agent_id, child).await;
+        Ok(ToolExecution::json(&WorkerResult {
+            agent_id,
+            kind: self.kind.result_name(),
+            role,
+            report: result.final_message,
+        }))
+    }
+}
 
-        // Closing the last command handle lets the child's driver terminate;
-        // drain through that close so its terminal event reaches the host
-        // before this tool call completes.
-        drop(child);
-        while let Some(event) = child_events.recv().await {
-            drop(self.events.send(RoutedEvent {
-                source: source.clone(),
-                event,
-            }));
-        }
+/// Sends another prompt through an existing child's retained session.
+struct PromptAgent {
+    agents: Weak<ChildAgents>,
+}
 
-        match outcome {
-            Ok(result) => ToolExecution::text(result.final_message),
-            Err(error) => ToolExecution::error(error.to_string()),
-        }
+#[async_trait]
+impl Tool for PromptAgent {
+    fn name(&self) -> &'static str {
+        "prompt_agent"
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            self.name(),
+            "Runs a follow-up turn on a previously spawned or forked agent, preserving that agent's conversation, response chain, cache lineage, WebSocket, and tools.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "The agent_id returned by spawn_agent or fork_agent."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The next prompt for that agent."
+                    }
+                },
+                "required": ["agent_id", "task"],
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        let FollowUpTask { agent_id, task } = input.decode_json()?;
+        let agents = self
+            .agents
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("child-agent registry stopped"))?;
+        let child = agents
+            .get(agent_id)
+            .await
+            .ok_or_else(|| std::io::Error::other(format!("unknown agent_id {agent_id}")))?;
+        let result = child.prompt(task).await?.result().await?;
+        Ok(ToolExecution::json(&FollowUpResult {
+            agent_id,
+            report: result.final_message,
+        }))
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
     let api_key = std::env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
     let workspace = std::env::current_dir().wrap_err("failed to resolve the workspace")?;
-    let (subagent_event_tx, mut subagent_events) = mpsc::unbounded_channel();
-    let tools = Tools::builder()
-        .without_defaults()
-        .tool(SpawnAgent::new(
-            api_key.clone(),
-            workspace.clone(),
-            subagent_event_tx,
-        ))
-        .build()?;
-    let (agent, mut parent_events) = Nanocodex::builder(api_key)
+    let child_agents = Arc::new(ChildAgents::default());
+    let tools_agents = Arc::downgrade(&child_agents);
+    let (agent, events) = Nanocodex::builder(api_key)
+        .prompt(
+            "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest completed context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
+        )
         .thinking(Thinking::Low)
-        .tools(tools)
+        .tools_factory(move |agent| {
+            Tools::builder()
+                .without_defaults()
+                .tool(ChildAgent::new(
+                    agent.clone(),
+                    tools_agents.clone(),
+                    ChildKind::Spawn,
+                ))
+                .tool(ChildAgent::new(
+                    agent,
+                    tools_agents.clone(),
+                    ChildKind::Fork,
+                ))
+                .tool(PromptAgent {
+                    agents: tools_agents.clone(),
+                })
+                .build()
+        })
         .workspace(workspace)
         .build()?;
+    drop(events);
 
-    let turn = agent
-        .prompt(
-            r#"Use code mode to run exactly these two calls concurrently with Promise.all:
-- spawn_agent({ task: "Return only the sum of the first ten positive integers." })
-- spawn_agent({ task: "Return only the product of 6 and 7." })
-Then reply with one sentence containing both returned answers."#,
-        )
+    agent
+        .prompt(format!(
+            "Without using tools, commit this orchestration brief as the decision context for later workers. Reply exactly BRIEF_COMMITTED.\n\n{ORCHESTRATION_BRIEF}"
+        ))
+        .await?
+        .result()
         .await?;
-    let mut result = Box::pin(turn.result());
-    let mut completed = None;
-    let mut parent_terminal = false;
-    let mut stream_seq = 1;
-    let mut stdout = std::io::stdout().lock();
 
-    while completed.is_none() || !parent_terminal {
-        let routed = tokio::select! {
-            outcome = &mut result, if completed.is_none() => {
-                completed = Some(outcome?);
-                continue;
-            }
-            event = parent_events.recv(), if !parent_terminal => {
-                let event = event.ok_or_eyre("parent event stream closed before its terminal event")?;
-                parent_terminal = event.kind.is_terminal();
-                RoutedEvent { source: EventSource::Parent, event }
-            }
-            event = subagent_events.recv() => {
-                event.ok_or_eyre("subagent event stream closed while the parent was running")?
-            }
-        };
-        serde_json::to_writer(
-            &mut stdout,
-            &UnifiedEvent {
-                stream_seq,
-                source: &routed.source,
-                event: &routed.event,
-            },
-        )?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-        stream_seq += 1;
-    }
-
-    // Every child drains its own event stream before returning its tool result,
-    // so once the parent completes any remaining records are already queued.
-    while let Ok(routed) = subagent_events.try_recv() {
-        serde_json::to_writer(
-            &mut stdout,
-            &UnifiedEvent {
-                stream_seq,
-                source: &routed.source,
-                event: &routed.event,
-            },
-        )?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
-        stream_seq += 1;
-    }
-
-    let result = completed.ok_or_eyre("turn completed without a result")?;
-    eprintln!("final result: {}", result.final_message);
+    let result = agent
+        .prompt(
+            std::env::args()
+                .nth(1)
+                .unwrap_or_else(|| DEFAULT_GOAL.to_owned()),
+        )
+        .await?
+        .result()
+        .await?;
+    println!("{}", result.final_message);
     Ok(())
 }
