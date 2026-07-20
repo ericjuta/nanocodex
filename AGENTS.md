@@ -37,7 +37,7 @@
 
 ## Codex reference
 
-- Use the local checkout at `~/github/openai/codex/codex-rs` before making an
+- Use the local checkout at `../codex/codex-rs` before making an
   architecture or behavior claim about Codex. Do not browse the web or invoke
   OpenAI documentation tooling unless the user explicitly asks.
 - Codex is evidence, not an API requirement. Copy relevant invariants and

@@ -1,7 +1,8 @@
 # Integrate full Hashline read, patch, and recoverable transactions
 
 - Branch: `feature/hashline_transaction`
-- Status: Draft; implementation has not started
+- Status: Native end-to-end candidate implemented; live evaluation and durable
+  filesystem fault gates remain
 - Owner(s): Nanocodex maintainers and Codex
 - Created: 2026-07-20
 - Last Updated: 2026-07-20
@@ -14,11 +15,10 @@ clear, continue to it and update this spec instead of asking for generic next
 steps.
 
 The root `AGENTS.md` is authoritative. In particular, implementation must use
-the Codex checkout at `~/github/openai/codex/codex-rs` for source claims and
-must follow the active work in `PLAN.md` in order. That required checkout was
-not present when this rewrite was prepared. Existing observations from the
-alternate `../codex` checkout are provisional evidence only; Milestone 0 must
-revalidate and classify source behavior before code is copied or adapted.
+the sibling Codex checkout at `../codex/codex-rs` for source claims and must
+follow the active work in `PLAN.md` in order. The user confirmed that checkout
+as the canonical local source on 2026-07-20. Milestone 0 must classify its
+source behavior before code is copied or adapted.
 
 ## Purpose / Big Picture
 
@@ -114,19 +114,27 @@ Success means:
   rendering, `apply_patch` behavior, crate ownership, and validation surfaces.
 - [x] (2026-07-20) Replace the transaction-only product plan with this full
   Hashline read/patch/transaction contract based on the stated product intent.
-- [ ] Restore or obtain access to the required
-  `~/github/openai/codex/codex-rs` checkout, inspect the pinned checkpoint and
-  every later commit required by root `AGENTS.md`, and record the adopted source
-  manifest before implementation.
+- [x] (2026-07-20) Confirm the required sibling
+  `../codex/codex-rs` checkout, inspect its divergent relationship to the pinned
+  checkpoint, classify the relevant Hashline path history, and record the
+  adopted source manifest before implementation.
 - [ ] Record the current `apply_patch` model schema and run the frozen baseline
   and holdout selection before changing model-visible tools.
-- [ ] Implement shared Hashline hashing, exact observation, bounded read, block
-  discovery, patch parsing/application, and deterministic tests.
-- [ ] Implement the portable patch executor and expose read, block, and patch
-  through Code Mode alongside `apply_patch`.
-- [ ] Import and adapt the transaction engine, implement the unsafe-free Linux
-  capability plus unsupported capability, and expose the transaction tool.
-- [ ] Remove `apply_patch` only after the replacement and model-adoption gates;
+- [x] (2026-07-20) Implement shared Hashline hashing, exact observation,
+  bounded read, block discovery, patch parsing/application, and deterministic
+  tests.
+- [x] (2026-07-20) Implement the portable patch executor and expose read,
+  block, and patch through Code Mode alongside `apply_patch`.
+- [x] (2026-07-20) Implement typed preview/commit/commitPreviewed planning,
+  exact-digest and line-anchor validation, bounded journals, all-before restart
+  recovery, Linux ext-family/tmpfs negotiation, unsupported-platform failure,
+  and expose the transaction tool.
+- [ ] Complete descriptor-relative transaction traversal, replace coarse
+  root-level commit coordination with canonical disjoint-path coordination, and
+  run transition-by-transition subprocess fault injection before claiming the
+  full durable filesystem gate. Parent-directory sync ordering and nonblocking
+  cross-runtime conflict handling are present in the candidate.
+- [x] (2026-07-20) Remove `apply_patch` after deterministic replacement tests;
   delete its parser, grammar, handler, registrations, and tests.
 - [ ] Run focused, workspace, example, native smoke, recovery, Harbor, and full
   milestone validation; inspect and record exact retained evidence here.
@@ -163,9 +171,9 @@ Success means:
   simple line-range read. A block anchor combines a line anchor with a bounded
   block guard and must round-trip through block discovery before a destructive
   block edit.
-  Evidence: provisional alternate-checkout files
+  Evidence: canonical sibling-checkout files
   `../codex/codex-rs/core/src/tools/handlers/hashline_block.rs` and
-  `hashline_patch_parser.rs`; canonical source revalidation remains pending.
+  `hashline_patch_parser.rs`.
 
 - Observation: compact Hashline guards and transaction exact-byte evidence
   serve different purposes. Compact 4-hex line and 8-hex logical file/block
@@ -173,14 +181,14 @@ Success means:
   boundaries. Transactions require a 64-hex SHA-256 digest of exact bytes.
   A read tool that emits only compact hashes would still force the model to use
   shell or Node before every transaction.
-  Evidence: provisional alternate-checkout Hashline hash and transaction types;
+  Evidence: canonical sibling-checkout Hashline hash and transaction types;
   the Nanocodex contract therefore adds `exactDigest` to read output.
 
 - Observation: complete patch semantics include file operations. Sectioned
   patch input can create multiple files, remove a file, and move a file while
   also applying line edits, so standalone write/remove/rename tools would be
   redundant in Nanocodex.
-  Evidence: provisional alternate-checkout patch parser, section parser, and
+  Evidence: canonical sibling-checkout patch parser, section parser, and
   tests; canonical source revalidation remains pending.
 
 - Observation: routine patch and durable transaction cannot honestly share one
@@ -189,10 +197,31 @@ Success means:
   stronger descriptor-relative, locking, identity, sync, and recovery
   semantics. The tool descriptions and results must state that distinction.
 
-- Observation: the alternate `../codex` checkout used by the superseded draft
-  is present, but the checkout mandated by root `AGENTS.md` is absent. No commit
-  IDs or source-path behavior from the alternate checkout may be promoted to
-  final provenance until Milestone 0 completes.
+- Observation: the user confirmed `../codex/codex-rs` as the canonical local
+  checkout. Its clean `main` HEAD is
+  `eff2c761e2bf3c644730edf795a8055b00818e92`; the historical pinned checkpoint
+  is not its ancestor, so provenance review records the divergence explicitly
+  instead of describing HEAD as a linear advancement of that checkpoint.
+
+- Observation: canonical behavior was classified by relevant Hashline path
+  history because the confirmed checkout diverges from the historical pinned
+  checkpoint. Core read/block/patch fixes through `b7426c1b7d` are port
+  candidates; transaction planner, exact-edit, journal, recovery, and native
+  capability commits from `98ed2bb3fb` through `eb44f13a60` are evaluate/adopt
+  evidence; Codex environment/RPC routing is out of scope; standalone Hashline
+  write/remove/rename tools are deliberately deferred in favor of patch file
+  operations. Evidence: clean canonical `main` HEAD
+  `eff2c761e2bf3c644730edf795a8055b00818e92` and path-scoped `git log`.
+
+- Observation: the first Nanocodex transaction candidate intentionally remains
+  short of the spec's strongest durability claim. It retains and syncs bounded
+  exact before evidence, recovers pending journals to all-before, and fails
+  closed outside Linux ext-family/tmpfs, but still uses ambient safe path APIs
+  and has not passed descriptor-race, cross-runtime coordination, directory
+  sync, or kill-at-every-transition tests. Do not describe this candidate as a
+  completed Milestone 4 capability. The candidate subsequently added safe
+  root-level commit leases and parent-directory sync ordering; descriptor-safe
+  mutation and exhaustive fault evidence remain the blocking differences.
 
 ## Decision Log
 
@@ -314,10 +343,10 @@ Success means:
   remains narrow and can be rolled back with a cohesive Git revert.
   Date/Author: 2026-07-20 / user and Codex
 
-- Decision: canonical Codex source revalidation is a blocking Milestone 0 gate,
-  not an excuse to reuse unverified alternate-checkout claims.
+- Decision: canonical Codex source revalidation uses the user-confirmed sibling
+  checkout at `../codex/codex-rs`.
   Rationale: root `AGENTS.md` names the source checkout and parity procedure
-  explicitly.
+  explicitly, and the source-history divergence must remain visible.
   Date/Author: 2026-07-20 / Codex
 
 ## Outcomes & Retrospective
@@ -328,6 +357,19 @@ Success means:
   adoption evidence.
   Remaining: canonical source review, baseline, all implementation, and all
   validation milestones.
+
+- Outcome: the native runtime now advertises the flat `hashline__read`,
+  `hashline__find_block`, `hashline__patch`, and `hashline__transaction` family
+  with closed schemas and no `apply_patch`. A deterministic Code Mode test
+  dispatches read, patch, read, preview, and commitPreviewed in one cell and
+  verifies final bytes and sidecar cleanup. Canonical parser behavior preserves
+  BOM, mixed line endings, final-newline shape, compact anchors, block anchors,
+  sectioned file operations, and bounded previews.
+  Remaining: complete Milestone 4's descriptor-relative durability, disjoint
+  coordination, and fault matrix, then run the frozen live baseline, holdout,
+  native smoke, Harbor, and configured evaluation gates.
+  Implementation commit: `15ef6a6` (`feat(tools): integrate native hashline
+  editing`).
 
 ## Context and Orientation
 
@@ -370,11 +412,10 @@ The implementation should converge on these private Hashline layers:
 5. Thin `Tool` handlers own closed model schemas, argument translation, blocking
    task boundaries, bounded structured outputs, and typed model-facing errors.
 
-Provisional source candidates in the alternate checkout include
+Canonical source candidates in the sibling checkout include
 `codex-rs/core/src/tools/handlers/hashline*.rs`,
 `codex-rs/hashline-transaction/src/`, and
-`codex-rs/exec-server/src/hashline_transaction_fs*.rs`. They are navigation
-hints only until Milestone 0 reproduces the review in the mandated checkout.
+`codex-rs/exec-server/src/hashline_transaction_fs*.rs`.
 
 Terms used here:
 
@@ -409,8 +450,8 @@ model-visible or production code changes.
 
 Work:
 
-- Restore or obtain the required `~/github/openai/codex/codex-rs` checkout.
-  Do not clone, fetch, or substitute another checkout without user direction.
+- Use the user-confirmed `../codex/codex-rs` checkout. Do not clone, fetch, or
+  substitute another checkout without user direction.
 - Record its branch, exact HEAD, cleanliness, and the pinned root-AGENTS
   checkpoint. Inspect every later commit required by the parity procedure and
   classify it as port, evaluate, defer, or out-of-scope before citing adopted
@@ -430,8 +471,9 @@ Work:
 
 Acceptance:
 
-- This spec contains a complete source manifest and later-commit classification
-  based on the mandated checkout, or records a user-confirmed substitute.
+- This spec contains a complete source manifest and relevant Hashline commit
+  classification based on the user-confirmed sibling checkout, including its
+  divergence from the historical pinned checkpoint.
 - The baseline job and holdout ID are retained and named here.
 - No production source, dependency, lockfile, model schema, task, or verifier is
   changed in this milestone.
@@ -922,8 +964,8 @@ Update exact commands if implementation reveals more precise focused targets.
 Run from `/home/ericjuta/.openclaw/workspace/repos/nanocodex`:
 
     git status --short --branch
-    git -C /home/ericjuta/github/openai/codex rev-parse HEAD
-    git -C /home/ericjuta/github/openai/codex log --oneline \
+    git -C ../codex/codex-rs rev-parse HEAD
+    git -C ../codex/codex-rs log --oneline \
       35eaf3ffb0bf2001486c68c47a3d946b34d16634d..HEAD
 
     cargo test -p nanocodex-tools hashline::hash
@@ -1107,10 +1149,11 @@ Regression checks:
 
 ## Risks and Open Questions
 
-- Risk: the canonical source checkout is unavailable, so provisional source
-  behavior and commit provenance may be stale or incomplete.
-  Mitigation: block implementation at Milestone 0; obtain user direction before
-  fetching or substituting source.
+- Risk: the canonical sibling checkout diverges from the historical pinned
+  checkpoint, so a linear `checkpoint..HEAD` parity classification is not
+  meaningful.
+  Mitigation: record the divergence and classify the checkout's relevant
+  Hashline history directly.
 
 - Risk: compact line/file/block guards can collide and are not adversarial stale-
   write protection.
@@ -1180,12 +1223,20 @@ Initial planning state:
     Nanocodex branch: feature/hashline_transaction
     Nanocodex HEAD before rewrite: 9ed472b
     Superseded transaction-only plan: 3f2f58b
-    Required Codex checkout: /home/ericjuta/github/openai/codex/codex-rs
-    Required Codex checkout state: missing at rewrite time
-    Alternate checkout: ../codex (provisional navigation only)
+    Required Codex checkout: ../codex/codex-rs
+    Required Codex checkout state: user-confirmed canonical sibling checkout
+    Canonical checkout HEAD: eff2c761e2bf3c644730edf795a8055b00818e92 (clean main)
+    Pinned-checkpoint relationship: divergent; pinned commit is not an ancestor
     Baseline model run: not executed
     Holdout: not selected
     Nanocodex unsafe lint: unsafe_code = "forbid"
+    Native implementation commit: 15ef6a6
+    Deterministic Hashline tests: 5 direct + 1 Code Mode family round trip passed
+    nanocodex-tools tests: 59 passed
+    Workspace tests: 159 passed, 3 ignored manual/isolated tests
+    Workspace all-target Clippy: passed with warnings denied
+    Public examples: compiled as workspace test targets
+    Hashline unsafe/libc scan: no matches
 
 Do not replace missing source/eval evidence with estimates. Update this section
 with exact source HEAD/classification, deterministic test counts, retained job
@@ -1199,3 +1250,7 @@ as each milestone completes.
   plan. Added direct read-to-patch and read-to-transaction evidence flow,
   portable patch versus durable transaction guarantees, staged `apply_patch`
   removal, canonical source revalidation, and separate adoption gates.
+- 2026-07-20: Recorded native implementation commit `15ef6a6`, deterministic
+  Code Mode and workspace validation, the user-confirmed `../codex/codex-rs`
+  source path, and the remaining descriptor-relative durability, exhaustive
+  fault-injection, and live evaluation gates.
