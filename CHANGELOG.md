@@ -178,6 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Refresh 0.1.0 changelog
 - [release] Automate publishing and native updates
 - Defer Windows test coverage
 - Update repository identity
@@ -283,6 +284,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- [tui] Cover escape cancellation
 - [observability] Add retained-session stress coverage
 - Stabilize PTY readiness checks
 
