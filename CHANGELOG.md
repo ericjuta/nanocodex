@@ -178,6 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Update 0.1.0 changelog
 - [release] Refresh 0.1.0 changelog
 - [release] Automate publishing and native updates
 - Defer Windows test coverage
@@ -187,6 +188,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Add reproducible Codex parity workload
 - Pin leaderboard Terminal-Bench 2.1 configuration
 - Compare checkpoint forks with transcript replay
 - Harden Harbor adapter for Terminal-Bench 2.1
