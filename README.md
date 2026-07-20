@@ -207,15 +207,6 @@ Tower stack.
 The common paths remain short; factories appear only when lifecycle isolation
 requires them.
 
-| Need | Builder API | Why |
-| --- | --- | --- |
-| Standard agent | `Nanocodex::new(api_key)` | All defaults |
-| Session policy | `Nanocodex::builder(api_key)` | Instructions, thinking, workspace, tools, identity, Responses policy |
-| Shareable/static tools | `.tools(tools)` | Reuses a completed registry |
-| Tools bound to each agent | `.tools_factory(|handle| ...)` | Fresh handlers for every root, fork, and child |
-| Wrap standard transport | `Responses::builder().layer(layer)` | Adds timeout, tracing, limits, or other Tower middleware |
-| Replace transport stack | `Responses::builder().service(|| stack)` | Fresh mutable service state for every independent lifecycle |
-
 ```rust
 use std::time::Duration;
 
