@@ -51,6 +51,28 @@ struct SharedNodeHost {
     host: Option<NodeHost>,
 }
 
+impl SharedNodeHost {
+    fn prewarmed(workspace: PathBuf) -> Self {
+        // Tool runtimes may be constructed outside an entered Tokio runtime.
+        // Preserve lazy startup for those callers and as a retry path when the
+        // eager process spawn fails.
+        let host = tokio::runtime::Handle::try_current().ok().and_then(|_| {
+            match NodeHost::spawn(&workspace) {
+                Ok(host) => Some(host),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "nanocodex_tools",
+                        %error,
+                        "code mode host prewarm failed; the first cell will retry"
+                    );
+                    None
+                }
+            }
+        });
+        Self { workspace, host }
+    }
+}
+
 struct CellRegistry {
     next_cell_id: u64,
     live_cells: HashMap<u64, LiveCell>,
@@ -216,10 +238,7 @@ impl CodeModeRuntime {
                 live_cells: HashMap::new(),
             })),
             stored: Arc::new(Mutex::new(HashMap::new())),
-            host: Arc::new(Mutex::new(SharedNodeHost {
-                workspace,
-                host: None,
-            })),
+            host: Arc::new(Mutex::new(SharedNodeHost::prewarmed(workspace))),
         }
     }
 

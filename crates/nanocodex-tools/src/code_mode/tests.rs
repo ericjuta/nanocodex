@@ -8,6 +8,18 @@ use super::{CodeModeExecution, NestedToolCall, parse_exec_source};
 use crate::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime, WebSearchConfig};
 
 #[tokio::test]
+async fn prewarms_node_host_when_runtime_is_available() -> Result<()> {
+    let workspace = temporary_workspace("prewarmed-node-host")?;
+    let runtime = super::CodeModeRuntime::new(workspace.clone());
+
+    assert!(runtime.host.lock().await.host.is_some());
+
+    runtime.control().terminate_all().await;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn reuses_one_node_host_across_cells() -> Result<()> {
     let workspace = temporary_workspace("persistent-node-host")?;
     let tools = test_tools(&workspace);
