@@ -94,10 +94,17 @@ pub enum AgentEventKind {
 
 /// The receiving half of an agent's typed event stream.
 pub struct AgentEvents {
+    request_id: Arc<str>,
     receiver: mpsc::UnboundedReceiver<AgentEvent>,
 }
 
 impl AgentEvents {
+    /// Stable session/request identifier shared by every event in this stream.
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     /// Receives the next event, or `None` after all emitters are dropped.
     pub async fn recv(&mut self) -> Option<AgentEvent> {
         self.receiver.recv().await
@@ -173,14 +180,18 @@ pub struct EventSink {
 impl EventSink {
     #[must_use]
     pub fn channel(request_id: String) -> (Self, AgentEvents) {
+        let request_id = Arc::<str>::from(request_id);
         let (sender, receiver) = mpsc::unbounded_channel();
         (
             Self {
-                request_id: request_id.into(),
+                request_id: Arc::clone(&request_id),
                 next_seq: Arc::new(AtomicU64::new(1)),
                 sender,
             },
-            AgentEvents { receiver },
+            AgentEvents {
+                request_id,
+                receiver,
+            },
         )
     }
 
@@ -231,17 +242,18 @@ mod tests {
 
     use super::{AgentEventKind, EventSink};
 
-    #[tokio::test]
-    async fn events_are_ordered_and_receiver_drop_is_not_an_error() {
+    #[test]
+    fn events_are_ordered_and_receiver_drop_is_not_an_error() {
         let (events, mut receiver) = EventSink::channel("request-1".to_owned());
+        assert_eq!(receiver.request_id(), "request-1");
         events
             .emit(AgentEventKind::RunStarted, json!({ "n": 1 }))
             .unwrap();
         events
             .emit(AgentEventKind::RunCompleted, json!({ "n": 2 }))
             .unwrap();
-        let first = receiver.recv().await.unwrap();
-        let second = receiver.recv().await.unwrap();
+        let first = receiver.receiver.try_recv().unwrap();
+        let second = receiver.receiver.try_recv().unwrap();
         assert_eq!((first.seq, first.kind), (1, AgentEventKind::RunStarted));
         assert_eq!((second.seq, second.kind), (2, AgentEventKind::RunCompleted));
         assert_eq!(
