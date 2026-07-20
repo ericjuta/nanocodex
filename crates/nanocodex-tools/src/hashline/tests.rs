@@ -1,5 +1,9 @@
 use std::fs;
+use std::io::Write as _;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
@@ -139,6 +143,133 @@ fn block_anchor_round_trips_and_rejects_stale_evidence() {
 }
 
 #[test]
+fn tool_schemas_explain_relative_paths_and_patch_grammar() {
+    let read =
+        serde_json::to_value(super::read_definition()).expect("read definition should serialize");
+    assert!(
+        read["parameters"]["properties"]["path"]["description"]
+            .as_str()
+            .expect("read path description should be text")
+            .contains("workspace-relative")
+    );
+
+    let patch =
+        serde_json::to_value(super::patch_definition()).expect("patch definition should serialize");
+    let patch_description = patch["parameters"]["properties"]["patch"]["description"]
+        .as_str()
+        .expect("patch description should be text");
+    for required in [
+        "[path]#HASH",
+        "SWAP 12:abcd",
+        "+replacement",
+        "create=true",
+        "REM",
+        "MV",
+    ] {
+        assert!(
+            patch_description.contains(required),
+            "patch description should document {required}"
+        );
+    }
+
+    let transaction = serde_json::to_value(super::transaction_definition())
+        .expect("transaction definition should serialize");
+    assert!(
+        transaction["parameters"]["properties"]["root"]["description"]
+            .as_str()
+            .expect("transaction root description should be text")
+            .contains("Omit or use \".\"")
+    );
+    for mutation in transaction["parameters"]["properties"]["mutations"]["items"]["oneOf"]
+        .as_array()
+        .expect("mutation variants should be an array")
+    {
+        let path_schema = mutation["properties"]
+            .get("path")
+            .or_else(|| mutation["properties"].get("source"))
+            .expect("mutation should expose a path or source");
+        assert!(
+            path_schema["description"]
+                .as_str()
+                .expect("mutation path description should be text")
+                .contains("relative to the selected transaction root")
+        );
+    }
+}
+
+#[test]
+fn patch_rejections_explain_a_valid_hashline_retry() {
+    let root = workspace("patch-errors");
+    fs::write(root.join("notes.txt"), b"alpha\n").expect("fixture should write");
+
+    let missing_header = execute_patch(
+        &root,
+        &PatchRequest {
+            path: "notes.txt".to_owned(),
+            patch: format!("SWAP 1:{}:\n+omega", line_hash("alpha")),
+            dry_run: true,
+            create: false,
+        },
+    )
+    .expect_err("an existing-file patch without a section header should fail")
+    .to_string();
+    for required in ["hashline__read", "#HASH", "SWAP 12:abcd"] {
+        assert!(
+            missing_header.contains(required),
+            "missing-header error should document {required}"
+        );
+    }
+
+    let read_result = read(
+        &root,
+        &ReadRequest {
+            path: "notes.txt".to_owned(),
+            start_line: None,
+            end_line: None,
+            max_lines: None,
+        },
+    )
+    .expect("fixture should read");
+    let unified_diff = execute_patch(
+        &root,
+        &PatchRequest {
+            path: "notes.txt".to_owned(),
+            patch: format!(
+                "{}\n@@ -1 +1 @@\n-alpha\n+omega",
+                read_result["header"]
+                    .as_str()
+                    .expect("header should be text")
+            ),
+            dry_run: true,
+            create: false,
+        },
+    )
+    .expect_err("unified diff syntax should fail")
+    .to_string();
+    for required in ["hashline__read", "[path]#HASH", "SWAP 12:abcd"] {
+        assert!(
+            unified_diff.contains(required),
+            "unified-diff error should document {required}"
+        );
+    }
+
+    let absolute_path = read(
+        &root,
+        &ReadRequest {
+            path: root.join("notes.txt").display().to_string(),
+            start_line: None,
+            end_line: None,
+            max_lines: None,
+        },
+    )
+    .expect_err("absolute paths should fail")
+    .to_string();
+    assert!(absolute_path.contains("workspace-relative"));
+
+    fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[test]
 fn transaction_preview_digest_commits_exact_plan_and_cleans_sidecar() {
     let root = workspace("transaction");
     let before = b"alpha\nbeta\n";
@@ -215,10 +346,17 @@ fn pending_journal_recovers_all_before_state_in_a_fresh_invocation() {
             after: b"after-b\n".to_vec(),
         },
     ];
-    super::write_journal(&root, "recovery-fixture", &prepared).expect("journal should be durable");
-    super::apply_one(&root, &prepared[0]).expect("first mutation should apply");
+    let native = super::transaction_fs::open_root(&root, ".").expect("root should be supported");
+    let lease = super::transaction_fs::lock_paths(&native, &prepared)
+        .expect("transaction paths should lock");
+    let mut journal = super::transaction_fs::write_journal(&native, "recovery-fixture", &prepared)
+        .expect("journal should be durable");
+    super::transaction_fs::apply_prepared(&native, &lease, &prepared, &mut journal)
+        .expect("mutations should apply before simulated interruption");
+    drop(journal);
+    drop(lease);
 
-    super::recover_pending(&root).expect("fresh recovery should converge");
+    super::transaction_fs::recover_pending(&native).expect("fresh recovery should converge");
 
     assert_eq!(
         fs::read(root.join("a.txt")).expect("file should read"),
@@ -230,4 +368,341 @@ fn pending_journal_recovers_all_before_state_in_a_fresh_invocation() {
     );
     assert!(!root.join(".nanocodex/hashline-transactions").exists());
     fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn transaction_plan_digest_binds_root_identity() {
+    let workspace = workspace("root-identity");
+    fs::create_dir(workspace.join("selected")).expect("selected root should be created");
+    fs::write(workspace.join("selected/a.txt"), "before\n").expect("fixture should write");
+    let request = TransactionRequest {
+        action: TransactionAction::Preview,
+        root: Some("selected".to_owned()),
+        mutations: vec![FileMutation::Update {
+            path: "a.txt".to_owned(),
+            expected: super::ExpectedFile {
+                exact_digest: exact_digest(b"before\n"),
+            },
+            edits: vec![FileEdit::ReplaceAll {
+                contents: "after\n".to_owned(),
+            }],
+        }],
+    };
+    let first = execute_transaction(&workspace, &request).expect("first preview should succeed");
+    fs::rename(workspace.join("selected"), workspace.join("replaced"))
+        .expect("selected root should move");
+    fs::create_dir(workspace.join("selected")).expect("replacement root should be created");
+    fs::write(workspace.join("selected/a.txt"), "before\n").expect("replacement should match");
+    let second = execute_transaction(&workspace, &request).expect("second preview should succeed");
+    assert_ne!(first["planDigest"], second["planDigest"]);
+    fs::remove_dir_all(workspace).expect("workspace should be removed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn leased_parent_replacement_fails_without_mutating_either_directory() {
+    let root = workspace("parent-replacement");
+    fs::create_dir(root.join("dir")).expect("parent should be created");
+    fs::write(root.join("dir/a.txt"), "before\n").expect("fixture should write");
+    let native = super::transaction_fs::open_root(&root, ".").expect("root should be supported");
+    let prepared = vec![super::PreparedMutation::Write {
+        path: "dir/a.txt".to_owned(),
+        before: Some(b"before\n".to_vec()),
+        after: b"after\n".to_vec(),
+    }];
+    let lease =
+        super::transaction_fs::lock_paths(&native, &prepared).expect("original parent should lock");
+    fs::rename(root.join("dir"), root.join("original")).expect("parent should move");
+    fs::create_dir(root.join("dir")).expect("replacement parent should be created");
+    fs::write(root.join("dir/a.txt"), "before\n").expect("replacement fixture should write");
+    let mut journal = super::transaction_fs::write_journal(&native, "parent-race", &prepared)
+        .expect("journal should write");
+    let error = super::transaction_fs::apply_prepared(&native, &lease, &prepared, &mut journal)
+        .expect_err("replaced parent must fail");
+    assert!(error.to_string().contains("not covered"));
+    assert_eq!(
+        fs::read(root.join("original/a.txt")).expect("original should read"),
+        b"before\n"
+    );
+    assert_eq!(
+        fs::read(root.join("dir/a.txt")).expect("replacement should read"),
+        b"before\n"
+    );
+    drop(journal);
+    drop(lease);
+    fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn recovery_preserves_unrecognized_external_state_and_retains_evidence() {
+    let root = workspace("recovery-conflict");
+    fs::write(root.join("a.txt"), "before\n").expect("fixture should write");
+    let native = super::transaction_fs::open_root(&root, ".").expect("root should be supported");
+    let prepared = vec![super::PreparedMutation::Write {
+        path: "a.txt".to_owned(),
+        before: Some(b"before\n".to_vec()),
+        after: b"after\n".to_vec(),
+    }];
+    let lease = super::transaction_fs::lock_paths(&native, &prepared)
+        .expect("transaction path should lock");
+    let mut journal = super::transaction_fs::write_journal(&native, "conflict", &prepared)
+        .expect("journal should write");
+    super::transaction_fs::apply_prepared(&native, &lease, &prepared, &mut journal)
+        .expect("mutation should apply");
+    drop(journal);
+    drop(lease);
+    fs::write(root.join("a.txt"), "external\n").expect("external state should write");
+    let error = super::transaction_fs::recover_pending(&native)
+        .expect_err("unrecognized state must stop recovery");
+    assert!(error.to_string().contains("manual recovery is required"));
+    assert_eq!(
+        fs::read(root.join("a.txt")).expect("state should read"),
+        b"external\n"
+    );
+    assert!(
+        root.join(".nanocodex/hashline-transactions/conflict.json")
+            .exists()
+    );
+    fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cross_process_coordination_conflicts_only_for_shared_parents() {
+    let root = workspace("coordination");
+    fs::create_dir(root.join("left")).expect("left should be created");
+    fs::create_dir(root.join("right")).expect("right should be created");
+    fs::write(root.join("left/a.txt"), "left\n").expect("left fixture should write");
+    fs::write(root.join("right/b.txt"), "right\n").expect("right fixture should write");
+    let marker = root.join("lease-ready");
+    let mut child = Command::new(std::env::current_exe().expect("test executable should resolve"))
+        .args([
+            "--ignored",
+            "--exact",
+            "hashline::tests::transaction_lease_child",
+            "--nocapture",
+        ])
+        .env("NANOCODEX_HASHLINE_CHILD_ROOT", &root)
+        .env("NANOCODEX_HASHLINE_CHILD_MARKER", &marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("lease child should start");
+    for _ in 0..200 {
+        if marker.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "lease child did not become ready");
+
+    let native = super::transaction_fs::open_root(&root, ".").expect("root should be supported");
+    let overlapping = vec![super::PreparedMutation::Write {
+        path: "left/other.txt".to_owned(),
+        before: None,
+        after: b"other\n".to_vec(),
+    }];
+    let conflict = super::transaction_fs::lock_paths(&native, &overlapping)
+        .expect_err("same parent must conflict");
+    assert!(conflict.to_string().contains("transaction conflict"));
+
+    let disjoint = vec![super::PreparedMutation::Write {
+        path: "right/other.txt".to_owned(),
+        before: None,
+        after: b"other\n".to_vec(),
+    }];
+    let lease = super::transaction_fs::lock_paths(&native, &disjoint)
+        .expect("disjoint parent should lock concurrently");
+    drop(lease);
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin should be piped")
+        .write_all(b"release\n")
+        .expect("child should receive release");
+    assert!(child.wait().expect("child should finish").success());
+    fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn subprocess_faults_at_every_durable_transition_converge_and_clean_up() {
+    const FAULTS: &[&str] = &[
+        "prepared-journal-file-sync",
+        "prepared-journal-publish",
+        "prepared-journal-dir-sync",
+        "mutation-0-after-stage-sync",
+        "mutation-0-after-rename",
+        "mutation-0-after-parent-sync",
+        "after-mutation-0",
+        "progress-0-journal-file-sync",
+        "progress-0-journal-publish",
+        "progress-0-journal-dir-sync",
+        "mutation-1-after-stage-sync",
+        "mutation-1-after-rename",
+        "mutation-1-after-parent-sync",
+        "after-mutation-1",
+        "progress-1-journal-file-sync",
+        "progress-1-journal-publish",
+        "progress-1-journal-dir-sync",
+        "mutation-2-after-unlink",
+        "mutation-2-after-parent-sync",
+        "after-mutation-2",
+        "progress-2-journal-file-sync",
+        "progress-2-journal-publish",
+        "progress-2-journal-dir-sync",
+        "mutation-3-destination-after-stage-sync",
+        "mutation-3-destination-after-rename",
+        "mutation-3-destination-after-parent-sync",
+        "mutation-3-after-source-unlink",
+        "mutation-3-after-source-parent-sync",
+        "after-mutation-3",
+        "progress-3-journal-file-sync",
+        "progress-3-journal-publish",
+        "progress-3-journal-dir-sync",
+        "before-journal-remove",
+        "after-journal-remove",
+        "after-journal-remove-dir-sync",
+    ];
+    for fault in FAULTS {
+        let root = workspace(&format!("fault-{}", fault.replace('-', "_")));
+        fs::write(root.join("a.txt"), "before-a\n").expect("a fixture should write");
+        fs::write(root.join("delete.txt"), "before-delete\n").expect("delete fixture should write");
+        fs::write(root.join("move.txt"), "before-move\n").expect("move fixture should write");
+        let status = Command::new(std::env::current_exe().expect("test executable should resolve"))
+            .args([
+                "--ignored",
+                "--exact",
+                "hashline::tests::transaction_fault_child",
+                "--nocapture",
+            ])
+            .env("NANOCODEX_HASHLINE_CHILD_ROOT", &root)
+            .env("NANOCODEX_HASHLINE_FAULT", fault)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("fault child should run");
+        assert!(
+            !status.success(),
+            "fault point {fault} did not interrupt the child"
+        );
+        let native = super::transaction_fs::open_root(&root, ".").expect("root should reopen");
+        super::transaction_fs::recover_pending(&native).expect("recovery should converge");
+        assert_recovered_state(&root, fault);
+        assert!(
+            !root.join(".nanocodex").exists(),
+            "fault point {fault} left recovery storage"
+        );
+        let temporary = fs::read_dir(&root)
+            .expect("workspace should list")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("nanocodex-hashline")
+            });
+        assert!(!temporary, "fault point {fault} left a temporary file");
+        fs::remove_dir_all(root).expect("workspace should be removed");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_recovered_state(root: &std::path::Path, fault: &str) {
+    let state = (
+        fs::read(root.join("a.txt")).expect("a should read"),
+        fs::read(root.join("create.txt")).ok(),
+        fs::read(root.join("delete.txt")).ok(),
+        fs::read(root.join("move.txt")).ok(),
+        fs::read(root.join("moved.txt")).ok(),
+    );
+    let all_before = (
+        b"before-a\n".to_vec(),
+        None,
+        Some(b"before-delete\n".to_vec()),
+        Some(b"before-move\n".to_vec()),
+        None,
+    );
+    let all_after = (
+        b"after-a\n".to_vec(),
+        Some(b"created\n".to_vec()),
+        None,
+        None,
+        Some(b"after-move\n".to_vec()),
+    );
+    assert!(
+        state == all_before || state == all_after,
+        "fault point {fault} left a mixed state: {state:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "subprocess helper"]
+fn transaction_fault_child() {
+    let root = PathBuf::from(
+        std::env::var_os("NANOCODEX_HASHLINE_CHILD_ROOT")
+            .expect("child root environment should be set"),
+    );
+    let request: TransactionRequest = serde_json::from_value(json!({
+        "action": {"type": "commit"},
+        "mutations": [
+            {
+                "type": "update",
+                "path": "a.txt",
+                "expected": {"exactDigest": exact_digest(b"before-a\n")},
+                "edits": [{"type": "replaceAll", "contents": "after-a\n"}]
+            },
+            {
+                "type": "create",
+                "path": "create.txt",
+                "contents": "created\n"
+            },
+            {
+                "type": "delete",
+                "path": "delete.txt",
+                "expected": {"exactDigest": exact_digest(b"before-delete\n")}
+            },
+            {
+                "type": "move",
+                "source": "move.txt",
+                "destination": "moved.txt",
+                "expected": {"exactDigest": exact_digest(b"before-move\n")},
+                "edits": [{"type": "replaceAll", "contents": "after-move\n"}]
+            }
+        ]
+    }))
+    .expect("child request should decode");
+    let _ = execute_transaction(&root, &request);
+    panic!("configured fault point was not reached");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "subprocess helper"]
+fn transaction_lease_child() {
+    let root = PathBuf::from(
+        std::env::var_os("NANOCODEX_HASHLINE_CHILD_ROOT")
+            .expect("child root environment should be set"),
+    );
+    let marker = PathBuf::from(
+        std::env::var_os("NANOCODEX_HASHLINE_CHILD_MARKER")
+            .expect("child marker environment should be set"),
+    );
+    let native = super::transaction_fs::open_root(&root, ".").expect("root should be supported");
+    let prepared = vec![super::PreparedMutation::Write {
+        path: "left/a.txt".to_owned(),
+        before: Some(b"left\n".to_vec()),
+        after: b"changed\n".to_vec(),
+    }];
+    let _lease =
+        super::transaction_fs::lock_paths(&native, &prepared).expect("left parent should lock");
+    fs::write(marker, "ready").expect("marker should write");
+    let mut release = String::new();
+    std::io::stdin()
+        .read_line(&mut release)
+        .expect("release should read");
 }

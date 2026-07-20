@@ -20,6 +20,7 @@ mod patch;
 mod patch_lines;
 mod patch_parser;
 mod patch_sections;
+mod transaction_fs;
 
 use block::{find_normalized_block_span, language_for_path, resolve_find_block_anchor};
 use format::{build_hashline_excerpt, split_lines_preserve};
@@ -307,7 +308,7 @@ fn execute_patch(workspace: &Path, request: &PatchRequest) -> Result<Value, Func
     }
     reject_conflicts(&prepared)?;
     if !request.dry_run {
-        apply_prepared(workspace, &prepared)?;
+        apply_patch_prepared(workspace, &prepared)?;
     }
     let total_files = details.len();
     let mut bounded_details = Vec::new();
@@ -357,7 +358,7 @@ fn prepare_patch_section(
     let observed = observe(workspace, &section.path)?;
     let expected = section.expected_hash.as_deref().ok_or_else(|| {
         FunctionCallError::RespondToModel(format!(
-            "existing-file Hashline patches require a [{}]#HASH section header",
+            "existing-file Hashline patches require a [{}]#HASH section header. Reread the target with hashline__read, copy its header as the first line, then use an operation such as SWAP 12:abcd:\n+replacement.",
             section.path
         ))
     })?;
@@ -532,15 +533,25 @@ fn execute_transaction(
         ));
     }
     let root_name = request.root.as_deref().unwrap_or(".");
-    let root = resolve_root(workspace, root_name)?;
-    ensure_transaction_capability(&root)?;
-    let _lease = acquire_transaction_lease(&root)?;
-    recover_pending(&root)?;
-    let prepared = prepare_transaction(&root, &request.mutations)?;
+    let root = transaction_fs::open_root(workspace, root_name)?;
+    transaction_fs::recover_pending(&root)?;
+    let mut prepared = prepare_transaction(&root, &request.mutations)?;
     reject_conflicts(&prepared)?;
-    let digest_input =
-        serde_json::to_vec(&(root_name, &request.mutations, prepared_digests(&prepared)))
-            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+    let lease = if matches!(request.action, TransactionAction::Preview) {
+        None
+    } else {
+        let lease = transaction_fs::lock_paths(&root, &prepared)?;
+        prepared = prepare_transaction(&root, &request.mutations)?;
+        reject_conflicts(&prepared)?;
+        Some(lease)
+    };
+    let digest_input = serde_json::to_vec(&(
+        transaction_fs::root_identity(&root),
+        root_name,
+        &request.mutations,
+        prepared_digests(&prepared),
+    ))
+    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
     let plan_digest = exact_digest(&digest_input);
     if let TransactionAction::CommitPreviewed {
         expected_plan_digest,
@@ -564,10 +575,13 @@ fn execute_transaction(
         }));
     }
     let transaction_id = plan_digest.clone();
-    write_journal(&root, &transaction_id, &prepared)?;
-    match apply_prepared(&root, &prepared) {
+    let lease = lease.ok_or_else(|| {
+        FunctionCallError::RespondToModel("transaction commit lease is missing".to_owned())
+    })?;
+    let mut journal = transaction_fs::write_journal(&root, &transaction_id, &prepared)?;
+    match transaction_fs::apply_prepared(&root, &lease, &prepared, &mut journal) {
         Ok(()) => {
-            remove_journal(&root, &transaction_id)?;
+            transaction_fs::remove_journal(&root, journal)?;
             Ok(json!({
                 "outcome": "committed",
                 "transactionId": transaction_id,
@@ -580,7 +594,7 @@ fn execute_transaction(
 }
 
 fn prepare_transaction(
-    root: &Path,
+    root: &transaction_fs::NativeRoot,
     mutations: &[FileMutation],
 ) -> Result<Vec<PreparedMutation>, FunctionCallError> {
     let mut prepared = Vec::with_capacity(mutations.len());
@@ -589,8 +603,7 @@ fn prepare_transaction(
         let item = match mutation {
             FileMutation::Create { path, contents } => {
                 validate_model_path(path)?;
-                ensure_missing(root, path)?;
-                validate_transaction_parent(root, path)?;
+                transaction_fs::ensure_missing(root, path)?;
                 PreparedMutation::Write {
                     path: path.clone(),
                     before: None,
@@ -602,7 +615,7 @@ fn prepare_transaction(
                 expected,
                 edits,
             } => {
-                let observed = observe(root, path)?;
+                let observed = transaction_fs::observe(root, path)?;
                 validate_exact(path, &observed.bytes, &expected.exact_digest)?;
                 let after = apply_transaction_edits(path, &observed.text, edits)?;
                 PreparedMutation::Write {
@@ -612,7 +625,7 @@ fn prepare_transaction(
                 }
             }
             FileMutation::Delete { path, expected } => {
-                let observed = observe(root, path)?;
+                let observed = transaction_fs::observe(root, path)?;
                 validate_exact(path, &observed.bytes, &expected.exact_digest)?;
                 PreparedMutation::Delete {
                     path: path.clone(),
@@ -625,11 +638,10 @@ fn prepare_transaction(
                 destination,
                 edits,
             } => {
-                let observed = observe(root, source)?;
+                let observed = transaction_fs::observe(root, source)?;
                 validate_exact(source, &observed.bytes, &expected.exact_digest)?;
                 validate_model_path(destination)?;
-                ensure_missing(root, destination)?;
-                validate_transaction_parent(root, destination)?;
+                transaction_fs::ensure_missing(root, destination)?;
                 let after = if edits.is_empty() {
                     observed.bytes.clone()
                 } else {
@@ -776,21 +788,6 @@ fn validate_model_path(model_path: &str) -> Result<(), FunctionCallError> {
     Ok(())
 }
 
-fn resolve_root(workspace: &Path, root: &str) -> Result<PathBuf, FunctionCallError> {
-    if root == "." {
-        return workspace
-            .canonicalize()
-            .map_err(|error| io_error("open workspace", workspace, error));
-    }
-    resolve_existing(workspace, root).and_then(|path| {
-        if path.is_dir() {
-            Ok(path)
-        } else {
-            model_error(format!("transaction root {root} is not a directory"))
-        }
-    })
-}
-
 fn resolve_existing(root: &Path, model_path: &str) -> Result<PathBuf, FunctionCallError> {
     validate_model_path(model_path)?;
     let root = root
@@ -839,71 +836,6 @@ fn resolve_destination(
     Ok(root.join(model_path))
 }
 
-fn validate_transaction_parent(root: &Path, model_path: &str) -> Result<(), FunctionCallError> {
-    let parent = Path::new(model_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    if parent == Path::new(".") {
-        return Ok(());
-    }
-    let parent_text = parent.to_str().ok_or_else(|| {
-        FunctionCallError::RespondToModel("transaction parent path is not UTF-8".to_owned())
-    })?;
-    let resolved = resolve_existing(root, parent_text)?;
-    if !resolved.is_dir() {
-        return model_error(format!(
-            "transaction parent {} is not a directory",
-            parent.display()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn ensure_transaction_capability(root: &Path) -> Result<(), FunctionCallError> {
-    use nix::sys::statfs::{EXT4_SUPER_MAGIC, TMPFS_MAGIC};
-
-    let filesystem = nix::sys::statfs::statfs(root)
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "unsupported: failed to inspect transaction filesystem: {error}"
-            ))
-        })?
-        .filesystem_type();
-    if matches!(filesystem, EXT4_SUPER_MAGIC | TMPFS_MAGIC) {
-        Ok(())
-    } else {
-        model_error(format!(
-            "unsupported: durable Hashline transactions require a proven Linux ext-family or tmpfs filesystem; found {filesystem:?}"
-        ))
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn ensure_transaction_capability(_root: &Path) -> Result<(), FunctionCallError> {
-    model_error(
-        "unsupported: durable Hashline transactions currently require Linux ext-family or tmpfs filesystem semantics",
-    )
-}
-
-#[cfg(target_os = "linux")]
-fn acquire_transaction_lease(root: &Path) -> Result<nix::fcntl::Flock<File>, FunctionCallError> {
-    let directory =
-        File::open(root).map_err(|error| io_error("open transaction root", root, error))?;
-    nix::fcntl::Flock::lock(directory, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(
-        |(_, error)| {
-            FunctionCallError::RespondToModel(format!(
-                "transaction conflict: another commit owns the selected root: {error}"
-            ))
-        },
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn acquire_transaction_lease(_root: &Path) -> Result<File, FunctionCallError> {
-    model_error("unsupported: transaction coordination requires Linux")
-}
-
 fn ensure_missing(root: &Path, model_path: &str) -> Result<(), FunctionCallError> {
     validate_model_path(model_path)?;
     let target = root.join(model_path);
@@ -941,7 +873,10 @@ fn reject_conflicts(prepared: &[PreparedMutation]) -> Result<(), FunctionCallErr
     Ok(())
 }
 
-fn apply_prepared(root: &Path, prepared: &[PreparedMutation]) -> Result<(), FunctionCallError> {
+fn apply_patch_prepared(
+    root: &Path,
+    prepared: &[PreparedMutation],
+) -> Result<(), FunctionCallError> {
     let mut applied = Vec::new();
     for mutation in prepared {
         if let Err(error) = apply_one(root, mutation) {
@@ -1069,143 +1004,6 @@ fn sync_parent(path: &Path) -> Result<(), FunctionCallError> {
         .map_err(|error| io_error("sync parent directory", parent, error))
 }
 
-#[derive(Serialize, Deserialize)]
-struct Journal {
-    mutations: Vec<JournalMutation>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct JournalMutation {
-    kind: String,
-    path: String,
-    destination: Option<String>,
-    before: Option<String>,
-}
-
-fn journal_dir(root: &Path) -> PathBuf {
-    root.join(".nanocodex/hashline-transactions")
-}
-
-fn write_journal(
-    root: &Path,
-    id: &str,
-    prepared: &[PreparedMutation],
-) -> Result<(), FunctionCallError> {
-    let directory = journal_dir(root);
-    fs::create_dir_all(&directory)
-        .map_err(|error| io_error("create transaction storage", &directory, error))?;
-    let mutations = prepared
-        .iter()
-        .map(|mutation| match mutation {
-            PreparedMutation::Write { path, before, .. } => JournalMutation {
-                kind: "write".to_owned(),
-                path: path.clone(),
-                destination: None,
-                before: before.as_deref().map(encode_bytes),
-            },
-            PreparedMutation::Delete { path, before } => JournalMutation {
-                kind: "delete".to_owned(),
-                path: path.clone(),
-                destination: None,
-                before: Some(encode_bytes(before)),
-            },
-            PreparedMutation::Move {
-                source,
-                destination,
-                before,
-                ..
-            } => JournalMutation {
-                kind: "move".to_owned(),
-                path: source.clone(),
-                destination: Some(destination.clone()),
-                before: Some(encode_bytes(before)),
-            },
-        })
-        .collect();
-    let bytes = serde_json::to_vec(&Journal { mutations })
-        .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-    atomic_write(&directory, &format!("{id}.json"), &bytes, true)
-}
-
-fn recover_pending(root: &Path) -> Result<(), FunctionCallError> {
-    let directory = journal_dir(root);
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(io_error("scan transaction storage", &directory, error)),
-    };
-    for entry in entries.take(MAX_MUTATIONS) {
-        let entry =
-            entry.map_err(|error| io_error("scan transaction storage", &directory, error))?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            return model_error("transaction storage contains an unrecognized artifact");
-        }
-        let journal: Journal = serde_json::from_slice(
-            &fs::read(&path).map_err(|error| io_error("read journal", &path, error))?,
-        )
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!("invalid transaction journal: {error}"))
-        })?;
-        for mutation in journal.mutations.iter().rev() {
-            match (mutation.kind.as_str(), mutation.before.as_deref()) {
-                ("write" | "delete", Some(before)) => {
-                    atomic_write(root, &mutation.path, &decode_bytes(before)?, true)?;
-                }
-                ("write", None) => {
-                    if let Ok(target) = resolve_existing(root, &mutation.path) {
-                        fs::remove_file(&target)
-                            .map_err(|error| io_error("recover create", &target, error))?;
-                        sync_parent(&target)?;
-                    }
-                }
-                ("move", Some(before)) => {
-                    if let Some(destination) = &mutation.destination
-                        && let Ok(target) = resolve_existing(root, destination)
-                    {
-                        fs::remove_file(&target)
-                            .map_err(|error| io_error("recover move", &target, error))?;
-                        sync_parent(&target)?;
-                    }
-                    atomic_write(root, &mutation.path, &decode_bytes(before)?, true)?;
-                }
-                _ => return model_error("transaction journal contains an invalid mutation"),
-            }
-        }
-        fs::remove_file(&path)
-            .map_err(|error| io_error("remove recovered journal", &path, error))?;
-        sync_parent(&path)?;
-    }
-    cleanup_journal_dirs(root)
-}
-
-fn remove_journal(root: &Path, id: &str) -> Result<(), FunctionCallError> {
-    let path = journal_dir(root).join(format!("{id}.json"));
-    fs::remove_file(&path).map_err(|error| io_error("remove transaction journal", &path, error))?;
-    sync_parent(&path)?;
-    cleanup_journal_dirs(root)
-}
-
-fn cleanup_journal_dirs(root: &Path) -> Result<(), FunctionCallError> {
-    let directory = journal_dir(root);
-    if directory
-        .read_dir()
-        .is_ok_and(|mut entries| entries.next().is_none())
-    {
-        fs::remove_dir(&directory)
-            .map_err(|error| io_error("remove transaction storage", &directory, error))?;
-        let parent = root.join(".nanocodex");
-        if parent
-            .read_dir()
-            .is_ok_and(|mut entries| entries.next().is_none())
-        {
-            fs::remove_dir(&parent)
-                .map_err(|error| io_error("remove empty state directory", &parent, error))?;
-        }
-    }
-    Ok(())
-}
-
 fn prepared_digests(prepared: &[PreparedMutation]) -> Vec<Value> {
     prepared
         .iter()
@@ -1302,7 +1100,10 @@ fn read_definition() -> ToolDefinition {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {
+                    "type": "string",
+                    "description": "Non-empty workspace-relative file path. Absolute paths, current-directory components, and parent traversal are rejected."
+                },
                 "start_line": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": HARD_READ_MAX_LINES}
@@ -1320,7 +1121,10 @@ fn block_definition() -> ToolDefinition {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {
+                    "type": "string",
+                    "description": "Non-empty workspace-relative file path. Absolute paths, current-directory components, and parent traversal are rejected."
+                },
                 "anchor": {"type": "string"},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": HARD_BLOCK_MAX_LINES}
             },
@@ -1333,14 +1137,26 @@ fn block_definition() -> ToolDefinition {
 fn patch_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__patch",
-        "Apply a complete hash-anchored routine patch. Supports line/range/block edits, sectioned creates, REM, MV, dry runs, and validation before the first write. Routine multi-file commits are not crash-atomic; use hashline__transaction for recoverable batches.",
+        "Apply a complete hash-anchored routine patch. Existing files require [path]#HASH sections copied from hashline__read. Supports line/range/block edits, sectioned creates, REM, MV, and dry runs. Routine multi-file commits are not crash-atomic; use hashline__transaction for recoverable batches.",
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "patch": {"type": "string"},
-                "dry_run": {"type": "boolean"},
-                "create": {"type": "boolean"}
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative default file path. Absolute paths and parent traversal are rejected."
+                },
+                "patch": {
+                    "type": "string",
+                    "description": "Complete Hashline program. For an existing file, start with the exact [path]#HASH header returned by hashline__read. Operations include SWAP 12:abcd:\n+replacement, SWAP 12:abcd..=14:ef01:\n+replacement, DEL 12:abcd, INS.PRE 12:abcd:\n+text, INS.POST 12:abcd:\n+text, INS.HEAD:\n+text, INS.TAIL:\n+text, and block forms using a line:hash@blockhash anchor. Prefix every payload line with +. With create=true, use [path] sections without #HASH. REM deletes an existing section; MV destination moves it. Example: [notes.txt]#0123abcd\nSWAP 2:f589:\n+bravo"
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Validate and preview every section without writing."
+                },
+                "create": {
+                    "type": "boolean",
+                    "description": "Create missing files from [path] sections without file hashes."
+                }
             },
             "required": ["path", "patch"],
             "additionalProperties": false
@@ -1360,7 +1176,10 @@ fn transaction_definition() -> ToolDefinition {
                     {"type": "object", "properties": {"type": {"const": "commit"}}, "required": ["type"], "additionalProperties": false},
                     {"type": "object", "properties": {"type": {"const": "commitPreviewed"}, "expectedPlanDigest": {"type": "string"}}, "required": ["type", "expectedPlanDigest"], "additionalProperties": false}
                 ]},
-                "root": {"type": "string"},
+                "root": {
+                    "type": "string",
+                    "description": "Workspace-relative transaction root directory. Omit or use \".\" for the workspace root; absolute paths and parent traversal are rejected."
+                },
                 "mutations": {"type": "array", "minItems": 1, "maxItems": MAX_MUTATIONS, "items": mutation_schema()}
             },
             "required": ["action", "mutations"],
@@ -1370,6 +1189,10 @@ fn transaction_definition() -> ToolDefinition {
 }
 
 fn mutation_schema() -> Value {
+    let path = json!({
+        "type": "string",
+        "description": "Non-empty path relative to the selected transaction root. Absolute paths, current-directory components, and parent traversal are rejected."
+    });
     let anchor = json!({"type": "object", "properties": {"line": {"type": "integer", "minimum": 1}, "expectedHash": {"type": "string"}}, "required": ["line", "expectedHash"], "additionalProperties": false});
     let expected = json!({"type": "object", "properties": {"exactDigest": {"type": "string"}}, "required": ["exactDigest"], "additionalProperties": false});
     let edits = json!({"type": "array", "items": {"oneOf": [
@@ -1379,10 +1202,10 @@ fn mutation_schema() -> Value {
         {"type": "object", "properties": {"type": {"const": "insertAfter"}, "anchor": anchor, "lines": {"type": "array", "items": {"type": "string"}}}, "required": ["type", "anchor", "lines"], "additionalProperties": false}
     ]}});
     json!({"oneOf": [
-        {"type": "object", "properties": {"type": {"const": "create"}, "path": {"type": "string"}, "contents": {"type": "string"}}, "required": ["type", "path", "contents"], "additionalProperties": false},
-        {"type": "object", "properties": {"type": {"const": "update"}, "path": {"type": "string"}, "expected": expected.clone(), "edits": edits.clone()}, "required": ["type", "path", "expected", "edits"], "additionalProperties": false},
-        {"type": "object", "properties": {"type": {"const": "delete"}, "path": {"type": "string"}, "expected": expected.clone()}, "required": ["type", "path", "expected"], "additionalProperties": false},
-        {"type": "object", "properties": {"type": {"const": "move"}, "source": {"type": "string"}, "expected": expected, "destination": {"type": "string"}, "edits": edits}, "required": ["type", "source", "expected", "destination", "edits"], "additionalProperties": false}
+        {"type": "object", "properties": {"type": {"const": "create"}, "path": path.clone(), "contents": {"type": "string"}}, "required": ["type", "path", "contents"], "additionalProperties": false},
+        {"type": "object", "properties": {"type": {"const": "update"}, "path": path.clone(), "expected": expected.clone(), "edits": edits.clone()}, "required": ["type", "path", "expected", "edits"], "additionalProperties": false},
+        {"type": "object", "properties": {"type": {"const": "delete"}, "path": path.clone(), "expected": expected.clone()}, "required": ["type", "path", "expected"], "additionalProperties": false},
+        {"type": "object", "properties": {"type": {"const": "move"}, "source": path.clone(), "expected": expected, "destination": path, "edits": edits}, "required": ["type", "source", "expected", "destination", "edits"], "additionalProperties": false}
     ]})
 }
 

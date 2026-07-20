@@ -1766,6 +1766,7 @@ dependencies = [
  "portable-pty",
  "reqwest 0.12.28",
  "rquickjs",
+ "rustix 1.1.4",
  "schemars",
  "serde",
  "serde_json",

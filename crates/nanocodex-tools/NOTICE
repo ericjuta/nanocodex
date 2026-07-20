@@ -1,0 +1,9 @@
+Nanocodex tools
+
+The Hashline implementation includes behavior adapted from OpenAI Codex.
+Copyright 2025 OpenAI. Licensed under the Apache License, Version 2.0.
+
+The canonical source reviewed for this adaptation is the sibling
+`codex/codex-rs` checkout at commit
+`eff2c761e2bf3c644730edf795a8055b00818e92`, principally its Hashline tool,
+transaction-engine, and Linux filesystem capability modules.

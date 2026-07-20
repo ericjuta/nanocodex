@@ -93,7 +93,7 @@ fn split_hashline_patch_sections_with_mode(
                 return Err(FunctionCallError::RespondToModel(message));
             }
             return Err(FunctionCallError::RespondToModel(format!(
-                "Hashline operation {line:?} appears before the first [path]#HASH section header"
+                "Hashline operation {line:?} appears before the first file section. Reread the target with hashline__read, copy its [path]#HASH header as the first line, then use an operation such as SWAP 12:abcd:\n+replacement."
             )));
         };
 

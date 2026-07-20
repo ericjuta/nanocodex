@@ -348,12 +348,12 @@ pub(super) fn apply_patch_contamination_message(line: &str) -> Option<String> {
             trimmed.to_string()
         };
         return Some(format!(
-            "apply_patch sentinel {preview:?} is not valid in hashline. File sections start with [path]#HASH. Use SWAP, DEL, INS.PRE, INS.POST, INS.HEAD, INS.TAIL, or block ops."
+            "apply_patch sentinel {preview:?} is not valid in Hashline. Reread the target with hashline__read, replace the sentinel with its [path]#HASH header, and use an operation such as SWAP 12:abcd:\n+replacement."
         ));
     }
     if trimmed.starts_with("@@ ") && trimmed.contains("@@") {
         return Some(
-            "unified-diff hunk header is not valid in hashline. Use SWAP, DEL, INS.PRE, INS.POST, INS.HEAD, INS.TAIL, or block ops."
+            "unified-diff hunk headers are not valid in Hashline. Reread the target with hashline__read, start with its [path]#HASH header, and replace the hunk with an operation such as SWAP 12:abcd..=14:ef01:\n+replacement."
                 .to_string(),
         );
     }
