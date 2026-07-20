@@ -1,5 +1,6 @@
 mod config;
 mod mcp;
+mod mpp;
 mod observability;
 mod run;
 mod subagents;
@@ -71,5 +72,46 @@ async fn main() -> Result<()> {
             let _observability = cli.observability.install(true, cli.agent.cwd())?;
             tui::run(cli.agent, cli.prompt).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRIVATE_KEY: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn mpp_flags_select_the_tui_transport() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "--api-key",
+            "test-key",
+            "--mpp",
+            "--tempo-private-key",
+            PRIVATE_KEY,
+        ])
+        .unwrap();
+
+        assert!(cli.command.is_none());
+        assert!(cli.agent.uses_mpp());
+    }
+
+    #[test]
+    fn mpp_flags_select_the_one_shot_transport() {
+        let cli = Cli::try_parse_from([
+            "nanocodex",
+            "--api-key",
+            "test-key",
+            "run",
+            "reply with ok",
+            "--mpp",
+            "--tempo-private-key",
+            PRIVATE_KEY,
+        ])
+        .unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Run(_))));
+        assert!(cli.agent.uses_mpp());
     }
 }

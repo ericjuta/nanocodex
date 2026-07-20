@@ -267,10 +267,11 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     let agent = configured.handle;
     let mut agent_events = configured.events;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
-    let _child_agents = configured.child_agents;
+    let child_agents = configured.child_agents;
+    let mpp_adapter = configured.mpp_adapter;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
-    spawn_agent_worker(agent, Arc::clone(&root_session_id), worker_rx, update_tx);
+    let worker = spawn_agent_worker(agent, Arc::clone(&root_session_id), worker_rx, update_tx);
 
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
     let mut input_events = EventStream::new();
@@ -283,19 +284,20 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
 
     submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
 
-    loop {
-        view_telemetry.observe(&ui.app);
-        let now = Instant::now();
-        if scheduler.is_due(now) {
-            let render_started = Instant::now();
-            terminal.draw(|frame| view::render(frame, &ui.app))?;
-            let presented_at = Instant::now();
-            scheduler.presented(presented_at);
-            stream_telemetry.frame_presented(render_started, presented_at, &ui.app);
-        }
+    let loop_result: Result<()> = async {
+        loop {
+            view_telemetry.observe(&ui.app);
+            let now = Instant::now();
+            if scheduler.is_due(now) {
+                let render_started = Instant::now();
+                terminal.draw(|frame| view::render(frame, &ui.app))?;
+                let presented_at = Instant::now();
+                scheduler.presented(presented_at);
+                stream_telemetry.frame_presented(render_started, presented_at, &ui.app);
+            }
 
-        let render_deadline = scheduler.deadline();
-        tokio::select! {
+            let render_deadline = scheduler.deadline();
+            tokio::select! {
             () = async {
                 if let Some(deadline) = render_deadline {
                     sleep_until(deadline.into()).await;
@@ -309,7 +311,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                     ui.update(UiAction::Terminal(event), &worker_tx)?,
                     &mut scheduler,
                 ) {
-                    return Ok(());
+                    break Ok(());
                 }
             }
             event = agent_events.recv(), if ui.agent_events_open => {
@@ -325,7 +327,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                     );
                 }
                 if apply_update(update, &mut scheduler) {
-                    return Ok(());
+                    break Ok(());
                 }
             }
             update = update_rx.recv(), if ui.worker_updates_open => {
@@ -344,16 +346,40 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                     );
                 }
                 if apply_update(update, &mut scheduler) {
-                    return Ok(());
+                    break Ok(());
                 }
             }
             _ = ticker.tick(), if ui.app.main.running || ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running) => {
                 if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
-                    return Ok(());
+                    break Ok(());
                 }
+            }
             }
         }
     }
+    .await;
+
+    // Restore the terminal before the paid session performs its close handshake.
+    drop(terminal);
+    drop(worker_tx);
+    drop(agent_events);
+    worker.abort();
+    let worker_result = worker.await;
+    if let Some(child_agents) = child_agents {
+        child_agents.shutdown().await;
+    }
+    let shutdown_result = if let Some(adapter) = mpp_adapter {
+        adapter.shutdown().await
+    } else {
+        Ok(())
+    };
+    loop_result?;
+    match worker_result {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(error).wrap_err("TUI agent worker failed"),
+    }
+    shutdown_result
 }
 
 fn submit_initial_prompt(
@@ -409,7 +435,7 @@ fn spawn_agent_worker(
     root_session_id: Arc<str>,
     mut commands: mpsc::UnboundedReceiver<WorkerCommand>,
     updates: mpsc::UnboundedSender<WorkerEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let (finished_tx, mut finished_rx) = mpsc::unbounded_channel::<FinishedTurn>();
         let mut worker = AgentWorker {
@@ -434,7 +460,7 @@ fn spawn_agent_worker(
                 }
             }
         }
-    });
+    })
 }
 
 struct AgentWorker {

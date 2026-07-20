@@ -2,7 +2,7 @@
 name = "nanocodex-bin"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+rust-version = "1.93"
 publish = false
 authors.workspace = true
 license.workspace = true
@@ -11,6 +11,7 @@ repository.workspace = true
 description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
 
 [dependencies]
+alloy-transport-mpp = { git = "https://github.com/tempoxyz/mpp-rs", rev = "0326f687e857063c8f3bb9fa21f8051f3935fc43" }
 clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
@@ -18,6 +19,7 @@ eyre.workspace = true
 futures-util.workspace = true
 nanocodex.workspace = true
 nanocodex-observability.workspace = true
+mpp = { git = "https://github.com/tempoxyz/mpp-rs", rev = "0326f687e857063c8f3bb9fa21f8051f3935fc43", default-features = false, features = ["tempo", "ws", "reqwest-rustls-tls"] }
 ratatui.workspace = true
 reqwest.workspace = true
 self-replace.workspace = true
@@ -26,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite.workspace = true
 tracing.workspace = true
 unicode-width.workspace = true
 

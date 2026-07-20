@@ -8,12 +8,14 @@ use eyre::{Result, eyre};
 use nanocodex::{AgentEvents, Nanocodex, Responses, Thinking, Tools};
 
 use crate::mcp::McpArgs;
+use crate::mpp::{MppAdapter, MppArgs};
 use crate::subagents::{self, ChildAgents};
 
 pub(crate) struct ConfiguredAgent {
     pub(crate) handle: Nanocodex,
     pub(crate) events: AgentEvents,
     pub(crate) child_agents: Option<Arc<ChildAgents>>,
+    pub(crate) mpp_adapter: Option<MppAdapter>,
 }
 
 #[derive(Args)]
@@ -84,6 +86,9 @@ pub(crate) struct AgentArgs {
 
     #[command(flatten)]
     mcp: McpArgs,
+
+    #[command(flatten)]
+    mpp: MppArgs,
 }
 
 impl AgentArgs {
@@ -91,12 +96,21 @@ impl AgentArgs {
         &self.cwd
     }
 
+    #[cfg(test)]
+    pub(crate) const fn uses_mpp(&self) -> bool {
+        self.mpp.is_enabled()
+    }
+
     pub(crate) fn build(self) -> Result<ConfiguredAgent> {
-        let api_key = self
-            .api_key
-            .ok_or_else(|| eyre!("--api-key or OPENAI_API_KEY is required"))?;
+        let mpp_enabled = self.mpp.is_enabled();
+        let api_key = match self.api_key {
+            Some(api_key) => api_key,
+            None if mpp_enabled => String::new(),
+            None => return Err(eyre!("--api-key or OPENAI_API_KEY is required")),
+        };
+        let (websocket_url, mpp_adapter) = self.mpp.start(self.websocket_url)?;
         let responses = Responses::builder()
-            .websocket_url(self.websocket_url)
+            .websocket_url(websocket_url)
             .api_base_url(self.api_base_url)
             .build();
         let mut tools = Tools::builder()
@@ -130,6 +144,7 @@ impl AgentArgs {
             handle,
             events,
             child_agents,
+            mpp_adapter,
         })
     }
 }

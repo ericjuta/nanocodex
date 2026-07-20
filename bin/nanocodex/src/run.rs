@@ -21,7 +21,7 @@ impl Run {
         let configured = config.build()?;
         let handle = configured.handle;
         let mut events = configured.events;
-        let result = async {
+        let run_result: Result<()> = async {
             for _ in 0..self.repeat {
                 let turn = handle.prompt(self.prompt.clone()).await?;
                 events.write_turn_jsonl(io::stdout()).await?;
@@ -31,9 +31,16 @@ impl Run {
         }
         .await;
         drop(handle);
+        drop(events);
         if let Some(child_agents) = configured.child_agents {
             child_agents.shutdown().await;
         }
-        result
+        let shutdown_result = if let Some(adapter) = configured.mpp_adapter {
+            adapter.shutdown().await
+        } else {
+            Ok(())
+        };
+        run_result?;
+        shutdown_result
     }
 }
