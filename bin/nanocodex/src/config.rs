@@ -4,7 +4,7 @@ use std::{
 };
 
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
-use eyre::Result;
+use eyre::{Result, eyre};
 use nanocodex::{AgentEvents, Nanocodex, Responses, Thinking, Tools};
 
 use crate::mcp::McpArgs;
@@ -25,7 +25,7 @@ pub(crate) struct AgentArgs {
         hide_env_values = true,
         value_parser = NonEmptyStringValueParser::new()
     )]
-    api_key: String,
+    api_key: Option<String>,
 
     /// Working directory exposed to the coding tools.
     #[arg(long, default_value = ".")]
@@ -92,6 +92,9 @@ impl AgentArgs {
     }
 
     pub(crate) fn build(self) -> Result<ConfiguredAgent> {
+        let api_key = self
+            .api_key
+            .ok_or_else(|| eyre!("--api-key or OPENAI_API_KEY is required"))?;
         let responses = Responses::builder()
             .websocket_url(self.websocket_url)
             .api_base_url(self.api_base_url)
@@ -104,7 +107,7 @@ impl AgentArgs {
         }
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
-        let builder = Nanocodex::builder(self.api_key)
+        let builder = Nanocodex::builder(api_key)
             .thinking(self.thinking)
             .workspace(self.cwd)
             .responses(responses);

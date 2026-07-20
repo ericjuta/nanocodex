@@ -16,6 +16,7 @@ use observability::ObservabilityArgs;
 #[command(
     version,
     about = "An interactive coding agent and headless JSONL runner",
+    args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
 struct Cli {

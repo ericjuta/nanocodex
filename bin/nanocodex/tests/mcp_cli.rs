@@ -20,6 +20,8 @@ async fn repeated_cli_turns_search_and_call_mcp_through_the_library() -> Result<
     let output = timeout(
         std::time::Duration::from_secs(30),
         Command::new(env!("CARGO_BIN_EXE_nanocodex"))
+            .current_dir(&workspace)
+            .env_remove("OPENAI_API_KEY")
             .arg("run")
             .arg("--api-key")
             .arg("test-key")
@@ -39,12 +41,12 @@ async fn repeated_cli_turns_search_and_call_mcp_through_the_library() -> Result<
     .await
     .map_err(|_| eyre!("CLI MCP stress harness exceeded 30 seconds"))??;
 
-    timeout(std::time::Duration::from_secs(5), server)
-        .await
-        .map_err(|_| eyre!("mock Responses server did not finish"))???;
     let stdout = String::from_utf8(output.stdout)?;
     let stderr = String::from_utf8(output.stderr)?;
     assert!(output.status.success(), "CLI failed:\n{stderr}\n{stdout}");
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
     let events = stdout
         .lines()
         .map(serde_json::from_str::<Value>)
