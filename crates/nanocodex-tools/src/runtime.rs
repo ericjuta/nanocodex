@@ -424,7 +424,7 @@ impl ToolRuntime {
         let workspace = workspace.into();
         let sessions = Arc::new(ShellSessions::new());
         let default_shell_name = sessions.default_shell_name();
-        let registry_workspace = workspace.clone();
+        let code_mode_workspace = workspace.clone();
         let mut handlers: Vec<Arc<dyn Tool>> = vec![
             Arc::new(shell::ExecCommandHandler::new(
                 workspace.clone(),
@@ -444,8 +444,8 @@ impl ToolRuntime {
             )));
         }
         Self {
-            registry: Arc::new(ToolRegistry::from_ordered(registry_workspace, handlers)),
-            code_mode: code_mode::CodeModeRuntime::new(),
+            registry: Arc::new(ToolRegistry::from_ordered(handlers)),
+            code_mode: code_mode::CodeModeRuntime::new(code_mode_workspace),
             default_shell_name,
         }
     }
@@ -482,7 +482,6 @@ impl ToolRuntime {
 
 #[derive(Clone)]
 pub(crate) struct ToolRegistry {
-    pub(crate) workspace: PathBuf,
     ordered: Vec<Arc<dyn Tool>>,
     definitions: Vec<ToolDefinition>,
     by_name: HashMap<Box<str>, usize>,
@@ -577,7 +576,7 @@ impl ToolRegistry {
         }
         metadata
     }
-    fn from_ordered(workspace: PathBuf, ordered: Vec<Arc<dyn Tool>>) -> Self {
+    fn from_ordered(ordered: Vec<Arc<dyn Tool>>) -> Self {
         let definitions = ordered.iter().map(|tool| tool.definition()).collect();
         let by_name = ordered
             .iter()
@@ -585,7 +584,6 @@ impl ToolRegistry {
             .map(|(index, tool)| (tool.name().into(), index))
             .collect();
         Self {
-            workspace,
             ordered,
             definitions,
             by_name,
