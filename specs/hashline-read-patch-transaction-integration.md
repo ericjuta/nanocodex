@@ -152,6 +152,13 @@ Success means:
   waiting versus immediate-conflict locks with an embedded consumer.
 - [x] (2026-07-20) Remove `apply_patch` after deterministic replacement tests;
   delete its parser, grammar, handler, registrations, and tests.
+- [x] (2026-07-20) Run an interactive consumer E2E while implementing and
+  validating TUI modifier editing in commit `f6afb79`. Hashline read supplied
+  anchors and exact digests; two routine patch attempts failed before writes;
+  the equivalent typed transaction committed on its first well-shaped call;
+  rustfmt, focused tests, warnings-denied Clippy, and a clean worktree followed.
+  A follow-up update to this spec then used a properly formed routine patch for
+  both dry-run and commit successfully.
 - [ ] Run focused, workspace, example, native smoke, recovery, Harbor, and full
   milestone validation; inspect and record exact retained evidence here.
 - [ ] Complete outcomes, adopted source provenance, residual platform risks,
@@ -238,6 +245,41 @@ Success means:
   The remaining differences are metadata preservation, body-free structural
   manifests backed by staged artifacts, explicit commit/rollback states,
   immediate live rollback, isolated recovery, and async-runtime integration.
+
+- Observation: the interactive consumer trajectory exposed a routine-patch
+  adoption failure before any filesystem mutation. An `apply_patch`-shaped
+  program first returned `existing-file Hashline patches require a
+  [path]#HASH section header`; after that header was added, the next diagnostic
+  identified the incompatible sentinel and named the Hashline operations. The
+  required top-level `path` plus repeated section path/header also made the
+  relationship between the default target and patch sections non-obvious.
+  Evidence: the retained 2026-07-20 Codex trajectory producing consumer commit
+  `f6afb79`.
+
+- Observation: in the same trajectory, the typed transaction schema was more
+  discoverable than the routine patch language. A one-file `replaceLines`
+  commit and a later anchored `insertBefore` commit both succeeded on their
+  first well-shaped calls and returned old/new exact digests, bounded previews,
+  outcome, plan digest, and transaction identity. This is positive transaction
+  evidence but negative routine-patch adoption evidence, not a model-evaluation
+  gate.
+  A subsequent properly formed patch against this spec also passed dry-run and
+  committed on its first calls after the grammar was available.
+
+- Observation: the observed read result duplicated every retained line in both
+  compact anchored `content` and a structured `lines` array. A requested
+  220-line range was bounded to 173 lines with `next_start_line`, but the
+  duplicated representation still dominated the tool result. This conflicts
+  with the stated no-duplicate-output success criterion above.
+
+- Observation: the orchestrator-visible Hashline declarations in this session
+  omitted the per-property path and patch-program descriptions present in
+  Nanocodex's `ToolDefinition` schemas. Absolute `path` and `root` inputs
+  consequently produced the generic `Hashline paths must be non-empty and
+  workspace-relative` diagnostic without identifying the failing field.
+  Failures surfaced as untyped `Script error` strings, and one rejected call
+  inside `Promise.all` hid successful sibling results. The last behavior
+  belongs to the orchestration wrapper rather than the Hashline core.
 
 - Observation: Rustix exposes the required descriptor-relative Linux calls,
   `openat2` resolution policy, filesystem inspection, inode flags, locking, and
@@ -405,6 +447,13 @@ Success means:
   remain blocked on an API key.
   Implementation commit: `15ef6a6` (`feat(tools): integrate native hashline
   editing`) plus `0aff4fa` (`feat(hashline): harden recoverable transactions`).
+
+- Outcome: consumer commit `f6afb79` is the first retained hands-on editing
+  trajectory recorded after integration. It completed through read plus typed
+  transaction, preserved unrelated content, passed the focused TUI and Clippy
+  gates, and left no transaction artifacts. Its two patch calls failed before
+  mutation, while the follow-up spec update demonstrated successful read plus
+  routine-patch dry-run and commit.
 
 ## Context and Orientation
 
