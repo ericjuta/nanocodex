@@ -346,6 +346,76 @@ stable cache/session headers, custom JavaScript tools, unified events, and the
 browser host contract. Native cancellation remains owned by the Phase 2 turn
 lifecycle rather than a binding-specific alternate runtime.
 
+
+### Phase 4: native Hashline editing (deterministic gates complete)
+
+The native tool runtime now exposes bounded Hashline read, block discovery,
+routine patch, and previewed recoverable transaction tools as its only dedicated
+structured editing family. Transactions retain a descriptor-opened Linux root,
+resolve beneath it without symlinks, coordinate participating parent inodes in
+canonical order, bind plans to root identity and exact bytes, journal bounded
+before/after evidence, and recover interrupted create/update/delete/move batches
+without local unsafe code. Unsupported filesystems fail closed.
+
+The deterministic gate includes a complete Code Mode family round trip, mixed
+file operations, parent-replacement rejection, overlapping/disjoint
+cross-process coordination, recovery-conflict evidence retention, and a
+35-point subprocess interruption matrix. Workspace `just check`, packaged
+documentation, and `just release-check 0.1.0` pass. The historical live
+baseline, native model smoke, focused Harbor trials, and configured full eval
+remain pending because this checkout currently has no usable `OPENAI_API_KEY`;
+the selected holdout is pinned `terminal-bench/polyglot-c-py`.
+
+
+#### 4.1 Transaction semantics hardening (active)
+
+The compact native transaction capability is a safe baseline, not yet stronger
+than the local Codex implementation. Use
+`../codex/codex-rs@eff2c761e2bf3c644730edf795a8055b00818e92` as behavioral
+evidence for this slice without importing its app-server boundary or advancing
+the formal parity checkpoint below.
+
+Delivery order:
+
+1. [ ] Preserve restorable metadata across update, delete rollback, move, and
+   restart recovery. At minimum, executable and permission bits must survive
+   replacement; test metadata before and after both commit and rollback.
+2. [ ] Move complete before/after file contents out of the JSON manifest into
+   bounded, owner-only staged and backup artifacts. Keep the journal structural,
+   digest-bound, and free of user file bodies; reserve the required storage
+   before the first visible mutation.
+3. [ ] Add an explicit durable transaction state machine covering preparation,
+   commit, reverse-order rollback, recovery-required, cleanup, and completion.
+   A live apply failure must attempt rollback in the same call. Restart recovery
+   must distinguish a committed transaction from one that must roll back.
+4. [ ] Isolate recovery entries so one malformed or externally disturbed
+   transaction retains its evidence without starving independent valid
+   transactions. Reject duplicate transaction IDs, bind every artifact and
+   journal to the selected root and transaction identity, and leave a bounded
+   terminal receipt until cleanup is durably complete.
+5. [ ] Move blocking filesystem work off async executor threads and evaluate
+   waiting versus immediate-conflict lock policy with a concrete embedded
+   consumer. Keep workspace-relative paths, fail-closed filesystem negotiation,
+   and the existing public Hashline schemas unchanged unless evidence requires
+   a contract change.
+
+Gate:
+
+- Deterministic tests cover metadata-preserving commit and rollback, staged and
+  backup artifact bounds, manifests containing no file bodies, live forward
+  failure with immediate reverse rollback, every durable state across restart,
+  committed-versus-rollback recovery, malformed-entry isolation, duplicate
+  reservation rejection, cleanup idempotence, and parent replacement races.
+- The subprocess interruption matrix covers every new state and artifact
+  transition for create/update/delete/move, including rollback and cleanup
+  failures. Externally disturbed paths remain untouched and retain sufficient
+  evidence for manual recovery.
+- Existing read/patch byte preservation, plan digests, Code Mode integration,
+  tool descriptions, warnings-denied Clippy, workspace tests, public examples,
+  and release packaging remain green. Run the pinned native smoke and focused
+  Harbor holdout when credentials are available; reserve the full eval for the
+  completed hardening milestone.
+
 ## Performance policy
 
 - Optimize representative retained API/JSONL traces and real turns, not type

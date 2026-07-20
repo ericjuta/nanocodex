@@ -1,8 +1,9 @@
 # Integrate full Hashline read, patch, and recoverable transactions
 
 - Branch: `feature/hashline_transaction`
-- Status: Native end-to-end candidate implemented; live evaluation and durable
-  filesystem fault gates remain
+- Status: Deterministic native baseline passes; transaction semantics hardening
+  is active, and live model, Harbor, and configured evaluation gates await an
+  API key
 - Owner(s): Nanocodex maintainers and Codex
 - Created: 2026-07-20
 - Last Updated: 2026-07-20
@@ -118,8 +119,10 @@ Success means:
   `../codex/codex-rs` checkout, inspect its divergent relationship to the pinned
   checkpoint, classify the relevant Hashline path history, and record the
   adopted source manifest before implementation.
-- [ ] Record the current `apply_patch` model schema and run the frozen baseline
-  and holdout selection before changing model-visible tools.
+- [ ] Finish the reconstructed frozen `apply_patch` live baseline. The exact
+  pre-Hashline model schema is retained from `9ed472b`, and the pinned
+  `terminal-bench/polyglot-c-py` holdout was selected without candidate output,
+  but no usable `OPENAI_API_KEY` is available for the historical model run.
 - [x] (2026-07-20) Implement shared Hashline hashing, exact observation,
   bounded read, block discovery, patch parsing/application, and deterministic
   tests.
@@ -129,11 +132,24 @@ Success means:
   exact-digest and line-anchor validation, bounded journals, all-before restart
   recovery, Linux ext-family/tmpfs negotiation, unsupported-platform failure,
   and expose the transaction tool.
-- [ ] Complete descriptor-relative transaction traversal, replace coarse
-  root-level commit coordination with canonical disjoint-path coordination, and
-  run transition-by-transition subprocess fault injection before claiming the
-  full durable filesystem gate. Parent-directory sync ordering and nonblocking
-  cross-runtime conflict handling are present in the candidate.
+- [x] (2026-07-20) Complete safe descriptor-relative transaction traversal,
+  canonical inode-ordered participating-parent coordination, root-identity plan
+  binding, casefold-aware capability negotiation, evidence-preserving recovery,
+  and subprocess fault injection across every durable create/update/delete/move
+  transition. Overlapping cross-process parents conflict while disjoint parents
+  proceed independently.
+- [ ] Preserve executable and permission metadata across commit, rollback, move,
+  and restart recovery.
+- [ ] Replace manifest-embedded before/after file bodies with bounded owner-only
+  staged and backup artifacts reserved before visible mutation.
+- [ ] Add explicit preparation, commit, rollback, recovery-required, cleanup,
+  and completion states; perform immediate reverse rollback on live failures
+  and distinguish committed recovery from rollback recovery.
+- [ ] Isolate malformed or externally disturbed recovery entries, reject
+  duplicate transaction reservations, bind every artifact to root and
+  transaction identity, and retain bounded terminal evidence through cleanup.
+- [ ] Move blocking filesystem work off async executor threads and evaluate
+  waiting versus immediate-conflict locks with an embedded consumer.
 - [x] (2026-07-20) Remove `apply_patch` after deterministic replacement tests;
   delete its parser, grammar, handler, registrations, and tests.
 - [ ] Run focused, workspace, example, native smoke, recovery, Harbor, and full
@@ -213,15 +229,28 @@ Success means:
   operations. Evidence: clean canonical `main` HEAD
   `eff2c761e2bf3c644730edf795a8055b00818e92` and path-scoped `git log`.
 
-- Observation: the first Nanocodex transaction candidate intentionally remains
-  short of the spec's strongest durability claim. It retains and syncs bounded
-  exact before evidence, recovers pending journals to all-before, and fails
-  closed outside Linux ext-family/tmpfs, but still uses ambient safe path APIs
-  and has not passed descriptor-race, cross-runtime coordination, directory
-  sync, or kill-at-every-transition tests. Do not describe this candidate as a
-  completed Milestone 4 capability. The candidate subsequently added safe
-  root-level commit leases and parent-directory sync ordering; descriptor-safe
-  mutation and exhaustive fault evidence remain the blocking differences.
+- Observation: the first Nanocodex transaction candidate intentionally fell
+  short of the spec's strongest durability claim. It retained and synced
+  bounded exact before evidence and recovered pending journals to all-before,
+  but used ambient path APIs and lacked cross-runtime coordination and
+  kill-at-every-transition evidence. Commit `0aff4fa` closed those
+  descriptor-race, coordination, sync-ordering, and interruption-test gaps.
+  The remaining differences are metadata preservation, body-free structural
+  manifests backed by staged artifacts, explicit commit/rollback states,
+  immediate live rollback, isolated recovery, and async-runtime integration.
+
+- Observation: Rustix exposes the required descriptor-relative Linux calls,
+  `openat2` resolution policy, filesystem inspection, inode flags, locking, and
+  sync operations through safe APIs. The completed capability therefore keeps
+  `unsafe_code = "forbid"` without weakening the selected filesystem contract.
+  Evidence: implementation commit `0aff4fa` and the packaged
+  `crates/nanocodex-tools/NOTICE`.
+
+- Observation: the local checkout has no repository `.env`, no exported
+  `OPENAI_API_KEY`, and no API-key value in the local Codex auth record. Offline
+  Harbor setup and all deterministic repository gates work, but a live native
+  smoke, historical baseline, focused trials, and `just eval` cannot make an
+  authenticated model call until the user supplies that credential.
 
 ## Decision Log
 
@@ -355,21 +384,27 @@ Success means:
   integration plan covering anchor-producing reads, block discovery, complete
   patch behavior, durable transactions, staged `apply_patch` removal, and model
   adoption evidence.
-  Remaining: canonical source review, baseline, all implementation, and all
-  validation milestones.
+  The canonical source review and baseline implementation are complete.
+  Remaining: transaction semantics hardening plus live baseline and
+  model/evaluation evidence.
 
 - Outcome: the native runtime now advertises the flat `hashline__read`,
   `hashline__find_block`, `hashline__patch`, and `hashline__transaction` family
   with closed schemas and no `apply_patch`. A deterministic Code Mode test
-  dispatches read, patch, read, preview, and commitPreviewed in one cell and
-  verifies final bytes and sidecar cleanup. Canonical parser behavior preserves
+  dispatches read, patch, refreshed reads, a mixed create/update/delete/move
+  preview, and commitPreviewed in one cell and verifies final bytes and sidecar
+  cleanup. Canonical parser behavior preserves
   BOM, mixed line endings, final-newline shape, compact anchors, block anchors,
   sectioned file operations, and bounded previews.
-  Remaining: complete Milestone 4's descriptor-relative durability, disjoint
-  coordination, and fault matrix, then run the frozen live baseline, holdout,
-  native smoke, Harbor, and configured evaluation gates.
+  Descriptor-relative traversal, disjoint coordination, and a 35-point mixed
+  mutation subprocess fault matrix now pass. The next hardening slice preserves
+  metadata, separates staged/backup bodies from structural journals, adds
+  explicit commit/rollback states with immediate live rollback, isolates
+  recovery entries, and removes blocking filesystem work from async executor
+  threads. Live baseline, native smoke, Harbor, and configured evaluation gates
+  remain blocked on an API key.
   Implementation commit: `15ef6a6` (`feat(tools): integrate native hashline
-  editing`).
+  editing`) plus `0aff4fa` (`feat(hashline): harden recoverable transactions`).
 
 ## Context and Orientation
 
@@ -1208,13 +1243,12 @@ Regression checks:
   Mitigation: keep artifacts bounded and clearly named, clean empty sidecars,
   document diagnosis, and never modify external `.gitignore` automatically.
 
-- Open question: which frozen existing multi-file Harbor task is the holdout?
-  Owner/next step: select and record it in Milestone 0 before candidate runs.
+- Resolved: the frozen holdout is pinned `terminal-bench/polyglot-c-py`, selected
+  from configured task metadata without inspecting a candidate trajectory.
 
-- Open question: what notice file and source attribution does the current
-  packaging/release process require for adapted canonical code?
-  Owner/next step: inspect packaging and license practice in Milestone 0 and
-  record the decision before copying source.
+- Resolved: adapted canonical behavior is attributed in
+  `crates/nanocodex-tools/NOTICE`, which is present in the generated crate
+  archive. The implementation remains under the workspace's Apache-2.0 option.
 
 ## Artifacts and Notes
 
@@ -1227,16 +1261,24 @@ Initial planning state:
     Required Codex checkout state: user-confirmed canonical sibling checkout
     Canonical checkout HEAD: eff2c761e2bf3c644730edf795a8055b00818e92 (clean main)
     Pinned-checkpoint relationship: divergent; pinned commit is not an ancestor
-    Baseline model run: not executed
-    Holdout: not selected
+    Baseline model schema: .nanocodex/evidence/hashline/baseline-9ed472b-model-specs.json
+    Baseline schema result: apply_patch present; Hashline absent
+    Baseline live model run: blocked; OPENAI_API_KEY unavailable
+    Holdout: terminal-bench/polyglot-c-py at the configured pinned dataset digest
     Nanocodex unsafe lint: unsafe_code = "forbid"
     Native implementation commit: 15ef6a6
-    Deterministic Hashline tests: 5 direct + 1 Code Mode family round trip passed
-    nanocodex-tools tests: 59 passed
-    Workspace tests: 159 passed, 3 ignored manual/isolated tests
+    Durable filesystem commit: 0aff4fa
+    Deterministic Hashline tests: 12 direct + 1 Code Mode family round trip passed
+    Durable fault matrix: 35 subprocess interruption points passed
+    nanocodex-tools tests: 65 passed, 2 ignored subprocess helpers
+    Workspace tests: 167 passed, 5 ignored manual/isolated/helper tests
+    Harbor adapter tests: 34 passed
     Workspace all-target Clippy: passed with warnings denied
     Public examples: compiled as workspace test targets
     Hashline unsafe/libc scan: no matches
+    just check: passed
+    just release-check 0.1.0: passed, including packaged docs
+    nanocodex-tools archive: NOTICE and transaction_fs.rs present
 
 Do not replace missing source/eval evidence with estimates. Update this section
 with exact source HEAD/classification, deterministic test counts, retained job
@@ -1254,3 +1296,13 @@ as each milestone completes.
   Code Mode and workspace validation, the user-confirmed `../codex/codex-rs`
   source path, and the remaining descriptor-relative durability, exhaustive
   fault-injection, and live evaluation gates.
+- 2026-07-20: Recorded durable filesystem commit `0aff4fa`, safe
+  descriptor-relative traversal, disjoint parent leases, root identity binding,
+  mixed-mutation subprocess fault coverage, packaged attribution, reconstructed
+  baseline schema, selected holdout, full offline repository/release gates, and
+  the missing API-key blocker for all remaining live evidence.
+- 2026-07-20: Compared the compact transaction baseline with local Codex
+  `eff2c761e2` and made the remaining semantics hardening explicit: metadata
+  preservation, staged/backup storage, durable transaction states, immediate
+  rollback, isolated recovery, reservations, and async-runtime integration.
+  This behavioral reference does not advance the formal Codex parity checkpoint.
