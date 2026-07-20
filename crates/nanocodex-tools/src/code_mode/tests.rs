@@ -545,6 +545,8 @@ text("done");
 async fn hashline_family_round_trips_through_code_mode() -> Result<()> {
     let workspace = temporary_workspace("hashline-family")?;
     std::fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")?;
+    std::fs::write(workspace.join("delete.txt"), "delete me\n")?;
+    std::fs::write(workspace.join("move.txt"), "move me\n")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
@@ -556,12 +558,25 @@ await tools.hashline__patch({
   patch: `${initial.header}\nSWAP 2:${initial.lines[1].hash}:\n+bravo`
 });
 const observed = await tools.hashline__read({path: "notes.txt"});
-const mutations = [{
-  type: "update",
-  path: "notes.txt",
-  expected: {exactDigest: observed.exactDigest},
-  edits: [{type: "replaceAll", contents: "final\n"}]
-}];
+const deleted = await tools.hashline__read({path: "delete.txt"});
+const moved = await tools.hashline__read({path: "move.txt"});
+const mutations = [
+  {
+    type: "update",
+    path: "notes.txt",
+    expected: {exactDigest: observed.exactDigest},
+    edits: [{type: "replaceAll", contents: "final\n"}]
+  },
+  {type: "create", path: "created.txt", contents: "created\n"},
+  {type: "delete", path: "delete.txt", expected: {exactDigest: deleted.exactDigest}},
+  {
+    type: "move",
+    source: "move.txt",
+    destination: "moved.txt",
+    expected: {exactDigest: moved.exactDigest},
+    edits: [{type: "replaceAll", contents: "moved\n"}]
+  }
+];
 const preview = await tools.hashline__transaction({action: {type: "preview"}, mutations});
 await tools.hashline__transaction({
   action: {type: "commitPreviewed", expectedPlanDigest: preview.planDigest},
@@ -574,7 +589,7 @@ text("done");
         .await;
 
     assert!(execution.success, "{}", execution_output(&execution));
-    assert_eq!(execution.nested_calls.len(), 5);
+    assert_eq!(execution.nested_calls.len(), 7);
     assert_eq!(
         execution
             .nested_calls
@@ -585,6 +600,8 @@ text("done");
             "hashline__read",
             "hashline__patch",
             "hashline__read",
+            "hashline__read",
+            "hashline__read",
             "hashline__transaction",
             "hashline__transaction"
         ]
@@ -592,6 +609,16 @@ text("done");
     assert_eq!(
         std::fs::read_to_string(workspace.join("notes.txt"))?,
         "final\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("created.txt"))?,
+        "created\n"
+    );
+    assert!(!workspace.join("delete.txt").exists());
+    assert!(!workspace.join("move.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("moved.txt"))?,
+        "moved\n"
     );
     assert!(!workspace.join(".nanocodex/hashline-transactions").exists());
     std::fs::remove_dir_all(workspace)?;

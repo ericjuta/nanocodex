@@ -1750,6 +1750,7 @@ dependencies = [
  "nix 0.30.1",
  "portable-pty",
  "reqwest 0.12.28",
+ "rustix 1.1.4",
  "schemars",
  "serde",
  "serde_json",
