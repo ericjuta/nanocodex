@@ -39,11 +39,25 @@ BTW question:
 ";
 
 enum WorkerCommand {
-    Prompt { target: PaneId, prompt: String },
-    Steer { target: PaneId, prompt: String },
-    Cancel { target: PaneId },
-    OpenBtw { id: u64, prompt: Option<String> },
-    CloseBtw { id: u64 },
+    Prompt {
+        target: PaneId,
+        prompt: String,
+    },
+    Steer {
+        target: PaneId,
+        id: u64,
+        prompt: String,
+    },
+    Cancel {
+        target: PaneId,
+    },
+    OpenBtw {
+        id: u64,
+        prompt: Option<String>,
+    },
+    CloseBtw {
+        id: u64,
+    },
 }
 
 enum WorkerEvent {
@@ -51,16 +65,18 @@ enum WorkerEvent {
         target: PaneId,
         error: Option<String>,
     },
-    SteerAccepted {
+    SteerAdmitted {
         target: PaneId,
-        prompt: String,
+        id: u64,
     },
     SteerQueued {
         target: PaneId,
+        id: u64,
         prompt: String,
     },
     SteerFailed {
         target: PaneId,
+        id: u64,
         error: String,
     },
     CancelAccepted {
@@ -96,6 +112,11 @@ struct BtwWorker {
 struct TrackedTurn {
     id: u64,
     control: TurnControl,
+}
+
+struct SteerRequest {
+    id: u64,
+    prompt: String,
 }
 
 impl BtwWorker {
@@ -330,9 +351,11 @@ fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
 fn handle_worker_update(app: &mut App, update: WorkerEvent) {
     match update {
         WorkerEvent::TurnFinished { target, error } => app.turn_finished(target, error),
-        WorkerEvent::SteerAccepted { target, prompt } => app.steer_accepted(target, prompt),
-        WorkerEvent::SteerQueued { target, prompt } => app.steer_queued(target, prompt),
-        WorkerEvent::SteerFailed { target, error } => app.steer_failed(target, error),
+        WorkerEvent::SteerAdmitted { target, id } => app.steer_admitted(target, id),
+        WorkerEvent::SteerQueued { target, id, prompt } => {
+            app.steer_queued(target, id, prompt);
+        }
+        WorkerEvent::SteerFailed { target, id, error } => app.steer_failed(target, id, error),
         WorkerEvent::CancelAccepted { target } => app.cancel_accepted(target),
         WorkerEvent::CancelFailed { target, error } => app.cancel_failed(target, error),
         WorkerEvent::BtwOpened { id } => app.btw_opened(id),
@@ -392,7 +415,7 @@ impl AgentWorker {
     async fn handle_command(&mut self, command: WorkerCommand) {
         match command {
             WorkerCommand::Prompt { target, prompt } => self.prompt(target, prompt).await,
-            WorkerCommand::Steer { target, prompt } => self.steer(target, prompt).await,
+            WorkerCommand::Steer { target, id, prompt } => self.steer(target, id, prompt).await,
             WorkerCommand::Cancel { target } => self.cancel(target).await,
             WorkerCommand::OpenBtw { id, prompt } => self.open_btw(id, prompt).await,
             WorkerCommand::CloseBtw { id } => {
@@ -444,14 +467,17 @@ impl AgentWorker {
         }
     }
 
-    async fn steer(&mut self, target: PaneId, prompt: String) {
+    async fn steer(&mut self, target: PaneId, steer_id: u64, prompt: String) {
         let turn = match target {
             PaneId::Main => {
                 steer_turn(
                     &self.root,
                     &self.main_turns,
                     target,
-                    prompt,
+                    SteerRequest {
+                        id: steer_id,
+                        prompt,
+                    },
                     &mut self.next_turn_id,
                     &self.finished,
                     &self.updates,
@@ -462,6 +488,7 @@ impl AgentWorker {
                 let Some(branch) = self.btw.as_mut().filter(|branch| branch.id == id) else {
                     drop(self.updates.send(WorkerEvent::SteerFailed {
                         target,
+                        id: steer_id,
                         error: "BTW branch is not available".to_owned(),
                     }));
                     return;
@@ -470,7 +497,10 @@ impl AgentWorker {
                     &branch.agent,
                     &branch.turns,
                     target,
-                    prompt,
+                    SteerRequest {
+                        id: steer_id,
+                        prompt,
+                    },
                     &mut self.next_turn_id,
                     &self.finished,
                     &self.updates,
@@ -593,21 +623,25 @@ async fn steer_turn(
     agent: &Nanocodex,
     turns: &VecDeque<TrackedTurn>,
     target: PaneId,
-    prompt: String,
+    request: SteerRequest,
     next_turn_id: &mut u64,
     finished: &mpsc::UnboundedSender<FinishedTurn>,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) -> Option<TrackedTurn> {
     for turn in turns {
-        match turn.control.steer(prompt.clone()).await {
+        match turn.control.steer(request.prompt.clone()).await {
             Ok(()) => {
-                drop(updates.send(WorkerEvent::SteerAccepted { target, prompt }));
+                drop(updates.send(WorkerEvent::SteerAdmitted {
+                    target,
+                    id: request.id,
+                }));
                 return None;
             }
             Err(NanocodexError::TurnNotSteerable) => {}
             Err(error) => {
                 drop(updates.send(WorkerEvent::SteerFailed {
                     target,
+                    id: request.id,
                     error: error.to_string(),
                 }));
                 return None;
@@ -618,9 +652,18 @@ async fn steer_turn(
     // state. If no retained capability is active, preserve this as a new turn.
     drop(updates.send(WorkerEvent::SteerQueued {
         target,
-        prompt: prompt.clone(),
+        id: request.id,
+        prompt: request.prompt.clone(),
     }));
-    start_turn(agent, target, prompt, next_turn_id, finished, updates).await
+    start_turn(
+        agent,
+        target,
+        request.prompt,
+        next_turn_id,
+        finished,
+        updates,
+    )
+    .await
 }
 
 async fn cancel_turn(
@@ -787,8 +830,8 @@ fn submit(
         Submission::Prompt(prompt) => {
             let target = app.focus;
             if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
-                if app.queue_steer(target, prompt.clone()) {
-                    send_command(commands, WorkerCommand::Steer { target, prompt })?;
+                if let Some(id) = app.queue_steer(target, prompt.clone()) {
+                    send_command(commands, WorkerCommand::Steer { target, id, prompt })?;
                 }
             } else if app.queue_prompt(target, prompt.clone()) {
                 send_command(commands, WorkerCommand::Prompt { target, prompt })?;
@@ -859,12 +902,19 @@ fn classify_submission(input: String) -> Submission {
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, time::Duration};
+
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-    use tokio::sync::mpsc;
+    use futures_util::{SinkExt, StreamExt};
+    use nanocodex::{Nanocodex, Responses, Thinking};
+    use serde_json::{Value, json};
+    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+    use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
-        BTW_BOUNDARY, RedrawPriority, Submission, UiAction, UiModel, UiUpdate, WorkerCommand,
-        classify_submission, handle_key, prepare_btw_prompt,
+        BTW_BOUNDARY, PaneId, RedrawPriority, Submission, UiAction, UiModel, UiUpdate,
+        WorkerCommand, WorkerEvent, classify_submission, handle_key, prepare_btw_prompt,
+        spawn_agent_worker,
     };
     use crate::tui::app::App;
 
@@ -926,6 +976,110 @@ mod tests {
         assert!(!ui.worker_updates_open);
     }
 
+    #[tokio::test]
+    async fn tui_worker_steer_becomes_a_user_item_at_the_next_model_boundary() -> eyre::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let (first_seen, first_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_first, release_first_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            let warmup = next_ws_json(&mut socket).await?;
+            assert_eq!(warmup["generate"], false);
+            send_ws_json(
+                &mut socket,
+                json!({
+                    "type": "response.completed",
+                    "response": { "id": "resp-warmup", "usage": null }
+                }),
+            )
+            .await?;
+
+            let initial = next_ws_json(&mut socket).await?;
+            assert_eq!(initial["previous_response_id"], "resp-warmup");
+            assert!(initial.to_string().contains("initial task"));
+            first_seen
+                .send(())
+                .map_err(|()| eyre::eyre!("initial request signal receiver dropped"))?;
+            release_first_rx
+                .await
+                .map_err(|_| eyre::eyre!("initial request release sender dropped"))?;
+            send_completed(&mut socket, "resp-initial", "initial draft").await?;
+
+            let steered = next_ws_json(&mut socket).await?;
+            assert_eq!(steered["previous_response_id"], "resp-initial");
+            assert_eq!(steered["input"].as_array().map(Vec::len), Some(1));
+            assert_eq!(steered["input"][0]["role"], "user");
+            assert_eq!(
+                steered["input"][0]["content"][0]["text"],
+                "steering correction"
+            );
+            send_completed(&mut socket, "resp-steered", "steered answer").await
+        });
+
+        let workspace = temporary_workspace("tui-steer")?;
+        let responses = Responses::builder().websocket_url(endpoint).build();
+        let (agent, mut events) = Nanocodex::builder("test-key")
+            .thinking(Thinking::Low)
+            .workspace(&workspace)
+            .responses(responses)
+            .session_id("tui-steer-test")
+            .build()?;
+        let (commands, worker_rx) = mpsc::unbounded_channel();
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        spawn_agent_worker(agent, worker_rx, updates);
+
+        commands.send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt: "initial task".to_owned(),
+        })?;
+        first_seen_rx.await?;
+        commands.send(WorkerCommand::Steer {
+            target: PaneId::Main,
+            id: 7,
+            prompt: "steering correction".to_owned(),
+        })?;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    update_rx.recv().await,
+                    Some(WorkerEvent::SteerAdmitted {
+                        target: PaneId::Main,
+                        id: 7
+                    })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .map_err(|_| eyre::eyre!("TUI worker did not acknowledge the steer"))?;
+        release_first
+            .send(())
+            .map_err(|()| eyre::eyre!("initial request release receiver dropped"))?;
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .ok_or_else(|| eyre::eyre!("agent events closed before run.steered"))?;
+                if event.kind == nanocodex::AgentEventKind::RunSteered {
+                    return eyre::Result::<()>::Ok(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| eyre::eyre!("steer did not reach the model boundary"))??;
+        timeout(Duration::from_secs(5), server)
+            .await
+            .map_err(|_| eyre::eyre!("mock Responses server did not finish"))???;
+        drop(commands);
+        std::fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
     #[test]
     fn second_escape_sends_cancel_for_the_focused_turn() {
         let (commands, mut worker) = mpsc::unbounded_channel();
@@ -945,5 +1099,67 @@ mod tests {
             })
         ));
         assert_eq!(app.input, "preserved draft");
+    }
+
+    async fn next_ws_json<S>(socket: &mut WebSocketStream<S>) -> eyre::Result<Value>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| eyre::eyre!("client closed before sending a request"))??;
+            if let Message::Text(text) = message {
+                return Ok(serde_json::from_str(text.as_str())?);
+            }
+        }
+    }
+
+    async fn send_completed<S>(
+        socket: &mut WebSocketStream<S>,
+        response_id: &str,
+        text: &str,
+    ) -> eyre::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        send_ws_json(
+            socket,
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": text }]
+                    }],
+                    "usage": null
+                },
+            }),
+        )
+        .await
+    }
+
+    async fn send_ws_json<S>(socket: &mut WebSocketStream<S>, value: Value) -> eyre::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        socket.send(Message::Text(value.to_string().into())).await?;
+        Ok(())
+    }
+
+    fn temporary_workspace(label: &str) -> eyre::Result<PathBuf> {
+        let path = std::env::temp_dir().join(format!(
+            "nanocodex-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
     }
 }

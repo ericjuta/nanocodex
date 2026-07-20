@@ -12,7 +12,7 @@ use super::app::{App, Conversation, PaneId};
 pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     let composer_height = composer_height(&app.input, area.width.saturating_sub(4));
-    let pending_height = pending_height(app.active_conversation());
+    let pending_height = pending_height(app);
     let [
         header_area,
         transcript_area,
@@ -59,7 +59,7 @@ pub(super) fn render(frame: &mut Frame<'_>, app: &App) {
             "Ask Nanocodex to inspect, edit, run, or explain this workspace.",
         );
     }
-    render_pending(frame, app.active_conversation(), pending_area);
+    render_pending(frame, app, pending_area);
     render_composer(frame, app, composer_area);
     render_footer(frame, app, footer_area);
 }
@@ -165,14 +165,16 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let queued = conversation
         .pending_turns
         .saturating_sub(usize::from(conversation.running));
-    let steering = conversation.pending_steers.len();
-    let queue = if queued == 0 && steering == 0 {
+    let steers = conversation.pending_steers.len();
+    let queue = if queued == 0 && steers == 0 {
         String::new()
     } else {
-        match (steering, queued) {
+        match (steers, queued) {
             (0, queued) => format!(" · {queued} queued"),
-            (steering, 0) => format!(" · {steering} steering"),
-            (steering, queued) => format!(" · {steering} steering · {queued} queued"),
+            (1, 0) => " · 1 steer".to_owned(),
+            (steers, 0) => format!(" · {steers} steers"),
+            (1, queued) => format!(" · 1 steer · {queued} queued"),
+            (steers, queued) => format!(" · {steers} steers · {queued} queued"),
         }
     };
     let help = if app.btw.is_some() {
@@ -192,8 +194,15 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn pending_height(conversation: &Conversation) -> u16 {
-    let count = conversation.pending_steers.len() + conversation.queued_prompts.len();
+fn conversation_pending_count(conversation: &Conversation) -> usize {
+    conversation.pending_steers.len() + conversation.queued_prompts.len()
+}
+
+fn pending_height(app: &App) -> u16 {
+    let main_count = conversation_pending_count(&app.main);
+    let count = app.btw.as_ref().map_or(main_count, |btw| {
+        main_count.max(conversation_pending_count(&btw.conversation))
+    });
     if count == 0 {
         0
     } else {
@@ -201,30 +210,69 @@ fn pending_height(conversation: &Conversation) -> u16 {
     }
 }
 
-fn render_pending(frame: &mut Frame<'_>, conversation: &Conversation, area: Rect) {
+fn render_pending(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
 
+    if let Some(btw) = &app.btw {
+        let [main_area, btw_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(area);
+        render_conversation_pending(
+            frame,
+            &app.main,
+            main_area,
+            " Main pending input ",
+            app.focus == PaneId::Main,
+        );
+        render_conversation_pending(
+            frame,
+            &btw.conversation,
+            btw_area,
+            " BTW pending input ",
+            app.focus == PaneId::Btw(btw.id),
+        );
+    } else {
+        render_conversation_pending(frame, &app.main, area, " Pending input ", true);
+    }
+}
+
+fn render_conversation_pending(
+    frame: &mut Frame<'_>,
+    conversation: &Conversation,
+    area: Rect,
+    title: &'static str,
+    focused: bool,
+) {
     let mut lines = Vec::new();
-    for prompt in &conversation.pending_steers {
+    for steer in &conversation.pending_steers {
+        let (label, color) = if steer.is_admitted() {
+            ("↳ steer   ", Color::Yellow)
+        } else {
+            ("… steer   ", Color::DarkGray)
+        };
         lines.push(Line::from(vec![
-            Span::styled("↳ steer  ", Style::default().fg(Color::Yellow)),
-            Span::raw(prompt_preview(prompt)),
+            Span::styled(label, Style::default().fg(color)),
+            Span::raw(prompt_preview(steer.prompt())),
         ]));
     }
     for prompt in &conversation.queued_prompts {
         lines.push(Line::from(vec![
-            Span::styled("⏳ next   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("⏳ queued ", Style::default().fg(Color::DarkGray)),
             Span::raw(prompt_preview(prompt)),
         ]));
     }
     lines.truncate(3);
 
     let block = Block::default()
-        .title(" Pending input ")
+        .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -300,10 +348,13 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         let mut app = App::new("/workspace".into());
         app.main.running = true;
-        assert!(app.queue_steer(
-            crate::tui::app::PaneId::Main,
-            "use the database implementation".to_owned()
-        ));
+        let steer_id = app
+            .queue_steer(
+                crate::tui::app::PaneId::Main,
+                "use the database implementation".to_owned(),
+            )
+            .unwrap();
+        app.steer_admitted(crate::tui::app::PaneId::Main, steer_id);
         assert!(app.queue_prompt(
             crate::tui::app::PaneId::Main,
             "write a final benchmark summary".to_owned()
@@ -312,10 +363,39 @@ mod tests {
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Enter steers · Tab queues"));
+        assert!(rendered.contains("Pending input"));
         assert!(rendered.contains("↳ steer"));
         assert!(rendered.contains("use the database implementation"));
-        assert!(rendered.contains("⏳ next"));
+        assert!(rendered.contains("⏳ queued"));
         assert!(rendered.contains("write a final benchmark summary"));
+    }
+
+    #[test]
+    fn btw_focus_keeps_main_steers_visible_in_their_own_pending_pane() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut app = App::new("/workspace".into());
+        app.main.running = true;
+        let btw_id = app.begin_btw();
+        let steer_id = app
+            .queue_steer(
+                crate::tui::app::PaneId::Main,
+                "main correction remains visible".to_owned(),
+            )
+            .unwrap();
+        app.steer_admitted(crate::tui::app::PaneId::Main, steer_id);
+        assert!(app.queue_prompt(
+            crate::tui::app::PaneId::Btw(btw_id),
+            "queued BTW follow-up".to_owned(),
+        ));
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Main pending input"));
+        assert!(rendered.contains("BTW pending input"));
+        assert!(rendered.contains("↳ steer"));
+        assert!(rendered.contains("main correction remains visible"));
+        assert!(rendered.contains("⏳ queued"));
+        assert!(rendered.contains("queued BTW follow-up"));
     }
 
     #[test]

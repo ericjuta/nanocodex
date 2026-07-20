@@ -20,6 +20,29 @@ pub(super) enum PaneId {
     Btw(u64),
 }
 
+pub(super) struct PendingSteer {
+    id: u64,
+    run_generation: u64,
+    prompt: String,
+    state: PendingSteerState,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PendingSteerState {
+    Submitting,
+    Admitted,
+}
+
+impl PendingSteer {
+    pub(super) fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub(super) fn is_admitted(&self) -> bool {
+        self.state == PendingSteerState::Admitted
+    }
+}
+
 pub(super) struct Conversation {
     pub(super) transcript: Transcript,
     pub(super) pending_turns: usize,
@@ -30,7 +53,9 @@ pub(super) struct Conversation {
     reasoning: String,
     pending_run_error: Option<String>,
     pub(super) queued_prompts: VecDeque<String>,
-    pub(super) pending_steers: VecDeque<String>,
+    pub(super) pending_steers: VecDeque<PendingSteer>,
+    run_generation: u64,
+    applied_steer_runs_waiting_for_ack: VecDeque<u64>,
 }
 
 impl Conversation {
@@ -46,6 +71,8 @@ impl Conversation {
             pending_run_error: None,
             queued_prompts: VecDeque::new(),
             pending_steers: VecDeque::new(),
+            run_generation: 0,
+            applied_steer_runs_waiting_for_ack: VecDeque::new(),
         }
     }
 
@@ -60,30 +87,42 @@ impl Conversation {
         self.scroll_from_bottom = 0;
     }
 
-    fn queue_steer(&mut self, prompt: String) {
-        self.pending_steers.push_back(prompt);
-        "Steer pending".clone_into(&mut self.status);
+    fn queue_steer(&mut self, id: u64, prompt: String) {
+        self.pending_steers.push_back(PendingSteer {
+            id,
+            run_generation: self.run_generation,
+            prompt,
+            state: PendingSteerState::Submitting,
+        });
+        "Submitting steer".clone_into(&mut self.status);
         self.scroll_from_bottom = 0;
     }
 
-    fn steer_accepted(&mut self, prompt: String) {
-        drop(self.pending_steers.pop_front());
-        self.transcript.push(TranscriptItem::User(prompt));
-        self.status = if self.running {
-            "Steer accepted".to_owned()
-        } else {
-            "Ready".to_owned()
+    fn steer_admitted(&mut self, id: u64) {
+        let Some(steer) = self.pending_steers.iter_mut().find(|steer| steer.id == id) else {
+            return;
         };
+        steer.state = PendingSteerState::Admitted;
+        let applied = self.reconcile_applied_steers();
+        if self.running {
+            self.status = if applied == 0 {
+                "Steer pending".to_owned()
+            } else {
+                "Steer applied".to_owned()
+            };
+        }
     }
 
-    fn steer_queued(&mut self, prompt: String) {
-        drop(self.pending_steers.pop_front());
+    fn steer_queued(&mut self, id: u64, prompt: String) {
+        self.remove_pending_steer(id);
         self.queue_prompt(prompt);
+        self.reconcile_applied_steers();
     }
 
-    fn steer_failed(&mut self, error: String) {
-        drop(self.pending_steers.pop_front());
+    fn steer_failed(&mut self, id: u64, error: String) {
+        self.remove_pending_steer(id);
         self.transcript.push(TranscriptItem::Error(error));
+        self.reconcile_applied_steers();
         self.status = if self.running {
             "Working".to_owned()
         } else {
@@ -105,13 +144,17 @@ impl Conversation {
                     self.transcript.push(TranscriptItem::User(prompt));
                 }
                 self.running = true;
+                self.run_generation = self.run_generation.saturating_add(1);
                 self.streamed_this_turn = false;
                 self.reasoning.clear();
                 self.pending_run_error = None;
                 "Thinking".clone_into(&mut self.status);
             }
             AgentEventKind::RunSteered => {
-                "Working".clone_into(&mut self.status);
+                self.applied_steer_runs_waiting_for_ack
+                    .push_back(self.run_generation);
+                self.reconcile_applied_steers();
+                "Steer applied".clone_into(&mut self.status);
             }
             AgentEventKind::AssistantDelta => {
                 if let Ok(payload) = event.decode_payload::<TextPayload>() {
@@ -165,6 +208,7 @@ impl Conversation {
                     self.transcript.push(TranscriptItem::Error(error));
                 }
                 self.running = false;
+                self.reconcile_applied_steers();
                 "Ready".clone_into(&mut self.status);
             }
             AgentEventKind::RunFailed => {
@@ -192,6 +236,7 @@ impl Conversation {
 
     fn run_failed(&mut self, event: &AgentEvent) {
         self.running = false;
+        self.reconcile_applied_steers();
         let cancelled = event
             .decode_payload::<TerminalPayload>()
             .is_ok_and(|payload| payload.status == "cancelled");
@@ -203,6 +248,44 @@ impl Conversation {
                 self.transcript.push(TranscriptItem::Error(error));
             }
             "Turn failed".clone_into(&mut self.status);
+        }
+    }
+
+    fn reconcile_applied_steers(&mut self) -> usize {
+        let mut applied = 0;
+        while let Some(run_generation) = self.applied_steer_runs_waiting_for_ack.front().copied() {
+            let Some(index) = self
+                .pending_steers
+                .iter()
+                .position(|steer| steer.run_generation == run_generation)
+            else {
+                break;
+            };
+            let Some(steer) = self.pending_steers.get(index) else {
+                break;
+            };
+            if !steer.is_admitted() {
+                break;
+            }
+            let Some(steer) = self.pending_steers.remove(index) else {
+                break;
+            };
+            self.transcript.push(TranscriptItem::User(steer.prompt));
+            let _ = self.applied_steer_runs_waiting_for_ack.pop_front();
+            applied += 1;
+        }
+        if !self.running {
+            self.pending_steers.retain(|steer| {
+                self.applied_steer_runs_waiting_for_ack
+                    .contains(&steer.run_generation)
+            });
+        }
+        applied
+    }
+
+    fn remove_pending_steer(&mut self, id: u64) {
+        if let Some(index) = self.pending_steers.iter().position(|steer| steer.id == id) {
+            drop(self.pending_steers.remove(index));
         }
     }
 
@@ -233,6 +316,7 @@ pub(super) struct App {
     history_cursor: Option<usize>,
     history_draft: String,
     next_btw_id: u64,
+    next_steer_id: u64,
     cancel_confirmation: Option<CancelConfirmation>,
 }
 
@@ -256,6 +340,7 @@ impl App {
             history_cursor: None,
             history_draft: String::new(),
             next_btw_id: 1,
+            next_steer_id: 1,
             cancel_confirmation: None,
         }
     }
@@ -475,6 +560,7 @@ impl App {
             conversation.pending_turns = 0;
             conversation.queued_prompts.clear();
             conversation.pending_steers.clear();
+            conversation.applied_steer_runs_waiting_for_ack.clear();
             conversation.running = false;
             "Fork failed".clone_into(&mut conversation.status);
         }
@@ -488,29 +574,29 @@ impl App {
         true
     }
 
-    pub(super) fn queue_steer(&mut self, target: PaneId, prompt: String) -> bool {
-        let Some(conversation) = self.conversation_mut(target) else {
-            return false;
-        };
-        conversation.queue_steer(prompt);
-        true
+    pub(super) fn queue_steer(&mut self, target: PaneId, prompt: String) -> Option<u64> {
+        self.conversation(target)?;
+        let id = self.next_steer_id;
+        self.next_steer_id = self.next_steer_id.saturating_add(1);
+        self.conversation_mut(target)?.queue_steer(id, prompt);
+        Some(id)
     }
 
-    pub(super) fn steer_accepted(&mut self, target: PaneId, prompt: String) {
+    pub(super) fn steer_admitted(&mut self, target: PaneId, id: u64) {
         if let Some(conversation) = self.conversation_mut(target) {
-            conversation.steer_accepted(prompt);
+            conversation.steer_admitted(id);
         }
     }
 
-    pub(super) fn steer_queued(&mut self, target: PaneId, prompt: String) {
+    pub(super) fn steer_queued(&mut self, target: PaneId, id: u64, prompt: String) {
         if let Some(conversation) = self.conversation_mut(target) {
-            conversation.steer_queued(prompt);
+            conversation.steer_queued(id, prompt);
         }
     }
 
-    pub(super) fn steer_failed(&mut self, target: PaneId, error: String) {
+    pub(super) fn steer_failed(&mut self, target: PaneId, id: u64, error: String) {
         if let Some(conversation) = self.conversation_mut(target) {
-            conversation.steer_failed(error);
+            conversation.steer_failed(id, error);
         }
     }
 
@@ -748,26 +834,61 @@ mod tests {
         let mut app = App::new(".".into());
         app.main.running = true;
 
-        assert!(app.queue_steer(PaneId::Main, "narrow the search".to_owned()));
+        let steer_id = app
+            .queue_steer(PaneId::Main, "narrow the search".to_owned())
+            .unwrap();
         assert!(app.queue_prompt(PaneId::Main, "then summarize".to_owned()));
         assert_eq!(app.main.pending_steers.len(), 1);
         assert_eq!(app.main.queued_prompts.len(), 1);
         assert_eq!(app.main.pending_turns, 1);
 
-        app.steer_accepted(PaneId::Main, "narrow the search".to_owned());
+        app.steer_admitted(PaneId::Main, steer_id);
+        assert_eq!(app.main.pending_steers.len(), 1);
+        assert!(app.main.transcript.is_empty());
+        assert_eq!(app.main.status, "Steer pending");
+
+        app.main.on_agent_event(&event(
+            AgentEventKind::RunSteered,
+            &json!({ "steer_index": 1, "instruction_bytes": 17 }),
+        ));
         assert!(app.main.pending_steers.is_empty());
+        assert_eq!(app.main.transcript.len(), 1);
+        assert_eq!(app.main.status, "Steer applied");
         assert_eq!(app.main.queued_prompts.len(), 1);
         assert_eq!(app.main.pending_turns, 1);
+    }
+
+    #[test]
+    fn run_steered_waits_for_a_racing_queue_ack_before_promoting_input() {
+        let mut app = App::new(".".into());
+        app.main.running = true;
+        let steer_id = app
+            .queue_steer(PaneId::Main, "race-safe steer".to_owned())
+            .unwrap();
+
+        app.main.on_agent_event(&event(
+            AgentEventKind::RunSteered,
+            &json!({ "steer_index": 1, "instruction_bytes": 15 }),
+        ));
+        assert_eq!(app.main.pending_steers.len(), 1);
+        assert!(app.main.transcript.is_empty());
+
+        app.steer_admitted(PaneId::Main, steer_id);
+        assert!(app.main.pending_steers.is_empty());
+        assert_eq!(app.main.transcript.len(), 1);
+        assert_eq!(app.main.status, "Steer applied");
     }
 
     #[test]
     fn steer_rejected_after_turn_completion_becomes_the_next_turn() {
         let mut app = App::new(".".into());
         app.main.running = true;
-        assert!(app.queue_steer(PaneId::Main, "one more constraint".to_owned()));
+        let steer_id = app
+            .queue_steer(PaneId::Main, "one more constraint".to_owned())
+            .unwrap();
 
         app.main.running = false;
-        app.steer_queued(PaneId::Main, "one more constraint".to_owned());
+        app.steer_queued(PaneId::Main, steer_id, "one more constraint".to_owned());
 
         assert!(app.main.pending_steers.is_empty());
         assert_eq!(
