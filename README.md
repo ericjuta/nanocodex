@@ -425,8 +425,12 @@ ordering rules.
 `#[tool]` turns an async Rust function into a typed tool and derives its input
 schema. `Tools::builder()` accepts generated or manual `Tool` implementations;
 `Mcp::builder()` adds deferred Streamable HTTP or stdio MCP providers. The model
-normally sees only Code Mode and its wait operation, then composes nested tools
-with generated JavaScript, including loops, conditionals, and `Promise.all`.
+sees Code Mode, its wait operation, and the native Hashline read/edit family by
+default. `Tools::builder().hashline(false)` keeps Hashline available to Code Mode
+while removing its standalone function declarations; `without_defaults()`
+removes the standalone family with the other default selections. Code Mode
+continues to compose nested tools with generated JavaScript, including loops,
+conditionals, and `Promise.all`.
 
 Code Mode prewarms one persistent Node host alongside the first model call and
 reuses it for the session. Cells receive one shared owned history snapshot;
