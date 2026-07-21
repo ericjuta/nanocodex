@@ -295,8 +295,10 @@ while the mainline continues. The fork inherits the last completed response ID
 plus complete tool results and applied steers after that response; partial model
 output and unmatched tool calls remain excluded. With local telemetry running,
 `/trace` opens Jaeger filtered to every turn in the focused main or `/btw`
-session. The headless `nanocodex run` adapter emits flushed JSONL for scripts
-and Harbor.
+session. The complete keybinding reference, retained Amp and Codex research, and
+prioritized Ratatui backlog live in
+[`docs/TUI_NOTES.md`](docs/TUI_NOTES.md). The headless `nanocodex run` adapter
+emits flushed JSONL for scripts and Harbor.
 
 To measure streaming cadence without recording response text, enable the shared
 transport/TUI timing target and JSON logs:
