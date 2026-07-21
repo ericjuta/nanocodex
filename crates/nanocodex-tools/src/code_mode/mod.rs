@@ -32,6 +32,7 @@ const INITIAL_YIELD: Duration = if cfg!(test) {
     Duration::from_secs(10)
 };
 const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
+const NESTED_YIELD_GRACE: Duration = Duration::from_secs(5);
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
 pub(crate) struct CodeModeRuntime {
@@ -95,6 +96,10 @@ struct OwnedToolContext {
 }
 
 enum CellUpdate {
+    NestedCallStarted {
+        name: String,
+        yield_after: Duration,
+    },
     NestedCall {
         id: u64,
         call: NestedToolCall,
@@ -309,6 +314,7 @@ impl CodeModeRuntime {
             .max_output_tokens
             .unwrap_or(context.output_token_budget)
             .max(1);
+        let extend_for_nested_calls = source.yield_time_ms.is_none();
         tracing::Span::current().record("output.max_tokens", output_token_budget);
         let context = ToolContext {
             output_token_budget,
@@ -335,6 +341,7 @@ impl CodeModeRuntime {
             started_at,
             yield_after,
             Some(output_token_budget),
+            extend_for_nested_calls,
         )
         .await;
         tracing::Span::current().record("running", running);
@@ -402,6 +409,7 @@ impl CodeModeRuntime {
             started_at,
             yield_time,
             Some(output_token_budget),
+            false,
         )
         .await;
         if running {
@@ -649,11 +657,14 @@ impl Drop for LiveCell {
     }
 }
 
+// Keep every lifecycle update in one exhaustive, order-preserving observation loop.
+#[allow(clippy::too_many_lines)]
 async fn observe_cell(
     cell: &mut LiveCell,
     started_at: Instant,
     yield_after: Duration,
     max_output_tokens: Option<usize>,
+    extend_for_nested_calls: bool,
 ) -> (CodeModeExecution, bool) {
     let mut nested_calls = Vec::new();
     let mut notifications = Vec::new();
@@ -674,6 +685,18 @@ async fn observe_cell(
             update = cell.updates.recv() => update,
         };
         match update {
+            Some(CellUpdate::NestedCallStarted {
+                name,
+                yield_after: nested_yield_after,
+            }) => {
+                maybe_extend_cell_yield(
+                    yield_timer.as_mut(),
+                    extend_for_nested_calls,
+                    yield_after,
+                    nested_yield_after,
+                    &name,
+                );
+            }
             Some(CellUpdate::NestedCall { id, call }) => nested_calls.push((id, call)),
             Some(CellUpdate::Notification(notification)) => notifications.push(notification),
             Some(CellUpdate::Yielded { content }) => {
@@ -752,6 +775,35 @@ async fn observe_cell(
             }
         }
     }
+}
+
+fn maybe_extend_cell_yield(
+    mut timer: std::pin::Pin<&mut tokio::time::Sleep>,
+    enabled: bool,
+    initial_yield_after: Duration,
+    nested_yield_after: Duration,
+    tool_name: &str,
+) {
+    if !enabled || nested_yield_after <= initial_yield_after {
+        return;
+    }
+    let Some(extended_deadline) = tokio::time::Instant::now()
+        .checked_add(nested_yield_after)
+        .and_then(|deadline| deadline.checked_add(NESTED_YIELD_GRACE))
+    else {
+        return;
+    };
+    if extended_deadline <= timer.deadline() {
+        return;
+    }
+    timer.as_mut().reset(extended_deadline);
+    tracing::info!(
+        target: "nanocodex_tools",
+        stage = "code_mode.yield_extended",
+        tool.name = tool_name,
+        nested.yield_ms = nested_yield_after.as_millis(),
+        "extended Code Mode yield for nested tool wait"
+    );
 }
 
 fn running_observation(
@@ -916,6 +968,12 @@ impl NodeHost {
                         RuntimeEvent::ToolCall {
                             id, name, input, ..
                         } => {
+                            if let Some(yield_after) = nested_tool_yield_after(&name, &input) {
+                                let _ = updates.send(CellUpdate::NestedCallStarted {
+                                    name: name.clone(),
+                                    yield_after,
+                                });
+                            }
                             pending_calls
                                 .push(execute_nested_call(tools, id, name, input, context).boxed());
                         }
@@ -1006,6 +1064,25 @@ impl NodeHost {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
     }
+}
+
+fn nested_tool_yield_after(name: &str, input: &Value) -> Option<Duration> {
+    let input = input.as_object()?;
+    let requested = input.get("yield_time_ms")?.as_u64()?;
+    let (minimum, maximum) = match name {
+        "write_stdin"
+            if input
+                .get("chars")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .is_empty() =>
+        {
+            (5_000, 300_000)
+        }
+        "exec_command" | "write_stdin" => (250, 30_000),
+        _ => return None,
+    };
+    Some(Duration::from_millis(requested.clamp(minimum, maximum)))
 }
 
 #[allow(clippy::too_many_arguments)]

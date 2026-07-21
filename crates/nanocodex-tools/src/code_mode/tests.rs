@@ -1,10 +1,13 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use eyre::{Result, eyre};
 use nanocodex_core::ResponseItem;
 use serde_json::Value;
 
-use super::{CodeModeExecution, NestedToolCall, parse_exec_source};
+use super::{
+    CellUpdate, CodeModeExecution, LiveCell, NestedToolCall, nested_tool_yield_after, observe_cell,
+    parse_exec_source,
+};
 use crate::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime, WebSearchConfig};
 
 #[tokio::test]
@@ -560,6 +563,122 @@ fn exec_pragma_rejects_unknown_fields() {
         .err()
         .expect("unknown pragma fields should fail");
     assert!(error.contains("only supports"));
+}
+
+#[test]
+fn nested_shell_yields_follow_the_handlers_bounds() {
+    assert_eq!(
+        nested_tool_yield_after(
+            "exec_command",
+            &serde_json::json!({ "yield_time_ms": 45_000 }),
+        ),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        nested_tool_yield_after(
+            "write_stdin",
+            &serde_json::json!({ "session_id": 1, "yield_time_ms": 120_000 }),
+        ),
+        Some(Duration::from_secs(120))
+    );
+    assert_eq!(
+        nested_tool_yield_after(
+            "write_stdin",
+            &serde_json::json!({
+                "session_id": 1,
+                "chars": "x",
+                "yield_time_ms": 120_000,
+            }),
+        ),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        nested_tool_yield_after(
+            "apply_patch",
+            &serde_json::json!({ "yield_time_ms": 30_000 })
+        ),
+        None
+    );
+}
+
+#[tokio::test]
+async fn default_cell_yield_extends_for_a_longer_nested_shell_wait() {
+    let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let (terminate, _terminate_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        updates_tx
+            .send(CellUpdate::NestedCallStarted {
+                name: "write_stdin".to_owned(),
+                yield_after: Duration::from_millis(40),
+            })
+            .expect("observer should receive the nested call");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        updates_tx
+            .send(CellUpdate::Completed {
+                content: Vec::new(),
+            })
+            .expect("observer should receive cell completion");
+    });
+    let mut cell = LiveCell {
+        id: 1,
+        output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+        updates,
+        terminate: Some(terminate),
+        task: Some(task),
+    };
+
+    let (execution, running) = observe_cell(
+        &mut cell,
+        std::time::Instant::now(),
+        Duration::from_millis(5),
+        None,
+        true,
+    )
+    .await;
+
+    assert!(!running);
+    assert!(execution.success);
+    assert!(execution_output(&execution).contains("Script completed"));
+    cell.join().await;
+}
+
+#[tokio::test]
+async fn explicit_cell_yield_is_not_extended_by_a_nested_shell_wait() {
+    let (updates_tx, updates) = tokio::sync::mpsc::unbounded_channel();
+    let (terminate, _terminate_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        updates_tx
+            .send(CellUpdate::NestedCallStarted {
+                name: "write_stdin".to_owned(),
+                yield_after: Duration::from_millis(40),
+            })
+            .expect("observer should receive the nested call");
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let _ = updates_tx.send(CellUpdate::Completed {
+            content: Vec::new(),
+        });
+    });
+    let mut cell = LiveCell {
+        id: 1,
+        output_token_budget: crate::DEFAULT_TOOL_OUTPUT_TOKENS,
+        updates,
+        terminate: Some(terminate),
+        task: Some(task),
+    };
+
+    let (execution, running) = observe_cell(
+        &mut cell,
+        std::time::Instant::now(),
+        Duration::from_millis(5),
+        None,
+        false,
+    )
+    .await;
+
+    assert!(running);
+    assert!(execution.success);
+    assert!(execution_output(&execution).contains("Script running with cell ID 1"));
+    cell.join().await;
 }
 
 #[test]

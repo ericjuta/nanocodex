@@ -115,14 +115,23 @@ than current behavior. With a persistent prewarmed host, three live `pwd`
 trials spent 8.9--9.8 ms in the shell and 11.0--12.9 ms in the complete
 top-level Code Mode call: 2.1--3.2 ms of bridge overhead.
 
-One interaction remains expensive. Fifty-five Code Mode cells reached the
+One interaction was expensive. Fifty-five Code Mode cells reached the
 outer default 10-second yield while a nested tool was still pending, and all
 55 required a later `wait` call. The model calls whose sole action was to issue
 that wait consumed 123.684 seconds of Responses API time (1.401 seconds p50,
 4.504 seconds p90), or 3.01% of total retained run time. The first ten seconds
 overlap real subprocess work and are not themselves wasted; the extra model
 round trip is. None of those yielded calls set the outer `@exec` pragma even
-when the nested tool requested a longer wait.
+when the nested tool requested a longer wait: 13 `exec_command` calls requested
+30 seconds, 41 `write_stdin` polls requested 30 seconds, and one poll requested
+20 seconds.
+
+The default outer cell now extends its deadline when those built-in shell tools
+explicitly request a longer nested wait, plus a bounded five-second scheduling
+and protocol grace. An explicit outer `@exec` pragma still wins. All 55 retained
+nested calls completed within that derived deadline, so trace replay projects
+that this removes all 55 wait-selection model calls without delaying ordinary
+10-second cells or changing caller-selected outer yields.
 
 ## Avoidable work found and removed
 
