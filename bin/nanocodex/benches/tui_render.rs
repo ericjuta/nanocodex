@@ -1,9 +1,10 @@
 use criterion::{criterion_group, criterion_main};
 
 mod tui {
-    use std::hint::black_box;
+    use std::{hint::black_box, sync::Arc, time::Instant};
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
+    use nanocodex::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
     use ratatui::{Terminal, backend::TestBackend};
 
     #[allow(dead_code, unused_imports)]
@@ -24,7 +25,19 @@ mod tui {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/view.rs"));
     }
 
+    #[allow(dead_code, unused_imports)]
+    mod terminal {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/terminal.rs"));
+    }
+
+    #[allow(dead_code, unused_imports)]
+    mod telemetry {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tui/telemetry.rs"));
+    }
+
     use app::App;
+    use telemetry::StreamTelemetry;
+    use terminal::DrawMetrics;
     use transcript::{ToolStatus, Transcript, TranscriptItem};
 
     #[derive(Clone, Copy)]
@@ -189,6 +202,49 @@ mod tui {
         });
     }
 
+    pub(super) fn stream_telemetry_benchmark(criterion: &mut Criterion) {
+        const DELTAS: u64 = 1_024;
+        let events = std::iter::once(AgentEventKind::RunStarted)
+            .chain(std::iter::repeat_n(
+                AgentEventKind::AssistantDelta,
+                usize::try_from(DELTAS).unwrap(),
+            ))
+            .enumerate()
+            .map(|(index, kind)| TimedAgentEvent {
+                event: AgentEvent {
+                    protocol_version: 1,
+                    request_id: Arc::from("benchmark-session"),
+                    seq: index as u64 + 1,
+                    kind,
+                    payload: serde_json::value::to_raw_value(&serde_json::json!({
+                        "text": "delta"
+                    }))
+                    .unwrap(),
+                },
+                timing: AgentEventTiming {
+                    emitted_ns: 0,
+                    source_received_ns: (kind == AgentEventKind::AssistantDelta).then_some(0),
+                },
+            })
+            .collect::<Vec<_>>();
+        let app = App::new("/workspace/nanocodex".into());
+        let mut group = criterion.benchmark_group("tui_stream_telemetry");
+        group.throughput(Throughput::Elements(DELTAS));
+        group.bench_function("apply_1024_and_present", |bencher| {
+            bencher.iter(|| {
+                let mut telemetry = StreamTelemetry::default();
+                for event in &events {
+                    let received = telemetry.event_received(app::PaneId::Main, event);
+                    telemetry.event_applied(received, true);
+                }
+                let now = Instant::now();
+                telemetry.frame_presented(now, now, DrawMetrics::default(), &app);
+                black_box(telemetry);
+            });
+        });
+        group.finish();
+    }
+
     pub(super) fn first_frame_benchmarks(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("tui_trace_first_frame");
         for shape in TRACE_SHAPES {
@@ -219,6 +275,7 @@ criterion_group!(
     benches,
     tui::render_benchmarks,
     tui::transcript_update_benchmark,
+    tui::stream_telemetry_benchmark,
     tui::first_frame_benchmarks
 );
 criterion_main!(benches);

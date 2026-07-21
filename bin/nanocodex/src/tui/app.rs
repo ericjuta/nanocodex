@@ -15,7 +15,7 @@ const MAX_REASONING_STATUS_CHARS: usize = 160;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 180;
 const CANCEL_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) enum PaneId {
     Main,
     Btw(u64),

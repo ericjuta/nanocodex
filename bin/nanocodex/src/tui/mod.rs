@@ -17,7 +17,7 @@ use crossterm::event::{
 };
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
-use nanocodex::{AgentEvent, AgentEvents, Nanocodex, NanocodexError, TurnControl};
+use nanocodex::{AgentEvent, AgentEvents, Nanocodex, NanocodexError, TimedAgentEvent, TurnControl};
 use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval, sleep_until},
@@ -66,6 +66,15 @@ enum WorkerCommand {
 }
 
 enum WorkerEvent {
+    TurnTraceStarted {
+        target: PaneId,
+        id: u64,
+        span: tracing::Span,
+    },
+    TurnTraceRejected {
+        target: PaneId,
+        id: u64,
+    },
     TurnFinished {
         target: PaneId,
         error: Option<String>,
@@ -101,7 +110,7 @@ enum WorkerEvent {
     },
     BtwAgentEvent {
         id: u64,
-        event: AgentEvent,
+        event: TimedAgentEvent,
     },
     BtwEventStreamClosed {
         id: u64,
@@ -288,10 +297,10 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
         let now = Instant::now();
         if scheduler.is_due(now) {
             let render_started = Instant::now();
-            terminal.draw(|frame| view::render(frame, &ui.app))?;
+            let draw_metrics = terminal.draw(|frame| view::render(frame, &ui.app))?;
             let presented_at = Instant::now();
             scheduler.presented(presented_at);
-            stream_telemetry.frame_presented(render_started, presented_at, &ui.app);
+            stream_telemetry.frame_presented(render_started, presented_at, draw_metrics, &ui.app);
         }
 
         let render_deadline = scheduler.deadline();
@@ -312,11 +321,13 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                     return Ok(());
                 }
             }
-            event = agent_events.recv(), if ui.agent_events_open => {
+            event = agent_events.recv_timed(), if ui.agent_events_open => {
                 let received = event
                     .as_ref()
-                    .and_then(|event| StreamTelemetry::event_received(PaneId::Main, event));
-                let action = event.map_or(UiAction::AgentStreamClosed, UiAction::Agent);
+                    .map(|event| stream_telemetry.event_received(PaneId::Main, event));
+                let action = event.map_or(UiAction::AgentStreamClosed, |event| {
+                    UiAction::Agent(event.event)
+                });
                 let update = ui.update(action, &worker_tx)?;
                 if let Some(received) = received {
                     stream_telemetry.event_applied(
@@ -329,9 +340,14 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                 }
             }
             update = update_rx.recv(), if ui.worker_updates_open => {
+                if update.as_ref().is_some_and(|update| {
+                    handle_worker_telemetry(update, &mut stream_telemetry)
+                }) {
+                    continue;
+                }
                 let received = update.as_ref().and_then(|update| match update {
                     WorkerEvent::BtwAgentEvent { id, event } => {
-                        StreamTelemetry::event_received(PaneId::Btw(*id), event)
+                        Some(stream_telemetry.event_received(PaneId::Btw(*id), event))
                     }
                     _ => None,
                 });
@@ -353,6 +369,20 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                 }
             }
         }
+    }
+}
+
+fn handle_worker_telemetry(update: &WorkerEvent, telemetry: &mut StreamTelemetry) -> bool {
+    match update {
+        WorkerEvent::TurnTraceStarted { target, id, span } => {
+            telemetry.register_turn(*target, *id, span.clone());
+            true
+        }
+        WorkerEvent::TurnTraceRejected { target, id } => {
+            telemetry.reject_turn(*target, *id);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -384,6 +414,7 @@ fn apply_update(update: UiUpdate, scheduler: &mut RenderScheduler) -> bool {
 fn handle_worker_update(app: &mut App, update: WorkerEvent) {
     match update {
         WorkerEvent::TurnFinished { target, error } => app.turn_finished(target, error),
+        WorkerEvent::TurnTraceStarted { .. } | WorkerEvent::TurnTraceRejected { .. } => {}
         WorkerEvent::SteerAdmitted { target, id } => app.steer_admitted(target, id),
         WorkerEvent::SteerQueued { target, id, prompt } => {
             app.steer_queued(target, id, prompt);
@@ -394,7 +425,7 @@ fn handle_worker_update(app: &mut App, update: WorkerEvent) {
         WorkerEvent::BtwOpened { id, request_id } => app.btw_opened(id, request_id),
         WorkerEvent::BtwOpenFailed { id, error } => app.btw_failed(id, error),
         WorkerEvent::BtwAgentEvent { id, event } => {
-            let _ = app.on_agent_event(PaneId::Btw(id), &event);
+            let _ = app.on_agent_event(PaneId::Btw(id), &event.event);
         }
         WorkerEvent::BtwEventStreamClosed { id } => {
             if app.btw_id() == Some(id) {
@@ -684,6 +715,11 @@ async fn start_turn(
         status = tracing::field::Empty,
         duration_ns = tracing::field::Empty,
     );
+    drop(updates.send(WorkerEvent::TurnTraceStarted {
+        target: target.pane,
+        id,
+        span: span.clone(),
+    }));
     match agent.prompt(prompt).instrument(span.clone()).await {
         Ok(turn) => {
             *next_turn_id = next_turn_id.saturating_add(1);
@@ -714,6 +750,10 @@ async fn start_turn(
             Some(TrackedTurn { id, control, span })
         }
         Err(error) => {
+            drop(updates.send(WorkerEvent::TurnTraceRejected {
+                target: target.pane,
+                id,
+            }));
             span.record("status", "rejected");
             span.record("otel.status_code", "ERROR");
             span.record(
@@ -876,7 +916,7 @@ fn forward_btw_events(
     updates: mpsc::UnboundedSender<WorkerEvent>,
 ) {
     tokio::spawn(async move {
-        while let Some(event) = events.recv().await {
+        while let Some(event) = events.recv_timed().await {
             if updates
                 .send(WorkerEvent::BtwAgentEvent { id, event })
                 .is_err()

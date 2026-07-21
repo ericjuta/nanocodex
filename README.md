@@ -347,19 +347,21 @@ prioritized Ratatui backlog live in
 [`docs/TUI_NOTES.md`](docs/TUI_NOTES.md). The headless `nanocodex run` adapter
 emits flushed JSONL for scripts and Harbor.
 
-To measure streaming cadence without recording response text, enable the shared
-transport/TUI timing target and JSON logs:
+`just run-otel` exports compact per-turn streaming summaries alongside the full
+agent trace. When diagnosing a jagged stream, opt into the individual correlated
+API-delta, TUI-application, and presented-frame records:
 
 ```sh
-nanocodex --log-format json \
-  --log-filter 'warn,nanocodex=info,nanocodex_service=info,nanocodex_stream_timing=trace'
+just run-otel-detail
 ```
 
-The TUI log at `.nanocodex/logs/tui.log` then correlates each event's request ID
-and sequence across `api_delta_emitted`, `tui_event_received`,
-`tui_event_applied`, and `frame_presented`. Frame records include coalesced delta
-count, payload byte count, render time, and first/last-event-to-presentation
-latency; prompt and response bodies are never logged.
+The TUI log at `.nanocodex/logs/tui.log` correlates each request and event across
+socket receipt, agent emission, TUI receipt, state application, frame
+coalescing, Ratatui changed cells, terminal output bytes, and final flush.
+Detailed mode is intentionally opt-in because long responses can create
+thousands of records. Use `just bench-stream` for the focused event-delivery,
+transcript-update, and steady-frame regression gate. See
+[`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the full trace contract.
 
 The workspace also contains thin [Python](bindings/python),
 [Node](examples/node), and [browser Worker](examples/react-vite) consumers.

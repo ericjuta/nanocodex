@@ -1296,6 +1296,12 @@ fn model_call_span(
         cached_input_tokens = tracing::field::Empty,
         output_tokens = tracing::field::Empty,
         reasoning.summary_count = tracing::field::Empty,
+        time_to_first_event_ns = tracing::field::Empty,
+        time_to_first_output_ns = tracing::field::Empty,
+        stream.display_delta.count = tracing::field::Empty,
+        stream.display_delta.bytes = tracing::field::Empty,
+        stream.inter_delta_gap.max_ns = tracing::field::Empty,
+        stream.inter_delta_stall_100ms.count = tracing::field::Empty,
     )
 }
 
@@ -1326,6 +1332,26 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
         span.record("assistant.output.bytes", message.len());
     }
     span.record("reasoning.summary_count", summary_count);
+    span.record("time_to_first_event_ns", response.time_to_first_event_ns);
+    if let Some(time_to_first_output_ns) = response.time_to_first_output_ns {
+        span.record("time_to_first_output_ns", time_to_first_output_ns);
+    }
+    span.record(
+        "stream.display_delta.count",
+        response.pipeline_stats.display_delta_count,
+    );
+    span.record(
+        "stream.display_delta.bytes",
+        response.pipeline_stats.display_delta_bytes,
+    );
+    span.record(
+        "stream.inter_delta_gap.max_ns",
+        response.pipeline_stats.inter_delta_gap_max_ns,
+    );
+    span.record(
+        "stream.inter_delta_stall_100ms.count",
+        response.pipeline_stats.inter_delta_stall_100ms_count,
+    );
 }
 
 fn strip_item_id(mut item: ResponseItem) -> ResponseItem {

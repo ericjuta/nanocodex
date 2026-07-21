@@ -25,6 +25,12 @@ Or start Jaeger and launch the interactive TUI with telemetry in one command:
 just run-otel
 ```
 
+`just run-otel` exports one compact streaming summary on each `tui.turn`. Use
+`just run-otel-detail` when diagnosing a jagged stream; it additionally exports
+every correlated API-delta, TUI-application, and presented-frame timing record.
+The detailed mode is intentionally opt-in because a long response can produce
+thousands of trace records.
+
 `just` loads `OPENAI_API_KEY` from the repository `.env`. Interactive local
 logs are written to `.nanocodex/logs/tui.log`; exported traces appear in
 Jaeger at <http://localhost:16686> under the `nanocodex` service.
@@ -76,11 +82,21 @@ in the same trace:
 
 ```text
 tui.turn
-└── agent.turn
-    ├── model.call
-    ├── tool.call
-    └── model.call
+├── agent.turn
+│   ├── model.call
+│   ├── tool.call
+│   └── model.call
+└── event: tui.stream.completed
 ```
+
+`responses.attempt` measures socket-pump queue time, JSON parsing/decoding and
+event-emission time, display-delta bytes, inter-delta gaps, and 50/100/250 ms
+stall counts. The TUI summary continues the same event timestamps through agent
+delivery, state application, frame coalescing, Ratatui changed cells, terminal
+output bytes, and source-to-terminal-flush latency. Main and `/btw` turns keep
+independent aggregates even when both panes are presented by one terminal
+frame. Select `nanocodex_stream_timing=trace` (or use
+`just run-otel-detail`) for the individual correlated records.
 
 Code Mode promise fan-out and attached child agents appear as overlapping
 sibling branches under the active cell/tool operation. A child or follow-up

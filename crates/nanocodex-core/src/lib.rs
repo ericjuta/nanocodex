@@ -10,7 +10,10 @@ pub use auth::{
     OpenAiAuth, OpenAiAuthError, OpenAiAuthFuture, OpenAiAuthMode, OpenAiAuthSnapshot,
     OpenAiAuthSource,
 };
-pub use events::{AgentEvent, AgentEventKind, AgentEvents, EventError, EventSink};
+pub use events::{
+    AgentEvent, AgentEventKind, AgentEventTiming, AgentEvents, EventError, EventSink,
+    TimedAgentEvent, monotonic_now_ns,
+};
 pub use responses::{
     AgentMessageContent, ContentItem, CustomToolFormat, FunctionOutputBody, FunctionOutputContent,
     InternalMessageMetadata, ItemStatus, JsonSchema, JsonValue, LocalShellAction,

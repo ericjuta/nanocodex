@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use nanocodex_core::{
     AgentEventKind, ContentItem, EventSink, MessagePhase, MessageRole, ResponseItem,
+    monotonic_now_ns,
     responses::{ServerEvent, Usage},
 };
 use serde::Serialize;
@@ -47,6 +48,14 @@ pub struct ResponsePipelineStats {
     pub parse_duration_ns: u64,
     pub emit_duration_ns: u64,
     pub decode_duration_ns: u64,
+    pub socket_queue_duration_ns: u64,
+    pub display_delta_count: u64,
+    pub display_delta_bytes: u64,
+    pub inter_delta_gap_duration_ns: u64,
+    pub inter_delta_gap_max_ns: u64,
+    pub inter_delta_stall_50ms_count: u64,
+    pub inter_delta_stall_100ms_count: u64,
+    pub inter_delta_stall_250ms_count: u64,
 }
 
 pub struct CodeCall {
@@ -99,6 +108,7 @@ struct StreamTiming {
     first_event_ns: Option<u64>,
     first_output_ns: Option<u64>,
     pipeline: ResponsePipelineStats,
+    last_display_delta_received_ns: Option<u64>,
 }
 
 impl StreamTiming {
@@ -114,9 +124,53 @@ impl StreamTiming {
                 parse_duration_ns: 0,
                 emit_duration_ns: 0,
                 decode_duration_ns: 0,
+                socket_queue_duration_ns: 0,
+                display_delta_count: 0,
+                display_delta_bytes: 0,
+                inter_delta_gap_duration_ns: 0,
+                inter_delta_gap_max_ns: 0,
+                inter_delta_stall_50ms_count: 0,
+                inter_delta_stall_100ms_count: 0,
+                inter_delta_stall_250ms_count: 0,
             },
+            last_display_delta_received_ns: None,
         }
     }
+
+    fn record_display_delta(&mut self, received_ns: u64, bytes: usize) {
+        self.pipeline.display_delta_count = self.pipeline.display_delta_count.saturating_add(1);
+        self.pipeline.display_delta_bytes = self
+            .pipeline
+            .display_delta_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        if let Some(previous_ns) = self.last_display_delta_received_ns {
+            let gap_ns = received_ns.saturating_sub(previous_ns);
+            self.pipeline.inter_delta_gap_duration_ns = self
+                .pipeline
+                .inter_delta_gap_duration_ns
+                .saturating_add(gap_ns);
+            self.pipeline.inter_delta_gap_max_ns = self.pipeline.inter_delta_gap_max_ns.max(gap_ns);
+            self.pipeline.inter_delta_stall_50ms_count = self
+                .pipeline
+                .inter_delta_stall_50ms_count
+                .saturating_add(u64::from(gap_ns >= 50_000_000));
+            self.pipeline.inter_delta_stall_100ms_count = self
+                .pipeline
+                .inter_delta_stall_100ms_count
+                .saturating_add(u64::from(gap_ns >= 100_000_000));
+            self.pipeline.inter_delta_stall_250ms_count = self
+                .pipeline
+                .inter_delta_stall_250ms_count
+                .saturating_add(u64::from(gap_ns >= 250_000_000));
+        }
+        self.last_display_delta_received_ns = Some(received_ns);
+    }
+}
+
+struct ReceivedServerEvent {
+    event: ServerEvent,
+    received_ns: u64,
+    api_event_seq: u64,
 }
 
 pub(crate) async fn receive(
@@ -130,7 +184,8 @@ pub(crate) async fn receive(
     let mut timing = StreamTiming::new(started_at);
 
     loop {
-        match next_event(socket, events, "generation", call_index, &mut timing).await? {
+        let received = next_event(socket, events, "generation", call_index, &mut timing).await?;
+        match received.event {
             ServerEvent::OutputItemAdded { output_index, item } => {
                 let Some(output_index) = output_index else {
                     continue;
@@ -150,9 +205,10 @@ pub(crate) async fn receive(
                 output_index,
                 delta,
             } => {
-                let payload_bytes = delta.len();
                 let item = output_index.and_then(|index| assistant_items.get(&index));
-                let seq = events.emit_with_sequence(
+                emit_display_delta(
+                    events,
+                    &mut timing,
                     AgentEventKind::AssistantDelta,
                     AssistantTextDelta {
                         model_call_index: call_index,
@@ -160,38 +216,25 @@ pub(crate) async fn receive(
                         phase: item.and_then(|item| item.phase),
                         text: &delta,
                     },
+                    received.received_ns,
+                    received.api_event_seq,
+                    delta.len(),
                 )?;
-                tracing::trace!(
-                    target: "nanocodex_stream_timing",
-                    stage = "api_delta_emitted",
-                    request.id = events.request_id(),
-                    event.seq = seq,
-                    event.kind = "assistant.delta",
-                    model.call.index = call_index,
-                    payload.bytes = payload_bytes,
-                    "Responses text delta entered the agent event stream"
-                );
             }
             ServerEvent::ReasoningSummaryTextDelta { delta }
             | ServerEvent::ReasoningSummaryDelta { delta } => {
-                let payload_bytes = delta.len();
-                let seq = events.emit_with_sequence(
+                emit_display_delta(
+                    events,
+                    &mut timing,
                     AgentEventKind::ReasoningSummaryDelta,
                     TextDelta {
                         model_call_index: call_index,
                         text: &delta,
                     },
+                    received.received_ns,
+                    received.api_event_seq,
+                    delta.len(),
                 )?;
-                tracing::trace!(
-                    target: "nanocodex_stream_timing",
-                    stage = "api_delta_emitted",
-                    request.id = events.request_id(),
-                    event.seq = seq,
-                    event.kind = "reasoning.summary.delta",
-                    model.call.index = call_index,
-                    payload.bytes = payload_bytes,
-                    "Responses reasoning delta entered the agent event stream"
-                );
             }
             ServerEvent::OutputItemDone { item } => {
                 emit_assistant_message(events, call_index, &item)?;
@@ -221,6 +264,31 @@ pub(crate) async fn receive(
             _ => {}
         }
     }
+}
+
+fn emit_display_delta<P: Serialize>(
+    events: &EventSink,
+    timing: &mut StreamTiming,
+    kind: AgentEventKind,
+    payload: P,
+    received_ns: u64,
+    api_event_seq: u64,
+    payload_bytes: usize,
+) -> Result<(), ResponsesServiceError> {
+    timing.record_display_delta(received_ns, payload_bytes);
+    let seq = events.emit_with_source_sequence(kind, payload, Some(received_ns))?;
+    tracing::trace!(
+        target: "nanocodex_stream_timing",
+        stage = "api_delta_emitted",
+        request.id = events.request_id(),
+        event.seq = seq,
+        event.kind = ?kind,
+        source.api.event.seq = api_event_seq,
+        payload.bytes = payload_bytes,
+        socket_to_agent_emit_ns = monotonic_now_ns().saturating_sub(received_ns),
+        "Responses display delta entered the agent event stream"
+    );
+    Ok(())
 }
 
 fn emit_assistant_message(
@@ -260,7 +328,8 @@ pub(crate) async fn receive_compaction(
     let mut timing = StreamTiming::new(started_at);
 
     loop {
-        match next_event(socket, events, "compaction", call_index, &mut timing).await? {
+        let received = next_event(socket, events, "compaction", call_index, &mut timing).await?;
+        match received.event {
             ServerEvent::OutputItemDone { item } => done_items.push(item),
             ServerEvent::Completed { mut response } => {
                 let output_items = if response.output.is_empty() {
@@ -300,21 +369,25 @@ async fn next_event(
     phase: &'static str,
     call_index: u32,
     timing: &mut StreamTiming,
-) -> Result<ServerEvent, ResponsesServiceError> {
+) -> Result<ReceivedServerEvent, ResponsesServiceError> {
     let receive_started_at = Instant::now();
-    let text = socket.next_text_or_idle_timeout().await?;
+    let received = socket.next_text_or_idle_timeout().await?;
     timing.pipeline.receive_wait_duration_ns = timing
         .pipeline
         .receive_wait_duration_ns
         .saturating_add(elapsed_ns(receive_started_at));
     timing.pipeline.event_count = timing.pipeline.event_count.saturating_add(1);
+    timing.pipeline.socket_queue_duration_ns = timing
+        .pipeline
+        .socket_queue_duration_ns
+        .saturating_add(monotonic_now_ns().saturating_sub(received.received_ns));
     timing.pipeline.event_bytes = timing
         .pipeline
         .event_bytes
-        .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        .saturating_add(u64::try_from(received.text.len()).unwrap_or(u64::MAX));
 
     let parse_started_at = Instant::now();
-    let raw_event = parse_raw_json(text.as_str())?;
+    let raw_event = parse_raw_json(received.text.as_str())?;
     timing.pipeline.parse_duration_ns = timing
         .pipeline
         .parse_duration_ns
@@ -323,7 +396,7 @@ async fn next_event(
     timing.first_event_ns.get_or_insert(elapsed);
 
     let emit_started_at = Instant::now();
-    events.emit(
+    let api_event_seq = events.emit_with_source_sequence(
         AgentEventKind::ApiEvent,
         ApiEvent {
             direction: "inbound",
@@ -332,6 +405,7 @@ async fn next_event(
             model_call_index: Some(call_index),
             event: raw_event,
         },
+        Some(received.received_ns),
     )?;
     timing.pipeline.emit_duration_ns = timing
         .pipeline
@@ -369,7 +443,11 @@ async fn next_event(
         }
         .into());
     }
-    Ok(event)
+    Ok(ReceivedServerEvent {
+        event,
+        received_ns: received.received_ns,
+        api_event_seq,
+    })
 }
 
 fn code_calls(items: &[ResponseItem]) -> Vec<CodeCall> {
@@ -431,4 +509,28 @@ fn output_text(content: &[ContentItem]) -> String {
             | ContentItem::InputAudio { .. } => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use web_time::Instant;
+
+    use super::StreamTiming;
+
+    #[test]
+    fn display_delta_cadence_records_gaps_and_stalls() {
+        let mut timing = StreamTiming::new(Instant::now());
+
+        timing.record_display_delta(1_000_000, 3);
+        timing.record_display_delta(61_000_000, 5);
+        timing.record_display_delta(311_000_000, 7);
+
+        assert_eq!(timing.pipeline.display_delta_count, 3);
+        assert_eq!(timing.pipeline.display_delta_bytes, 15);
+        assert_eq!(timing.pipeline.inter_delta_gap_duration_ns, 310_000_000);
+        assert_eq!(timing.pipeline.inter_delta_gap_max_ns, 250_000_000);
+        assert_eq!(timing.pipeline.inter_delta_stall_50ms_count, 2);
+        assert_eq!(timing.pipeline.inter_delta_stall_100ms_count, 1);
+        assert_eq!(timing.pipeline.inter_delta_stall_250ms_count, 1);
+    }
 }

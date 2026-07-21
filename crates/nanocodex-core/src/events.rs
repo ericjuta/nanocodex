@@ -1,7 +1,7 @@
 use std::{
     io::Write,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -9,8 +9,21 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::value::{RawValue, to_raw_value};
 use tokio::sync::mpsc;
+use web_time::Instant;
 
 const PROTOCOL_VERSION: u32 = 1;
+static PROCESS_MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Returns a process-relative monotonic timestamp for private cross-layer timing.
+#[doc(hidden)]
+#[must_use]
+pub fn monotonic_now_ns() -> u64 {
+    let elapsed = PROCESS_MONOTONIC_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
@@ -33,6 +46,22 @@ pub struct AgentEvent {
     #[serde(rename = "type")]
     pub kind: AgentEventKind,
     pub payload: Box<RawValue>,
+}
+
+/// Private in-process timing carried beside an event without changing JSONL.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct AgentEventTiming {
+    pub emitted_ns: u64,
+    pub source_received_ns: Option<u64>,
+}
+
+/// An agent event plus private in-process delivery timing.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct TimedAgentEvent {
+    pub event: AgentEvent,
+    pub timing: AgentEventTiming,
 }
 
 /// Stable event categories emitted by the agent runtime.
@@ -95,7 +124,7 @@ pub enum AgentEventKind {
 /// The receiving half of an agent's typed event stream.
 pub struct AgentEvents {
     request_id: Arc<str>,
-    receiver: mpsc::UnboundedReceiver<AgentEvent>,
+    receiver: mpsc::UnboundedReceiver<TimedAgentEvent>,
 }
 
 impl AgentEvents {
@@ -107,6 +136,12 @@ impl AgentEvents {
 
     /// Receives the next event, or `None` after all emitters are dropped.
     pub async fn recv(&mut self) -> Option<AgentEvent> {
+        self.recv_timed().await.map(|event| event.event)
+    }
+
+    /// Receives one event with private process-relative timing metadata.
+    #[doc(hidden)]
+    pub async fn recv_timed(&mut self) -> Option<TimedAgentEvent> {
         self.receiver.recv().await
     }
 
@@ -174,7 +209,7 @@ fn write_jsonl_event(output: &mut impl Write, event: &AgentEvent) -> Result<(), 
 pub struct EventSink {
     request_id: Arc<str>,
     next_seq: Arc<AtomicU64>,
-    sender: mpsc::UnboundedSender<AgentEvent>,
+    sender: mpsc::UnboundedSender<TimedAgentEvent>,
 }
 
 impl EventSink {
@@ -223,14 +258,31 @@ impl EventSink {
         kind: AgentEventKind,
         payload: P,
     ) -> Result<u64, EventError> {
+        self.emit_with_source_sequence(kind, payload, None)
+    }
+
+    /// Emits an event correlated with the process-monotonic source receipt time.
+    #[doc(hidden)]
+    pub fn emit_with_source_sequence<P: Serialize>(
+        &self,
+        kind: AgentEventKind,
+        payload: P,
+        source_received_ns: Option<u64>,
+    ) -> Result<u64, EventError> {
         let payload = to_raw_value(&payload).map_err(EventError::Encode)?;
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        drop(self.sender.send(AgentEvent {
-            protocol_version: PROTOCOL_VERSION,
-            request_id: Arc::clone(&self.request_id),
-            seq,
-            kind,
-            payload,
+        drop(self.sender.send(TimedAgentEvent {
+            event: AgentEvent {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Arc::clone(&self.request_id),
+                seq,
+                kind,
+                payload,
+            },
+            timing: AgentEventTiming {
+                emitted_ns: monotonic_now_ns(),
+                source_received_ns,
+            },
         }));
         Ok(seq)
     }
@@ -252,8 +304,8 @@ mod tests {
         events
             .emit(AgentEventKind::RunCompleted, json!({ "n": 2 }))
             .unwrap();
-        let first = receiver.receiver.try_recv().unwrap();
-        let second = receiver.receiver.try_recv().unwrap();
+        let first = receiver.receiver.try_recv().unwrap().event;
+        let second = receiver.receiver.try_recv().unwrap().event;
         assert_eq!((first.seq, first.kind), (1, AgentEventKind::RunStarted));
         assert_eq!((second.seq, second.kind), (2, AgentEventKind::RunCompleted));
         assert_eq!(
@@ -262,5 +314,26 @@ mod tests {
         );
         drop(receiver);
         events.emit(AgentEventKind::RunFailed, json!({})).unwrap();
+    }
+
+    #[test]
+    fn timing_is_private_and_preserves_the_jsonl_contract() {
+        let (events, mut receiver) = EventSink::channel("request-1".to_owned());
+        let source_received_ns = super::monotonic_now_ns();
+        events
+            .emit_with_source_sequence(
+                AgentEventKind::AssistantDelta,
+                json!({ "text": "x" }),
+                Some(source_received_ns),
+            )
+            .unwrap();
+
+        let timed = receiver.receiver.try_recv().unwrap();
+        assert_eq!(timed.timing.source_received_ns, Some(source_received_ns));
+        assert!(timed.timing.emitted_ns >= source_received_ns);
+        let encoded = serde_json::to_value(&timed.event).unwrap();
+        assert!(encoded.get("timing").is_none());
+        assert!(encoded.get("source_received_ns").is_none());
+        assert_eq!(encoded["type"], "assistant.delta");
     }
 }

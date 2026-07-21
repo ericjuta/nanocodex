@@ -93,11 +93,15 @@ Unknown slash-prefixed input is sent to the model as an ordinary prompt.
 
 ### Observability
 
-TUI telemetry correlates each event's request ID and sequence across API delta
-emission, event receipt, state application, and frame presentation. Frame
-records include coalesced delta count, payload bytes, render duration, and
-first/last-event-to-presentation latency. Full conversation content remains in
-the agent lifecycle traces described in `docs/OBSERVABILITY.md`.
+TUI telemetry carries a private process-monotonic source timestamp beside each
+typed event without changing the public event or JSONL contract. It correlates
+socket receipt, agent emission, TUI receipt, state application, Ratatui diff
+rendering, and terminal flush. Frame records include coalesced delta count,
+payload bytes, changed cells, output bytes, render duration, and first/last
+source-to-presentation latency. Compact per-turn summaries are exported at
+`info`; `just run-otel-detail` enables individual records. Full conversation
+content remains in the agent lifecycle traces described in
+`docs/OBSERVABILITY.md`.
 
 ## Representative workload evidence
 
@@ -126,6 +130,11 @@ Run it with:
 ```sh
 cargo bench -p nanocodex-bin --bench tui_render
 ```
+
+Use `just bench-stream` for the focused cross-layer gate. It also measures the
+timed agent-event envelope in `nanocodex-service` and the TUI timing aggregator,
+so UI improvements are not credited for delays introduced before Ratatui
+receives an event or for unmeasured instrumentation overhead.
 
 Every performance slice should select applicable gates before implementation:
 

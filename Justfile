@@ -98,6 +98,24 @@ run-otel: otel-up
         --otel-endpoint http://127.0.0.1:4318 \
         --otel-environment local-tui
 
+# Launch the TUI and export per-event/per-frame streaming diagnostics in addition
+# to the compact per-turn summaries enabled by `run-otel`.
+run-otel-detail: otel-up
+    @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }
+    @echo "Building and launching the Nanocodex TUI with detailed stream timing..."
+    @OTEL_LEVEL="warn,nanocodex=info,nanocodex_service=info,nanocodex_tools=info,nanocodex_mcp=info,nanocodex_stream_timing=trace" \
+        cargo run --manifest-path bin/nanocodex/Cargo.toml -- \
+        --otel-endpoint http://127.0.0.1:4318 \
+        --otel-environment local-tui
+
+# Focused streaming-performance gate: private event-envelope overhead plus
+# trace-shaped transcript updates and steady Ratatui diff rendering.
+bench-stream:
+    cargo bench -p nanocodex-service --bench tower_responses -- timed_agent_event_delivery
+    cargo bench -p nanocodex-bin --bench tui_render -- tui_stream_telemetry
+    cargo bench -p nanocodex-bin --bench tui_render -- tui_transcript_delta
+    cargo bench -p nanocodex-bin --bench tui_render -- tui_trace_render
+
 # Run a tool-using turn and retain events and diagnostic logs independently.
 otel-demo:
     @test -n "${OPENAI_API_KEY:-}" || { echo "set OPENAI_API_KEY in .env or the environment" >&2; exit 2; }

@@ -469,6 +469,28 @@ fn record_pipeline_stats(
     span.record("response.parse.duration_ns", stats.parse_duration_ns);
     span.record("response.emit.duration_ns", stats.emit_duration_ns);
     span.record("response.decode.duration_ns", stats.decode_duration_ns);
+    span.record(
+        "response.socket_queue.duration_ns",
+        stats.socket_queue_duration_ns,
+    );
+    span.record("response.display_delta.count", stats.display_delta_count);
+    span.record("response.display_delta.bytes", stats.display_delta_bytes);
+    span.record(
+        "response.inter_delta_gap.max_ns",
+        stats.inter_delta_gap_max_ns,
+    );
+    span.record(
+        "response.inter_delta_stall_50ms.count",
+        stats.inter_delta_stall_50ms_count,
+    );
+    span.record(
+        "response.inter_delta_stall_100ms.count",
+        stats.inter_delta_stall_100ms_count,
+    );
+    span.record(
+        "response.inter_delta_stall_250ms.count",
+        stats.inter_delta_stall_250ms_count,
+    );
     tracing::info!(
         target: "nanocodex_service",
         stage = "responses.pipeline.completed",
@@ -481,6 +503,14 @@ fn record_pipeline_stats(
         response.parse.duration_ns = stats.parse_duration_ns,
         response.emit.duration_ns = stats.emit_duration_ns,
         response.decode.duration_ns = stats.decode_duration_ns,
+        response.socket_queue.duration_ns = stats.socket_queue_duration_ns,
+        response.display_delta.count = stats.display_delta_count,
+        response.display_delta.bytes = stats.display_delta_bytes,
+        response.inter_delta_gap.duration_ns = stats.inter_delta_gap_duration_ns,
+        response.inter_delta_gap.max_ns = stats.inter_delta_gap_max_ns,
+        response.inter_delta_stall_50ms.count = stats.inter_delta_stall_50ms_count,
+        response.inter_delta_stall_100ms.count = stats.inter_delta_stall_100ms_count,
+        response.inter_delta_stall_250ms.count = stats.inter_delta_stall_250ms_count,
         "Responses attempt pipeline timing"
     );
 }
@@ -517,6 +547,13 @@ impl Service<ResponsesAttempt> for ResponsesService {
             response.parse.duration_ns = tracing::field::Empty,
             response.emit.duration_ns = tracing::field::Empty,
             response.decode.duration_ns = tracing::field::Empty,
+            response.socket_queue.duration_ns = tracing::field::Empty,
+            response.display_delta.count = tracing::field::Empty,
+            response.display_delta.bytes = tracing::field::Empty,
+            response.inter_delta_gap.max_ns = tracing::field::Empty,
+            response.inter_delta_stall_50ms.count = tracing::field::Empty,
+            response.inter_delta_stall_100ms.count = tracing::field::Empty,
+            response.inter_delta_stall_250ms.count = tracing::field::Empty,
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
@@ -535,9 +572,9 @@ async fn receive_warmup(
     request: &ResponsesAttempt,
 ) -> Result<WarmupResponse, ResponsesServiceError> {
     loop {
-        let text = socket.next_text_or_idle_timeout().await?;
-        let raw_event = parse_raw_json(text.as_str())?;
-        request.observer.emit(
+        let received = socket.next_text_or_idle_timeout().await?;
+        let raw_event = parse_raw_json(received.text.as_str())?;
+        request.observer.events.emit_with_source_sequence(
             AgentEventKind::ApiEvent,
             ApiEvent {
                 direction: "inbound",
@@ -546,6 +583,7 @@ async fn receive_warmup(
                 model_call_index: None,
                 event: raw_event,
             },
+            Some(received.received_ns),
         )?;
         match decode_event::<WarmupServerEvent>(raw_event)? {
             WarmupServerEvent::Completed { response } => return Ok(response),

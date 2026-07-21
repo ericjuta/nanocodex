@@ -7,6 +7,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::ResponsesError;
+use nanocodex_core::monotonic_now_ns;
 
 const EVENT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -40,6 +41,11 @@ pub(crate) struct ConnectionMetadata {
 pub(crate) struct ResponsesSocket {
     handle: u32,
     turn_state: Option<String>,
+}
+
+pub(crate) struct ReceivedText {
+    pub text: String,
+    pub received_ns: u64,
 }
 
 /// A request serialized once at the API boundary and ready for transport.
@@ -152,7 +158,9 @@ impl ResponsesSocket {
         })
     }
 
-    pub(crate) async fn next_text_or_idle_timeout(&mut self) -> Result<String, ResponsesError> {
+    pub(crate) async fn next_text_or_idle_timeout(
+        &mut self,
+    ) -> Result<ReceivedText, ResponsesError> {
         let timeout_ms = u32::try_from(EVENT_IDLE_TIMEOUT.as_millis()).unwrap_or(u32::MAX);
         let promise = host_next(self.handle, timeout_ms)
             .map_err(|error| ResponsesError::Receive(js_error(&error)))?;
@@ -160,7 +168,10 @@ impl ResponsesSocket {
         match message {
             HostMessage::Text { text } => {
                 self.capture_turn_state(&text);
-                Ok(text)
+                Ok(ReceivedText {
+                    text,
+                    received_ns: monotonic_now_ns(),
+                })
             }
             HostMessage::Closed { detail } => Err(ResponsesError::Closed { detail }),
             HostMessage::Error { detail } => Err(ResponsesError::Receive(detail)),

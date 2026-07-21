@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell as CounterCell,
     io::{self, IsTerminal, Stdout, Write, stdin, stdout},
     panic,
+    rc::Rc,
     sync::{
         Once,
         atomic::{AtomicBool, Ordering},
@@ -19,12 +21,34 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use ratatui::{Frame, Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Frame, Terminal,
+    backend::{Backend, ClearType, CrosstermBackend, WindowSize},
+    buffer::Cell,
+    layout::{Position, Size},
+};
 
-pub(super) type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
+type TuiTerminal = Terminal<MeasuredBackend<CrosstermBackend<ByteCountingWriter<Stdout>>>>;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct DrawMetrics {
+    pub changed_cells: u64,
+    pub output_bytes: u64,
+}
+
+struct ByteCountingWriter<W> {
+    inner: W,
+    bytes: Rc<CounterCell<u64>>,
+}
+
+struct MeasuredBackend<B> {
+    inner: B,
+    changed_cells: u64,
+}
 
 pub(super) struct TerminalSession {
     terminal: TuiTerminal,
+    output_bytes: Rc<CounterCell<u64>>,
 }
 
 static INSTALL_PANIC_HOOK: Once = Once::new();
@@ -32,6 +56,82 @@ static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 struct RestoreOnDrop {
     armed: bool,
+}
+
+impl<W: Write> Write for ByteCountingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+        self.bytes
+            .set(self.bytes.get().saturating_add(written as u64));
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<B: Write> Write for MeasuredBackend<B> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.inner.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<B: Backend> Backend for MeasuredBackend<B> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let content = content.collect::<Vec<_>>();
+        self.changed_cells = self
+            .changed_cells
+            .saturating_add(content.len().try_into().unwrap_or(u64::MAX));
+        self.inner.draw(content.into_iter())
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        self.inner.append_lines(n)
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 impl TerminalSession {
@@ -61,16 +161,33 @@ impl TerminalSession {
                     | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
             )
         ));
-        let terminal = Terminal::new(CrosstermBackend::new(output))?;
+        let output_bytes = Rc::new(CounterCell::new(0));
+        let writer = ByteCountingWriter {
+            inner: output,
+            bytes: Rc::clone(&output_bytes),
+        };
+        let terminal = Terminal::new(MeasuredBackend {
+            inner: CrosstermBackend::new(writer),
+            changed_cells: 0,
+        })?;
         restore.armed = false;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            output_bytes,
+        })
     }
 
-    pub(super) fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
+    pub(super) fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<DrawMetrics> {
+        let bytes_before = self.output_bytes.get();
+        self.terminal.backend_mut().changed_cells = 0;
         begin_synchronized_update(self.terminal.backend_mut())?;
         let draw_result = self.terminal.draw(render).map(|_| ());
         let end_result = end_synchronized_update(self.terminal.backend_mut());
-        draw_result.and(end_result)
+        draw_result.and(end_result)?;
+        Ok(DrawMetrics {
+            changed_cells: self.terminal.backend().changed_cells,
+            output_bytes: self.output_bytes.get().saturating_sub(bytes_before),
+        })
     }
 }
 
@@ -129,7 +246,14 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
-    use super::{begin_synchronized_update, end_synchronized_update, restore_commands};
+    use std::{cell::Cell, io::Write, rc::Rc};
+
+    use ratatui::{Terminal, backend::TestBackend, text::Text, widgets::Paragraph};
+
+    use super::{
+        ByteCountingWriter, MeasuredBackend, begin_synchronized_update, end_synchronized_update,
+        restore_commands,
+    };
 
     #[test]
     fn synchronized_update_uses_csi_2026() {
@@ -149,5 +273,39 @@ mod tests {
 
         assert!(output.starts_with(b"\x1b[?2026l\x1b[?25h"));
         assert!(output.ends_with(b"\x1b[?1049l"));
+    }
+
+    #[test]
+    fn writer_counts_only_bytes_accepted_by_the_terminal() {
+        let bytes = Rc::new(Cell::new(0));
+        let mut writer = ByteCountingWriter {
+            inner: Vec::new(),
+            bytes: Rc::clone(&bytes),
+        };
+
+        writer.write_all(b"abcdef").unwrap();
+
+        assert_eq!(bytes.get(), 6);
+        assert_eq!(writer.inner, b"abcdef");
+    }
+
+    #[test]
+    fn measured_backend_counts_ratatui_diff_cells() {
+        let backend = MeasuredBackend {
+            inner: TestBackend::new(20, 2),
+            changed_cells: 0,
+        };
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(Text::raw("hello")), frame.area()))
+            .unwrap();
+        assert!(terminal.backend().changed_cells > 0);
+
+        terminal.backend_mut().changed_cells = 0;
+        terminal
+            .draw(|frame| frame.render_widget(Paragraph::new(Text::raw("hello")), frame.area()))
+            .unwrap();
+        assert_eq!(terminal.backend().changed_cells, 0);
     }
 }

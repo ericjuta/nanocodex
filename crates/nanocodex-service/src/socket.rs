@@ -16,7 +16,7 @@ use tokio_tungstenite::{
 };
 
 use crate::{ResponsesError, connector::connect_async};
-use nanocodex_core::OpenAiAuthSnapshot;
+use nanocodex_core::{OpenAiAuthSnapshot, monotonic_now_ns};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,13 +45,23 @@ pub(crate) struct ResponsesSocket {
     turn_state: Option<String>,
 }
 
+pub(crate) struct ReceivedText {
+    pub text: Utf8Bytes,
+    pub received_ns: u64,
+}
+
 /// A request serialized once at the API boundary and ready for transport.
 pub struct EncodedRequest(Box<RawValue>);
 
 struct SocketPump {
     commands: mpsc::Sender<SocketCommand>,
-    messages: mpsc::UnboundedReceiver<std::result::Result<Message, WebSocketError>>,
+    messages: mpsc::UnboundedReceiver<PumpMessage>,
     task: tokio::task::JoinHandle<()>,
+}
+
+struct PumpMessage {
+    message: std::result::Result<Message, WebSocketError>,
+    received_ns: u64,
 }
 
 enum SocketCommand {
@@ -181,7 +191,9 @@ impl ResponsesSocket {
     /// # Errors
     ///
     /// Returns an error for timeout, socket failure, closure, or an unexpected frame.
-    pub(crate) async fn next_text_or_idle_timeout(&mut self) -> Result<Utf8Bytes, ResponsesError> {
+    pub(crate) async fn next_text_or_idle_timeout(
+        &mut self,
+    ) -> Result<ReceivedText, ResponsesError> {
         timeout(EVENT_IDLE_TIMEOUT, self.next_text())
             .await
             .map_err(|_| ResponsesError::IdleTimeout {
@@ -194,19 +206,22 @@ impl ResponsesSocket {
     /// # Errors
     ///
     /// Returns an error for socket failure, closure, or an unexpected frame.
-    pub(crate) async fn next_text(&mut self) -> Result<Utf8Bytes, ResponsesError> {
+    pub(crate) async fn next_text(&mut self) -> Result<ReceivedText, ResponsesError> {
         loop {
-            let message = self
+            let received = self
                 .pump
                 .next()
                 .await
-                .ok_or(ResponsesError::UnexpectedEnd)?
-                .map_err(ResponsesError::Receive)?;
+                .ok_or(ResponsesError::UnexpectedEnd)?;
+            let message = received.message.map_err(ResponsesError::Receive)?;
 
             match message {
                 Message::Text(text) => {
                     self.capture_turn_state(text.as_str());
-                    return Ok(text);
+                    return Ok(ReceivedText {
+                        text,
+                        received_ns: received.received_ns,
+                    });
                 }
                 Message::Binary(_) => return Err(ResponsesError::UnexpectedBinary),
                 Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
@@ -309,19 +324,28 @@ impl SocketPump {
                         match message {
                             Ok(Message::Ping(payload)) => {
                                 if let Err(error) = socket.send(Message::Pong(payload)).await {
-                                    drop(message_sender.send(Err(error)));
+                                    drop(message_sender.send(PumpMessage {
+                                        message: Err(error),
+                                        received_ns: monotonic_now_ns(),
+                                    }));
                                     break;
                                 }
                             }
                             Ok(Message::Pong(_)) => {}
                             Ok(message) => {
                                 let should_stop = matches!(message, Message::Close(_));
-                                if message_sender.send(Ok(message)).is_err() || should_stop {
+                                if message_sender.send(PumpMessage {
+                                    message: Ok(message),
+                                    received_ns: monotonic_now_ns(),
+                                }).is_err() || should_stop {
                                     break;
                                 }
                             }
                             Err(error) => {
-                                drop(message_sender.send(Err(error)));
+                                drop(message_sender.send(PumpMessage {
+                                    message: Err(error),
+                                    received_ns: monotonic_now_ns(),
+                                }));
                                 break;
                             }
                         }
@@ -347,7 +371,7 @@ impl SocketPump {
             .unwrap_or(Err(WebSocketError::ConnectionClosed))
     }
 
-    async fn next(&mut self) -> Option<std::result::Result<Message, WebSocketError>> {
+    async fn next(&mut self) -> Option<PumpMessage> {
         self.messages.recv().await
     }
 }
@@ -688,7 +712,10 @@ mod tests {
 
         server.await??;
         let text = socket.next_text().await?;
-        assert_eq!(parse_raw_json(text.as_str())?.get(), r#"{"type":"probe"}"#);
+        assert_eq!(
+            parse_raw_json(text.text.as_str())?.get(),
+            r#"{"type":"probe"}"#
+        );
         assert!(matches!(
             socket.next_text().await,
             Err(crate::ResponsesError::UnexpectedBinary)

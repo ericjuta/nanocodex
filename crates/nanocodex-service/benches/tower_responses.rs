@@ -9,8 +9,8 @@ use std::{
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nanocodex_core::{
-    AgentEvent, AgentEventKind, ContentItem, FunctionOutputBody, FunctionOutputContent,
-    MessageRole, ResponseItem, responses::ServerEvent,
+    AgentEvent, AgentEventKind, ContentItem, EventSink, FunctionOutputBody, FunctionOutputContent,
+    MessageRole, ResponseItem, monotonic_now_ns, responses::ServerEvent,
 };
 use nanocodex_service::EncodedRequest;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -363,6 +363,36 @@ fn agent_event_encoding(criterion: &mut Criterion) {
             },
         );
     }
+    group.finish();
+}
+
+fn timed_agent_event_delivery(criterion: &mut Criterion) {
+    const EVENTS_PER_BATCH: u64 = 1_024;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let mut group = criterion.benchmark_group("timed_agent_event_delivery");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(3));
+    group.throughput(Throughput::Elements(EVENTS_PER_BATCH));
+    group.bench_function("emit_receive_1024", |bencher| {
+        bencher.to_async(&runtime).iter(|| async {
+            let (sink, mut events) = EventSink::channel("benchmark-session".to_owned());
+            for _ in 0..EVENTS_PER_BATCH {
+                let source_received_ns = monotonic_now_ns();
+                sink.emit_with_source_sequence(
+                    AgentEventKind::AssistantDelta,
+                    ReplyPayload { message: "delta" },
+                    Some(source_received_ns),
+                )
+                .unwrap();
+                let received = events.recv_timed().await.unwrap();
+                black_box((
+                    received.event.seq,
+                    received.timing.emitted_ns,
+                    received.timing.source_received_ns,
+                ));
+            }
+        });
+    });
     group.finish();
 }
 
@@ -729,6 +759,7 @@ criterion_group!(
     request_encoding,
     event_decoding,
     agent_event_encoding,
+    timed_agent_event_delivery,
     retained_agent_event_trace,
     retained_response_event_pipeline,
     response_item_history,
