@@ -375,8 +375,12 @@ impl Session {
         let Some(handles) = handles else {
             return;
         };
+        let deadline = tokio::time::Instant::now() + DRAIN_GRACE;
         for mut handle in handles {
-            if timeout(DRAIN_GRACE, &mut handle).await.is_err() {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
                 handle.abort();
                 let _ = handle.await;
             }
@@ -617,6 +621,40 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(contents, "survived");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_grace_is_shared_across_output_streams() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let sessions = ShellSessions::new();
+        let started_at = std::time::Instant::now();
+        let result = sessions
+            .execute(
+                ExecCommand::new(
+                    "sleep 30 & printf '%s' $!".to_owned(),
+                    None,
+                    Some("/bin/sh".to_owned()),
+                    Some(false),
+                    false,
+                    Some(10_000),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        let elapsed = started_at.elapsed();
+        let background_pid = result.output.trim();
+        let _ = std::process::Command::new("kill")
+            .args(["-9", background_pid])
+            .status();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            elapsed < Duration::from_millis(3_500),
+            "two blocked drains consumed separate grace periods: {elapsed:?}"
+        );
         Ok(())
     }
 

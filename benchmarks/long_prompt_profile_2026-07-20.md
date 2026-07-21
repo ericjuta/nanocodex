@@ -152,6 +152,12 @@ that this removes all 55 wait-selection model calls without delaying ordinary
    emission, and typed decode duration as structural span fields. A
    `stage="responses.pipeline.completed"` info event carries the same values so
    local compact/JSON fmt logs are sufficient without an OTLP collector.
+4. Shell completion previously gave stdout and stderr drain tasks separate
+   sequential two-second grace periods. A detached child holding both pipes
+   open could therefore add four seconds after its shell had already exited.
+   Both drains now share one deadline; the focused background-process
+   regression completes in 2.13 seconds instead of waiting two full periods.
+
 ## Remaining boundaries
 
 - The WebSocket pump and typed event stream use unbounded queues. This prevents
