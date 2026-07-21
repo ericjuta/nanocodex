@@ -4,7 +4,7 @@ mod tui {
     use std::{hint::black_box, sync::Arc, time::Instant};
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
-    use nanocodex::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
+    use nanocodex::{AgentEvent, AgentEventKind, AgentEventTiming, Thinking, TimedAgentEvent};
     use ratatui::{Terminal, backend::TestBackend};
 
     #[allow(dead_code, unused_imports)]
@@ -118,7 +118,7 @@ mod tui {
     }
 
     fn trace_app(shape: TraceShape) -> App {
-        let mut app = App::new("/workspace/nanocodex".into());
+        let mut app = App::new("/workspace/nanocodex".into(), Thinking::Medium);
         let turns = shape
             .user_messages
             .max(shape.assistant_messages)
@@ -242,7 +242,7 @@ mod tui {
     pub(super) fn scroll_anchor_benchmark(criterion: &mut Criterion) {
         const DELTAS: usize = 128;
         fn scrolled_app() -> App {
-            let mut app = App::new("/workspace/nanocodex".into());
+            let mut app = App::new("/workspace/nanocodex".into(), Thinking::Medium);
             for index in 0..50 {
                 app.main
                     .transcript
@@ -318,7 +318,7 @@ mod tui {
         const DELTAS: usize = 128;
 
         fn following_app() -> App {
-            let mut app = App::new("/workspace/nanocodex".into());
+            let mut app = App::new("/workspace/nanocodex".into(), Thinking::Medium);
             for index in 0..50 {
                 app.main
                     .transcript
@@ -423,7 +423,7 @@ mod tui {
                 },
             })
             .collect::<Vec<_>>();
-        let app = App::new("/workspace/nanocodex".into());
+        let app = App::new("/workspace/nanocodex".into(), Thinking::Medium);
         let mut group = criterion.benchmark_group("tui_stream_telemetry");
         group.throughput(Throughput::Elements(DELTAS));
         group.bench_function("apply_1024_and_present", |bencher| {
@@ -468,7 +468,7 @@ mod tui {
 
     pub(super) fn composer_benchmarks(criterion: &mut Criterion) {
         criterion.bench_function("tui_composer_render/multiline_100k/120x40", |bencher| {
-            let mut app = App::new("/workspace/nanocodex".into());
+            let mut app = App::new("/workspace/nanocodex".into(), Thinking::Medium);
             app.input = sized_text(100 * 1_024, 7);
             app.cursor = app.input.len();
             let mut terminal = Terminal::new(TestBackend::new(120, 40))

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use nanocodex::{AgentEvent, AgentEventKind};
+use nanocodex::{AgentEvent, AgentEventKind, Thinking};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -656,6 +656,7 @@ fn append_branch_tree(
 
 pub(super) struct App {
     pub(super) cwd: PathBuf,
+    pub(super) thinking: Thinking,
     pub(super) main: Conversation,
     main_branch_id: u64,
     main_branch_parent_id: Option<u64>,
@@ -686,9 +687,10 @@ struct CancelConfirmation {
 }
 
 impl App {
-    pub(super) fn new(cwd: PathBuf) -> Self {
+    pub(super) fn new(cwd: PathBuf, thinking: Thinking) -> Self {
         Self {
             cwd,
+            thinking,
             main: Conversation::new("Ready"),
             main_branch_id: 0,
             main_branch_parent_id: None,
@@ -761,9 +763,10 @@ impl App {
         if previous == self.cursor {
             return;
         }
-        self.detach_history();
+        self.prepare_composer_edit();
         self.input.drain(previous..self.cursor);
         self.cursor = previous;
+        self.preferred_column = None;
     }
 
     pub(super) fn delete_word(&mut self) {
@@ -771,8 +774,9 @@ impl App {
         if next == self.cursor {
             return;
         }
-        self.detach_history();
+        self.prepare_composer_edit();
         self.input.drain(self.cursor..next);
+        self.preferred_column = None;
     }
 
     pub(super) fn move_left(&mut self) {
@@ -791,47 +795,13 @@ impl App {
     }
 
     pub(super) fn move_word_left(&mut self) {
-        let mut cursor = self.cursor;
-        while let Some((index, character)) = self.input[..cursor].char_indices().next_back() {
-            if !character.is_whitespace() {
-                break;
-            }
-            cursor = index;
-        }
-        while let Some((index, character)) = self.input[..cursor].char_indices().next_back() {
-            if character.is_whitespace() {
-                break;
-            }
-            cursor = index;
-        }
-        self.cursor = cursor;
-        self.preferred_column = None;
-    }
-
-    pub(super) fn move_word_right(&mut self) {
-        let mut cursor = self.cursor;
-        while let Some(character) = self.input[cursor..].chars().next() {
-            if character.is_whitespace() {
-                break;
-            }
-            cursor += character.len_utf8();
-        }
-        while let Some(character) = self.input[cursor..].chars().next() {
-            if !character.is_whitespace() {
-                break;
-            }
-            cursor += character.len_utf8();
-        }
-        self.cursor = cursor;
-        self.preferred_column = None;
-    }
-
-    pub(super) fn move_word_left(&mut self) {
         self.cursor = self.previous_word_boundary();
+        self.preferred_column = None;
     }
 
     pub(super) fn move_word_right(&mut self) {
         self.cursor = self.next_word_boundary();
+        self.preferred_column = None;
     }
 
     pub(super) fn move_home(&mut self) {
@@ -1004,19 +974,8 @@ impl App {
         if self.cursor == end {
             return;
         }
-        self.detach_history();
+        self.prepare_composer_edit();
         self.input.drain(self.cursor..end);
-    }
-
-    pub(super) fn delete_to_line_end(&mut self) {
-        let start = self.cursor;
-        self.move_end();
-        if self.cursor == start {
-            return;
-        }
-        self.detach_history();
-        self.input.drain(start..self.cursor);
-        self.cursor = start;
     }
 
     fn previous_word_boundary(&self) -> usize {
@@ -1856,7 +1815,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use nanocodex::{AgentEvent, AgentEventKind};
+    use nanocodex::{AgentEvent, AgentEventKind, Thinking};
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use serde_json::{Value, json};
 
@@ -1876,7 +1835,7 @@ mod tests {
 
     #[test]
     fn btw_conversation_isolated_and_focus_toggles() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         assert_eq!(app.focus, PaneId::Main);
         let id = app.begin_btw();
         assert_eq!(app.focus, PaneId::Btw(id));
@@ -1900,7 +1859,7 @@ mod tests {
 
     #[test]
     fn streamed_wrap_growth_preserves_a_scrolled_view_and_marks_output_unseen() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.settle_viewport(20, 6);
         for index in 0..8 {
             app.main
@@ -1935,7 +1894,7 @@ mod tests {
 
     #[test]
     fn new_entries_anchor_only_the_conversation_that_receives_them() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         let btw_id = app.begin_btw();
         app.main.settle_viewport(40, 10);
         app.btw
@@ -1968,7 +1927,7 @@ mod tests {
 
     #[test]
     fn page_down_and_jump_to_bottom_clear_unseen_output_at_the_tail() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.scroll_from_bottom = 15;
         app.main.has_unseen_output = true;
 
@@ -1988,7 +1947,7 @@ mod tests {
 
     #[test]
     fn repeated_scroll_up_clamps_without_hidden_overscroll() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         for index in 0..12 {
             app.main
                 .push_output(TranscriptItem::User(format!("message {index}")));
@@ -2011,7 +1970,7 @@ mod tests {
 
     #[test]
     fn follow_bottom_only_animates_after_content_overflows_the_viewport() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.settle_viewport(20, 6);
 
         app.main.push_assistant_delta("one\ntwo\nthree");
@@ -2034,7 +1993,7 @@ mod tests {
 
     #[test]
     fn follow_bottom_catch_up_is_bounded_to_one_viewport() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.settle_viewport(20, 6);
         app.main.push_assistant_delta("one\ntwo\nthree");
         app.main.settle_viewport(20, 6);
@@ -2049,7 +2008,7 @@ mod tests {
 
     #[test]
     fn manual_scroll_takes_over_from_the_current_animated_position() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.settle_viewport(20, 6);
         app.main.push_assistant_delta("one\ntwo\nthree");
         app.main.settle_viewport(20, 6);
@@ -2069,7 +2028,7 @@ mod tests {
 
     #[test]
     fn vertical_motion_uses_visual_rows_and_preserves_the_preferred_column() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.input = "012345\nxy\nabcdef".to_owned();
         app.cursor = 4;
         app.set_composer_width(20);
@@ -2092,7 +2051,7 @@ mod tests {
 
     #[test]
     fn transcript_history_starts_above_the_first_visual_row_without_replacing_the_draft() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("older prompt".to_owned(), 1);
@@ -2155,7 +2114,7 @@ mod tests {
 
     #[test]
     fn historical_edit_switches_to_a_prefixed_branch_and_preserves_branch_drafts() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main
             .transcript
             .push(TranscriptItem::Assistant("inherited answer".to_owned()));
@@ -2205,7 +2164,7 @@ mod tests {
 
     #[test]
     fn historical_edit_archives_a_running_source_without_misrouting_its_completion() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("prompt still running".to_owned(), 41);
@@ -2237,7 +2196,7 @@ mod tests {
 
     #[test]
     fn branch_previews_follow_depth_first_tree_order() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("root prompt".to_owned(), 41);
@@ -2296,7 +2255,7 @@ mod tests {
 
     #[test]
     fn readline_deletions_edit_only_the_expected_span() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.input = "alpha beta  \ngamma delta".to_owned();
         app.cursor = "alpha beta  \ngamma".len();
 
@@ -2324,7 +2283,7 @@ mod tests {
 
     #[test]
     fn resize_retains_tail_distance_and_uses_the_new_width_for_later_growth() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         for index in 0..8 {
             app.main
                 .push_output(TranscriptItem::User(format!("earlier message {index}")));
@@ -2346,7 +2305,7 @@ mod tests {
 
     #[test]
     fn stale_btw_updates_do_not_reach_a_reopened_pane() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         let first = app.begin_btw();
         app.close_btw(first);
         let second = app.begin_btw();
@@ -2357,7 +2316,7 @@ mod tests {
 
     #[test]
     fn accepted_steers_and_queued_turns_have_distinct_lifecycles() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.running = true;
 
         let steer_id = app
@@ -2389,7 +2348,7 @@ mod tests {
 
     #[test]
     fn run_steered_waits_for_a_racing_queue_ack_before_promoting_input() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.running = true;
         let steer_id = app
             .queue_steer(PaneId::Main, "race-safe steer".to_owned())
@@ -2410,7 +2369,7 @@ mod tests {
 
     #[test]
     fn steer_rejected_after_turn_completion_becomes_the_next_turn() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.running = true;
         let steer_id = app
             .queue_steer(PaneId::Main, "one more constraint".to_owned())
@@ -2429,7 +2388,7 @@ mod tests {
 
     #[test]
     fn late_cancel_ack_does_not_overwrite_the_next_turn_state() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.running = true;
         "Thinking".clone_into(&mut app.main.status);
 
@@ -2441,7 +2400,7 @@ mod tests {
 
     #[test]
     fn cancelled_turn_is_terminal_without_rendering_a_generic_error() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         assert!(
             app.queue_prompt(PaneId::Main, "run it".to_owned())
                 .is_some()
@@ -2474,7 +2433,7 @@ mod tests {
 
     #[test]
     fn reasoning_summary_deltas_are_visible_while_the_turn_is_running() {
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.on_agent_event(&event(
             AgentEventKind::RunStarted,
             &json!({ "status": "started" }),
@@ -2491,7 +2450,7 @@ mod tests {
     #[test]
     fn escape_requires_confirmation_and_preserves_the_draft() {
         let now = Instant::now();
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.running = true;
         app.input = "keep this draft".to_owned();
         app.cursor = app.input.len();
@@ -2511,7 +2470,7 @@ mod tests {
     #[test]
     fn expired_escape_confirmation_rearms_instead_of_cancelling() {
         let now = Instant::now();
-        let mut app = App::new(".".into());
+        let mut app = App::new(".".into(), Thinking::Medium);
         app.main.running = true;
 
         assert_eq!(app.handle_escape(now), None);

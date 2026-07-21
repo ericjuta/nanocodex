@@ -641,7 +641,7 @@ pub(super) fn elapsed_ns(start: Instant, end: Instant) -> u64 {
 mod tests {
     use std::{path::PathBuf, sync::Arc, time::Instant};
 
-    use nanocodex::AgentEventKind;
+    use nanocodex::{AgentEventKind, Thinking};
 
     use crate::tui::{
         app::{App, PaneId},
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn coalesced_events_are_consumed_by_one_presented_frame() {
         let mut telemetry = StreamTelemetry::default();
-        let app = App::new(PathBuf::from("."));
+        let app = App::new(PathBuf::from("."), Thinking::Medium);
         telemetry.event_applied_at(received(1, AgentEventKind::RunStarted, None), true, 130);
         for seq in 2..=4 {
             telemetry.event_applied_at(
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn terminal_frame_finishes_the_active_turn() {
         let mut telemetry = StreamTelemetry::default();
-        let app = App::new(PathBuf::from("."));
+        let app = App::new(PathBuf::from("."), Thinking::Medium);
         telemetry.event_applied_at(received(1, AgentEventKind::RunStarted, None), true, 130);
         telemetry.event_applied_at(received(2, AgentEventKind::RunCompleted, None), true, 140);
         let now = Instant::now();
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn queued_run_does_not_replace_terminal_turn_before_flush() {
         let mut telemetry = StreamTelemetry::default();
-        let app = App::new(PathBuf::from("."));
+        let app = App::new(PathBuf::from("."), Thinking::Medium);
         telemetry.event_applied_at(received(1, AgentEventKind::RunStarted, None), true, 130);
         telemetry.event_applied_at(
             received(2, AgentEventKind::RunCompleted, Some(140)),
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn view_state_tracks_btw_lifecycle_focus_and_session_mapping() {
-        let mut app = App::new(PathBuf::from("."));
+        let mut app = App::new(PathBuf::from("."), Thinking::Medium);
         let mut telemetry = ViewTelemetry::new(Arc::from("main-session"));
 
         telemetry.observe(&app);

@@ -325,6 +325,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
         .canonicalize()
         .wrap_err("failed to resolve the working directory")?;
     let configured = config.build()?;
+    let thinking = configured.thinking;
     let agent = configured.handle;
     let mut agent_events = configured.events;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
@@ -336,7 +337,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
     let mut input_events = EventStream::new();
     let mut ticker = ui_ticker();
-    let mut ui = UiModel::new(App::new(cwd), Arc::clone(&root_session_id));
+    let mut ui = UiModel::new(App::new(cwd, thinking), Arc::clone(&root_session_id));
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
@@ -1353,6 +1354,8 @@ fn handle_key(
         match key.code {
             KeyCode::Char('b') | KeyCode::Left => app.move_word_left(),
             KeyCode::Char('f') | KeyCode::Right => app.move_word_right(),
+            KeyCode::Backspace => app.backspace_word(),
+            KeyCode::Delete => app.delete_word(),
             _ => {}
         }
         return Ok(TerminalAction::Redraw);
@@ -1368,29 +1371,7 @@ fn handle_key(
             KeyCode::Delete => app.delete_to_line_end(),
             _ => {}
         }
-        return Ok(false);
-    }
-
-    if key.modifiers.contains(KeyModifiers::ALT) {
-        match key.code {
-            KeyCode::Left => {
-                app.move_word_left();
-                return Ok(false);
-            }
-            KeyCode::Right => {
-                app.move_word_right();
-                return Ok(false);
-            }
-            KeyCode::Backspace => {
-                app.backspace_word();
-                return Ok(false);
-            }
-            KeyCode::Delete => {
-                app.delete_word();
-                return Ok(false);
-            }
-            _ => {}
-        }
+        return Ok(TerminalAction::Redraw);
     }
 
     match key.code {
@@ -1867,7 +1848,7 @@ mod tests {
     #[test]
     fn control_end_jumps_the_focused_transcript_to_the_tail() {
         let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         let btw_id = app.begin_btw();
         app.main.scroll_from_bottom = 11;
         app.main.has_unseen_output = true;
@@ -1890,7 +1871,7 @@ mod tests {
 
     #[test]
     fn jaeger_search_targets_the_focused_session_and_encodes_its_tag() {
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         assert_eq!(
             active_session_id(&app, "main-session"),
             Some("main-session")
@@ -1933,7 +1914,7 @@ mod tests {
     fn all_event_sources_cross_the_ui_action_boundary() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut ui = UiModel::new(
-            App::new("/workspace".into()),
+            App::new("/workspace".into(), Thinking::Medium),
             std::sync::Arc::from("main-session"),
         );
 
@@ -2236,7 +2217,7 @@ mod tests {
     #[test]
     fn second_escape_sends_cancel_for_the_focused_turn() {
         let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.main.running = true;
         app.input = "preserved draft".to_owned();
         app.cursor = app.input.len();
@@ -2263,7 +2244,7 @@ mod tests {
     #[test]
     fn control_g_requests_the_external_editor_without_changing_the_draft() {
         let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.input = "multiline\ndraft".to_owned();
         app.cursor = 4;
         let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL);
@@ -2279,7 +2260,7 @@ mod tests {
     #[test]
     fn e_edits_the_selected_prompt_inline_before_requesting_a_fork() {
         let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("earlier prompt".to_owned(), 17);
@@ -2337,7 +2318,7 @@ mod tests {
     #[test]
     fn escape_cancels_inline_history_edit_and_restores_the_composer_draft() {
         let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("earlier prompt".to_owned(), 17);
@@ -2366,7 +2347,7 @@ mod tests {
 
     #[test]
     fn opened_historical_branch_submits_the_inline_revision() {
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("earlier prompt".to_owned(), 17);
@@ -2407,7 +2388,7 @@ mod tests {
     #[test]
     fn control_alt_arrows_request_branch_navigation() {
         let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("earlier prompt".to_owned(), 17);
@@ -2437,7 +2418,7 @@ mod tests {
     #[test]
     fn branch_navigator_switches_as_selection_moves() -> eyre::Result<()> {
         let (commands, mut worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.main
             .transcript
             .push_editable_user("root prompt".to_owned(), 17);
@@ -2514,7 +2495,7 @@ mod tests {
     #[test]
     fn readline_control_keys_are_dispatched_to_the_composer() {
         let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.input = "one two".to_owned();
         app.cursor = app.input.len();
 
@@ -2594,7 +2575,7 @@ mod tests {
     #[test]
     fn alt_and_command_edit_the_composer_by_word_line_and_draft() {
         let (commands, _worker) = mpsc::unbounded_channel();
-        let mut app = App::new("/workspace".into());
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.input = "one two\nthree four".to_owned();
         app.cursor = app.input.len();
 
@@ -2605,21 +2586,39 @@ mod tests {
         let command_up = KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER);
         let command_down = KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER);
 
-        assert!(!handle_key(alt_left, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(alt_left, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(&app.input[app.cursor..], "four");
 
-        assert!(!handle_key(alt_backspace, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(alt_backspace, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.input, "one two\nfour");
 
-        assert!(!handle_key(command_left, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(command_left, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.cursor, "one two\n".len());
 
-        assert!(!handle_key(command_delete, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(command_delete, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.input, "one two\n");
 
-        assert!(!handle_key(command_up, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(command_up, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.cursor, 0);
-        assert!(!handle_key(command_down, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(command_down, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.cursor, app.input.len());
 
         app.input = "one two\nthree four".to_owned();
@@ -2629,19 +2628,37 @@ mod tests {
         let command_right = KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER);
         let command_backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER);
 
-        assert!(!handle_key(alt_right, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(alt_right, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(&app.input[..app.cursor], "one two\nthree");
-        assert!(!handle_key(alt_delete, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(alt_delete, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.input, "one two\nthree");
 
-        assert!(!handle_key(command_left, &mut app, &commands).unwrap());
-        assert!(!handle_key(command_right, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(command_left, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
+        assert_eq!(
+            handle_key(command_right, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.cursor, app.input.len());
-        assert!(!handle_key(command_backspace, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(command_backspace, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.input, "one two\n");
 
         let command_character = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::SUPER);
-        assert!(!handle_key(command_character, &mut app, &commands).unwrap());
+        assert_eq!(
+            handle_key(command_character, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.input, "one two\n");
     }
 }
