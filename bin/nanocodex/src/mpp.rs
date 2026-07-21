@@ -1,5 +1,7 @@
 use std::{
+    fs,
     net::TcpListener as StdTcpListener,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -13,9 +15,18 @@ use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Context, Result, eyre};
 use futures_util::{SinkExt, StreamExt};
 use mpp::{
-    MppError, PaymentChallenge, PaymentCredential, PrivateKeySigner,
-    client::{PaymentProvider, TempoSessionProvider},
+    Address, MppError, PaymentChallenge, PaymentCredential, Signer,
+    client::{
+        PaymentProvider, TempoSessionProvider,
+        tempo::{
+            session::store::{
+                SqliteChannelStore, SqliteChannelStoreOptions, default_channel_database_path,
+            },
+            signing::{KeychainVersion, P256Jwk, TempoP256Signer, TempoSigningMode},
+        },
+    },
 };
+use serde::Deserialize;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{oneshot, watch},
@@ -32,16 +43,28 @@ use tokio_tungstenite::{
 };
 
 const DEFAULT_MPP_WEBSOCKET_URL: &str = "wss://openai.mpp.tempo.xyz/v1/responses";
-const DEFAULT_TEMPO_RPC_URL: &str = "https://rpc.moderato.tempo.xyz";
-const DEFAULT_MAX_DEPOSIT: u128 = 10_000_000;
+const DEFAULT_TEMPO_RPC_URL: &str = "https://rpc.mainnet.tempo.xyz";
+const DEFAULT_MAX_DEPOSIT: u128 = 1_000_000;
 
 #[derive(Args, Clone)]
 pub(crate) struct MppArgs {
+    /// Connect directly to `OpenAI`. This is the default provider.
+    #[arg(
+        long = "provider.openai",
+        global = true,
+        env = "NANOCODEX_PROVIDER_OPENAI",
+        default_value_t = false,
+        action = ArgAction::SetTrue,
+        conflicts_with = "tempo"
+    )]
+    openai: bool,
+
     /// Pay for the Responses WebSocket through MPP.
     #[arg(
-        long = "mpp",
+        long = "provider.tempo",
+        id = "tempo",
         global = true,
-        env = "NANOCODEX_MPP",
+        env = "NANOCODEX_PROVIDER_TEMPO",
         default_value_t = false,
         action = ArgAction::SetTrue
     )]
@@ -49,29 +72,35 @@ pub(crate) struct MppArgs {
 
     /// Paid MPP WebSocket endpoint.
     #[arg(
-        long = "mpp-responses-websocket-url",
+        long = "provider.tempo.responses-websocket-url",
         global = true,
-        env = "MPP_RESPONSES_WEBSOCKET_URL",
+        env = "NANOCODEX_PROVIDER_TEMPO_RESPONSES_WEBSOCKET_URL",
         default_value = DEFAULT_MPP_WEBSOCKET_URL,
         value_parser = NonEmptyStringValueParser::new()
     )]
     mpp_websocket_url: String,
 
-    /// Tempo account private key used to open and voucher the native session.
+    /// Tempo Wallet state containing the logged-in account and access key.
     #[arg(
-        long = "tempo-private-key",
+        long = "provider.tempo.wallet-store",
         global = true,
-        env = "TEMPO_PRIVATE_KEY",
-        hide_env_values = true,
-        value_parser = NonEmptyStringValueParser::new()
+        env = "NANOCODEX_PROVIDER_TEMPO_WALLET_STORE"
     )]
-    private_key: Option<String>,
+    wallet_store: Option<PathBuf>,
+
+    /// `SQLite` channel store shared with Tempo Wallet and `MPPx` CLIs.
+    #[arg(
+        long = "provider.tempo.channel-store",
+        global = true,
+        env = "NANOCODEX_PROVIDER_TEMPO_CHANNEL_STORE"
+    )]
+    channel_store: Option<PathBuf>,
 
     /// Tempo RPC used for native TIP-1034 channel operations.
     #[arg(
-        long = "tempo-rpc-url",
+        long = "provider.tempo.rpc-url",
         global = true,
-        env = "TEMPO_RPC_URL",
+        env = "NANOCODEX_PROVIDER_TEMPO_RPC_URL",
         default_value = DEFAULT_TEMPO_RPC_URL,
         value_parser = NonEmptyStringValueParser::new()
     )]
@@ -79,18 +108,18 @@ pub(crate) struct MppArgs {
 
     /// Maximum native session deposit in token atomic units.
     #[arg(
-        long = "mpp-max-deposit",
+        long = "provider.tempo.max-deposit",
         global = true,
-        env = "MPP_MAX_DEPOSIT",
+        env = "NANOCODEX_PROVIDER_TEMPO_MAX_DEPOSIT",
         default_value_t = DEFAULT_MAX_DEPOSIT
     )]
     max_deposit: u128,
 
     /// Optional access key for gated MPP deployments such as Moderato staging.
     #[arg(
-        long = "mpp-api-key",
+        long = "provider.tempo.api-key",
         global = true,
-        env = "MPP_API_KEY",
+        env = "NANOCODEX_PROVIDER_TEMPO_API_KEY",
         hide_env_values = true,
         value_parser = NonEmptyStringValueParser::new()
     )]
@@ -98,7 +127,6 @@ pub(crate) struct MppArgs {
 }
 
 impl MppArgs {
-    #[cfg(test)]
     pub(crate) const fn is_enabled(&self) -> bool {
         self.enabled
     }
@@ -107,16 +135,32 @@ impl MppArgs {
         self,
         direct_websocket_url: String,
     ) -> Result<(String, Option<MppAdapter>)> {
-        if !self.enabled {
+        if self.openai || !self.enabled {
             return Ok((direct_websocket_url, None));
         }
-        let private_key = self
-            .private_key
-            .ok_or_else(|| eyre!("--mpp requires TEMPO_PRIVATE_KEY or --tempo-private-key"))?;
-        let signer = PrivateKeySigner::from_str(&private_key)
-            .wrap_err("TEMPO_PRIVATE_KEY is not a valid private key")?;
-        let session = TempoSessionProvider::new(signer, &self.rpc_url)
+        let wallet_path = self.wallet_store.unwrap_or(
+            default_channel_database_path()
+                .map_err(|error| eyre!(error))?
+                .with_file_name("store.json"),
+        );
+        let wallet = TempoWallet::load(&wallet_path)?;
+        let endpoint = payment_http_url(&self.mpp_websocket_url)?;
+        let store = SqliteChannelStore::open(SqliteChannelStoreOptions {
+            namespace: endpoint.origin().ascii_serialization(),
+            path: self.channel_store,
+            request_url: Some(endpoint.to_string()),
+        })
+        .map_err(|error| eyre!(error))
+        .wrap_err("failed to open the Tempo session channel store")?;
+        let session = TempoSessionProvider::new(wallet.signer, &self.rpc_url)
             .wrap_err("failed to configure the native Tempo session provider")?
+            .with_signing_mode(TempoSigningMode::Keychain {
+                wallet: wallet.account,
+                key_authorization: None,
+                version: KeychainVersion::V2,
+            })
+            .with_authorized_signer(wallet.access_key)
+            .with_channel_store(Arc::new(store))
             .with_default_deposit(self.max_deposit)
             .with_max_deposit(self.max_deposit);
         let payment = NativeSession(session);
@@ -133,6 +177,7 @@ impl MppArgs {
             .wrap_err("failed to start the local MPP WebSocket adapter")?;
         let config = Arc::new(BridgeConfig {
             endpoint: self.mpp_websocket_url,
+            bootstrap_url: endpoint.to_string(),
             api_key: self.mpp_api_key,
             payment,
         });
@@ -146,6 +191,125 @@ impl MppArgs {
             }),
         ))
     }
+}
+
+#[derive(Deserialize)]
+struct TempoWalletFile {
+    #[serde(rename = "tempo-cli.store")]
+    store: TempoWalletEnvelope,
+}
+
+#[derive(Deserialize)]
+struct TempoWalletEnvelope {
+    state: TempoWalletState,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TempoWalletState {
+    active_account: serde_json::Value,
+    chain_id: u64,
+    accounts: Vec<TempoWalletAccount>,
+    access_keys: Vec<TempoAccessKey>,
+}
+
+#[derive(Deserialize)]
+struct TempoWalletAccount {
+    address: Address,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TempoAccessKey {
+    address: Address,
+    access: Address,
+    chain_id: u64,
+    key_type: String,
+    handle: TempoAccessKeyHandle,
+}
+
+#[derive(Deserialize)]
+struct TempoAccessKeyHandle {
+    kind: String,
+    jwk: P256Jwk,
+}
+
+struct TempoWallet {
+    account: Address,
+    access_key: Address,
+    signer: TempoP256Signer,
+}
+
+impl TempoWallet {
+    fn load(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path)
+            .wrap_err_with(|| format!("failed to read Tempo Wallet state at {}", path.display()))?;
+        let file: TempoWalletFile = serde_json::from_slice(&bytes)
+            .wrap_err_with(|| format!("invalid Tempo Wallet state at {}", path.display()))?;
+        let state = file.store.state;
+        let account = active_account(&state)?;
+        let access_key = state
+            .access_keys
+            .into_iter()
+            .find(|key| key.chain_id == state.chain_id && key.access == account)
+            .ok_or_else(|| {
+                eyre!(
+                    "Tempo Wallet has no access key for active chain {}",
+                    state.chain_id
+                )
+            })?;
+        if access_key.key_type != "p256" || access_key.handle.kind != "webcrypto-p256" {
+            return Err(eyre!(
+                "Tempo Wallet access key must be an extractable P-256 JWK"
+            ));
+        }
+        let signer = TempoP256Signer::from_webcrypto_jwk(&access_key.handle.jwk)
+            .wrap_err("failed to load the Tempo Wallet access key")?;
+        if Signer::address(&signer) != access_key.address {
+            return Err(eyre!(
+                "Tempo Wallet access-key address does not match its persisted JWK"
+            ));
+        }
+        Ok(Self {
+            account,
+            access_key: access_key.address,
+            signer,
+        })
+    }
+}
+
+fn active_account(state: &TempoWalletState) -> Result<Address> {
+    if let Some(index) = state.active_account.as_u64() {
+        return usize::try_from(index)
+            .ok()
+            .and_then(|index| state.accounts.get(index))
+            .map(|account| account.address)
+            .ok_or_else(|| eyre!("Tempo Wallet active account index is out of range"));
+    }
+    if let Some(address) = state.active_account.as_str() {
+        let address = Address::from_str(address).wrap_err("invalid Tempo Wallet active account")?;
+        if state
+            .accounts
+            .iter()
+            .any(|account| account.address == address)
+        {
+            return Ok(address);
+        }
+    }
+    Err(eyre!("Tempo Wallet active account is missing or invalid"))
+}
+
+fn payment_http_url(websocket_url: &str) -> Result<reqwest13::Url> {
+    let mut url = reqwest13::Url::parse(websocket_url)
+        .wrap_err("Tempo Responses WebSocket URL is invalid")?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        scheme => return Err(eyre!("unsupported Tempo WebSocket URL scheme {scheme}")),
+    };
+    url.set_scheme(scheme)
+        .map_err(|()| eyre!("failed to derive the Tempo payment bootstrap URL"))?;
+    Ok(url)
 }
 
 pub(crate) struct MppAdapter {
@@ -231,6 +395,7 @@ impl CloseProvider for NativeSession {
 
 struct BridgeConfig {
     endpoint: String,
+    bootstrap_url: String,
     api_key: Option<String>,
     payment: NativeSession,
 }
@@ -315,6 +480,24 @@ async fn bridge(
         .map_err(|_| eyre!("local Responses WebSocket header capture was poisoned"))?
         .take()
         .ok_or_else(|| eyre!("local Responses WebSocket headers were not captured"))?;
+
+    let mut bootstrap_headers = reqwest13::header::HeaderMap::new();
+    if let Some(api_key) = &config.api_key {
+        bootstrap_headers.insert(
+            reqwest13::header::HeaderName::from_static("x-api-key"),
+            reqwest13::header::HeaderValue::from_str(api_key)?,
+        );
+    }
+    config
+        .payment
+        .0
+        .bootstrap_with_headers(
+            &reqwest13::Client::new(),
+            &config.bootstrap_url,
+            bootstrap_headers,
+        )
+        .await
+        .wrap_err("failed to rehydrate the Tempo MPP session")?;
 
     let mut connector = MppApplicationWsConnect::new(
         &config.endpoint,
@@ -408,9 +591,11 @@ mod tests {
 
     fn args(enabled: bool) -> MppArgs {
         MppArgs {
+            openai: false,
             enabled,
             mpp_websocket_url: DEFAULT_MPP_WEBSOCKET_URL.to_owned(),
-            private_key: None,
+            wallet_store: None,
+            channel_store: None,
             rpc_url: DEFAULT_TEMPO_RPC_URL.to_owned(),
             max_deposit: DEFAULT_MAX_DEPOSIT,
             mpp_api_key: None,
@@ -427,15 +612,54 @@ mod tests {
     }
 
     #[test]
-    fn mpp_requires_a_tempo_signer() {
-        let error = args(true)
-            .start("wss://api.openai.com/v1/responses".to_owned())
-            .err()
-            .unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("--mpp requires TEMPO_PRIVATE_KEY")
+    fn derives_payment_bootstrap_url() {
+        let url = payment_http_url("wss://openai.mpp.tempo.xyz/v1/responses").unwrap();
+        assert_eq!(url.as_str(), "https://openai.mpp.tempo.xyz/v1/responses");
+    }
+
+    #[test]
+    fn loads_accounts_sdk_access_key() {
+        let path = std::env::temp_dir().join(format!(
+            "nanocodex-tempo-wallet-{}.json",
+            std::process::id()
+        ));
+        let json = r#"{
+          "tempo-cli.store": {
+            "version": 0,
+            "state": {
+              "activeAccount": 0,
+              "chainId": 4217,
+              "accounts": [{"address":"0x1111111111111111111111111111111111111111"}],
+              "accessKeys": [{
+                "address":"0xf0159a522607cd6ab1097204c9fafb7bbe6afb6c",
+                "access":"0x1111111111111111111111111111111111111111",
+                "chainId":4217,
+                "keyType":"p256",
+                "handle":{"kind":"webcrypto-p256","jwk":{
+                  "kty":"EC","crv":"P-256",
+                  "x":"OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8",
+                  "y":"0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0",
+                  "d":"QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI"
+                }}
+              }]
+            }
+          }
+        }"#;
+        fs::write(&path, json).unwrap();
+        let wallet = TempoWallet::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            wallet.account,
+            "0x1111111111111111111111111111111111111111"
+                .parse::<Address>()
+                .unwrap()
+        );
+        assert_eq!(
+            wallet.access_key,
+            "0xf0159a522607cd6ab1097204c9fafb7bbe6afb6c"
+                .parse::<Address>()
+                .unwrap()
         );
     }
 }

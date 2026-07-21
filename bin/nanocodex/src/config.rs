@@ -97,16 +97,16 @@ impl AgentArgs {
     }
 
     #[cfg(test)]
-    pub(crate) const fn uses_mpp(&self) -> bool {
+    pub(crate) const fn uses_tempo(&self) -> bool {
         self.mpp.is_enabled()
     }
 
     pub(crate) fn build(self) -> Result<ConfiguredAgent> {
         let mpp_enabled = self.mpp.is_enabled();
-        let api_key = match self.api_key {
-            Some(api_key) => api_key,
-            None if mpp_enabled => String::new(),
-            None => return Err(eyre!("--api-key or OPENAI_API_KEY is required")),
+        let api_key = match (mpp_enabled, self.api_key) {
+            (true, _) => "tempo-proxy".to_owned(),
+            (false, Some(api_key)) => api_key,
+            (false, None) => return Err(eyre!("--api-key or OPENAI_API_KEY is required")),
         };
         let (websocket_url, mpp_adapter) = self.mpp.start(self.websocket_url)?;
         let responses = Responses::builder()

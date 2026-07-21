@@ -7,6 +7,7 @@ mod view;
 
 use std::{
     collections::VecDeque,
+    path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -259,10 +260,7 @@ enum Submission {
 }
 
 pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Result<()> {
-    let cwd = config
-        .cwd()
-        .canonicalize()
-        .wrap_err("failed to resolve the working directory")?;
+    let cwd = resolve_cwd(&config)?;
     let configured = config.build()?;
     let agent = configured.handle;
     let mut agent_events = configured.events;
@@ -363,6 +361,23 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     drop(terminal);
     drop(worker_tx);
     drop(agent_events);
+    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter).await;
+    loop_result?;
+    shutdown_result
+}
+
+fn resolve_cwd(config: &AgentArgs) -> Result<PathBuf> {
+    config
+        .cwd()
+        .canonicalize()
+        .wrap_err("failed to resolve the working directory")
+}
+
+async fn shutdown_runtime(
+    worker: tokio::task::JoinHandle<()>,
+    child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
+    mpp_adapter: Option<crate::mpp::MppAdapter>,
+) -> Result<()> {
     worker.abort();
     let worker_result = worker.await;
     if let Some(child_agents) = child_agents {
@@ -373,7 +388,6 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     } else {
         Ok(())
     };
-    loop_result?;
     match worker_result {
         Ok(()) => {}
         Err(error) if error.is_cancelled() => {}

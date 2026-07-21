@@ -79,39 +79,50 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
 
-    const PRIVATE_KEY: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
-
     #[test]
-    fn mpp_flags_select_the_tui_transport() {
+    fn tempo_flag_selects_the_tui_transport() {
         let cli = Cli::try_parse_from([
             "nanocodex",
-            "--api-key",
-            "test-key",
-            "--mpp",
-            "--tempo-private-key",
-            PRIVATE_KEY,
+            "--provider.tempo",
+            "--provider.tempo.wallet-store",
+            "/tmp/tempo-wallet.json",
         ])
         .unwrap();
 
         assert!(cli.command.is_none());
-        assert!(cli.agent.uses_mpp());
+        assert!(cli.agent.uses_tempo());
     }
 
     #[test]
-    fn mpp_flags_select_the_one_shot_transport() {
+    fn tempo_flag_selects_the_one_shot_transport() {
         let cli = Cli::try_parse_from([
             "nanocodex",
-            "--api-key",
-            "test-key",
             "run",
             "reply with ok",
-            "--mpp",
-            "--tempo-private-key",
-            PRIVATE_KEY,
+            "--provider.tempo",
+            "--provider.tempo.wallet-store",
+            "/tmp/tempo-wallet.json",
         ])
         .unwrap();
 
         assert!(matches!(cli.command, Some(Command::Run(_))));
-        assert!(cli.agent.uses_mpp());
+        assert!(cli.agent.uses_tempo());
+    }
+
+    #[test]
+    fn openai_provider_is_explicitly_selectable() {
+        let cli = Cli::try_parse_from(["nanocodex", "--provider.openai", "--api-key", "test-key"])
+            .unwrap();
+
+        assert!(!cli.agent.uses_tempo());
+    }
+
+    #[test]
+    fn provider_selection_is_exclusive() {
+        let error = Cli::try_parse_from(["nanocodex", "--provider.openai", "--provider.tempo"])
+            .err()
+            .unwrap();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

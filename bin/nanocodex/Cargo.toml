@@ -11,7 +11,7 @@ repository.workspace = true
 description = "Daily-driver TUI and headless JSONL adapter for Nanocodex"
 
 [dependencies]
-alloy-transport-mpp = { version = "=0.2.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "0326f687e857063c8f3bb9fa21f8051f3935fc43" }
+alloy-transport-mpp = { version = "=0.2.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "c570cdc48c0847ad4c5e62667b5c8ba19ee230dc" }
 clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
@@ -19,9 +19,10 @@ eyre.workspace = true
 futures-util.workspace = true
 nanocodex.workspace = true
 nanocodex-observability.workspace = true
-mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "0326f687e857063c8f3bb9fa21f8051f3935fc43", default-features = false, features = ["tempo", "ws", "reqwest-rustls-tls"] }
+mpp = { version = "=0.11.0", git = "https://github.com/tempoxyz/mpp-rs", rev = "c570cdc48c0847ad4c5e62667b5c8ba19ee230dc", default-features = false, features = ["tempo", "ws", "sqlite", "reqwest-rustls-tls"] }
 ratatui.workspace = true
 reqwest.workspace = true
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
 self-replace.workspace = true
 semver.workspace = true
 serde.workspace = true

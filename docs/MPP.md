@@ -63,9 +63,23 @@ the canonical application socket, not that legacy dialect.
 
 ## Native Tempo sessions
 
-The CLI configures `mpp::TempoSessionProvider` with the selected private key,
-RPC endpoint, and maximum deposit. The OpenAI proxy offers native v2 before
-legacy v1. The v2 challenge uses:
+The CLI reads the active account and extractable P-256 access key written by
+Tempo Wallet login at `~/.tempo/wallet/store.json`. It uses Alloy's generic
+signer interface with a Tempo keychain-v2 envelope; there is no Nanocodex
+signer abstraction and no raw private-key CLI option. The same access key can
+therefore open and voucher sessions from Wallet CLI, MPPx, or Rust.
+
+`mpp::TempoSessionProvider` owns channel recovery and cumulative voucher state.
+Its `ChannelStore` is deliberately persistence-only. Nanocodex opts into the
+MPPx-compatible SQLite implementation at `~/.tempo/wallet/channels.db`; a
+library caller that does not configure persistence gets the in-memory store.
+Before the paid WebSocket probe, the provider performs the server's
+authenticated `HEAD` bootstrap, reconciles the returned session snapshot with
+TIP-1034 on-chain state, and then updates SQLite and its live registry. A new
+process can consequently resume a server-known session even when its local
+database starts empty.
+
+The OpenAI proxy offers native v2 before legacy v1. The v2 challenge uses:
 
 - Moderato chain ID `42431` or Tempo mainnet chain ID `4217`;
 - TIP-1034 reserve precompile
@@ -136,21 +150,33 @@ existing fixed-tick behavior.
 Enable the adapter with:
 
 ```text
---mpp
---mpp-responses-websocket-url <ws-or-wss-url>
---tempo-private-key <key>                 # prefer TEMPO_PRIVATE_KEY
---tempo-rpc-url <url>
---mpp-max-deposit <atomic-units>
---mpp-api-key <key>                       # optional gated deployment key
+--provider.openai
+--provider.tempo
+--provider.tempo.responses-websocket-url <ws-or-wss-url>
+--provider.tempo.wallet-store <path>       # default ~/.tempo/wallet/store.json
+--provider.tempo.channel-store <path>      # default ~/.tempo/wallet/channels.db
+--provider.tempo.rpc-url <url>
+--provider.tempo.max-deposit <atomic-units>
+--provider.tempo.api-key <key>             # optional gated deployment key
 ```
 
 These are global CLI flags. They select the same paid transport for both the
 interactive TUI and the headless one-shot runner:
 
 ```text
-nanocodex --mpp --prompt "say hello"
-nanocodex run "say hello" --mpp
+nanocodex --provider.tempo --prompt "say hello"
+nanocodex run "say hello" --provider.tempo
 ```
+
+The defaults target Tempo mainnet and
+`wss://openai.mpp.tempo.xyz/v1/responses`. Direct OpenAI is the default;
+`--provider.openai` makes that selection explicit. `--provider.tempo` does not
+require an OpenAI API key because the proxy owns the upstream credential.
+
+The eventual login surface follows the same namespace: `nanocodex login`
+defaults to OpenAI OAuth, while `nanocodex login --provider.tempo` runs the
+Tempo Wallet login flow and writes the shared Accounts SDK store. OpenAI OAuth
+is intentionally not stubbed by this integration.
 
 Both paths retain the adapter until the agent handle is dropped and then
 perform the canonical signed session close. TUI teardown restores the terminal
@@ -173,6 +199,6 @@ Required validation before merging:
   test.
 - Nanocodex: rustfmt, Clippy with warnings denied, CLI tests, and unchanged
   library tests.
-- Live: faucet-fund a fresh Moderato payer, open a native v2 channel against a
-  local proxy, and complete two sequential real OpenAI Responses turns through
-  one paid WebSocket without exposing either secret.
+- Live: use the logged-in mainnet wallet access key, rehydrate or open a native
+  v2 channel, and complete two sequential real OpenAI Responses turns through
+  one paid WebSocket without exposing either the wallet JWK or OpenAI secret.
