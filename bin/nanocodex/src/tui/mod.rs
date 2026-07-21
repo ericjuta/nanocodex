@@ -270,7 +270,9 @@ impl UiModel {
                 }
             }
             UiAction::Agent(event) => {
-                if self.app.on_main_agent_event(0, &event) {
+                let updated = self.app.on_main_agent_event(0, &event);
+                request_navigated_branch_switch(&mut self.app, commands)?;
+                if updated {
                     Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
                 } else {
                     Ok(UiUpdate::Ignore)
@@ -539,6 +541,7 @@ fn handle_worker_update(
         }
         WorkerEvent::MainBranchAgentEvent { id, event } => {
             let _ = app.on_main_agent_event(id, &event.event);
+            request_navigated_branch_switch(app, commands)?;
         }
         WorkerEvent::MainBranchEventStreamClosed { id } => {
             app.main_branch_event_stream_closed(id);
@@ -1757,7 +1760,7 @@ mod tests {
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
         UiUpdate, WorkerCommand, WorkerEvent, active_session_id, classify_submission, handle_key,
-        prepare_btw_prompt, session_trace_url, spawn_agent_worker,
+        handle_worker_update, prepare_btw_prompt, session_trace_url, spawn_agent_worker,
     };
     use crate::tui::app::App;
 
@@ -2396,6 +2399,26 @@ mod tests {
         assert!(matches!(
             worker.try_recv(),
             Ok(WorkerCommand::SwitchMainBranch { id: 0 })
+        ));
+
+        let _ = handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut app,
+            "root-session",
+            &commands,
+        )?;
+        assert!(worker.try_recv().is_err());
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::MainBranchSwitched {
+                id: 0,
+                request_id: Arc::from("root-session"),
+            },
+            &commands,
+        )?;
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SwitchMainBranch { id: 1 })
         ));
         Ok(())
     }
