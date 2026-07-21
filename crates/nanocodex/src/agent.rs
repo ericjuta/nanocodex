@@ -321,6 +321,19 @@ impl Nanocodex {
         })
     }
 
+    /// Starts a clean sibling agent with the same private configuration,
+    /// workspace policy, service factory, and tools factory.
+    ///
+    /// The sibling receives a new session, cache lineage, conversation,
+    /// WebSocket, and tool runtime. It does not inherit conversation history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after this agent's driver has stopped.
+    pub async fn spawn(&self) -> Result<(Self, AgentEvents)> {
+        request_spawn(&self.commands).await
+    }
+
     /// Forks from the latest safe model boundary into an independently driven
     /// agent.
     ///
@@ -1354,6 +1367,19 @@ mod tests {
 
         let (child, child_events) = handle.spawn().await.unwrap();
         drop((child, child_events, agent, events));
+    }
+
+    #[tokio::test]
+    async fn owning_agent_supports_clean_spawn() {
+        let responses = Responses::builder().service(|| NeverCalled).build();
+        let (agent, events) = Nanocodex::builder("test")
+            .responses(responses)
+            .build()
+            .unwrap();
+
+        let (sibling, sibling_events) = agent.spawn().await.unwrap();
+
+        drop((sibling, sibling_events, agent, events));
     }
 
     #[tokio::test]
