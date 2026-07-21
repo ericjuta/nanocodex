@@ -16,7 +16,7 @@ class BindingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected low"):
             Nanocodex("test-key", thinking="impossible")
 
-        with self.assertRaisesRegex(RuntimeError, "must not be empty"):
+        with self.assertRaisesRegex(RuntimeError, "OpenAI credentials are empty"):
             Nanocodex("")
 
     @unittest.skipUnless(os.environ.get("OPENAI_API_KEY"), "live API key not configured")
