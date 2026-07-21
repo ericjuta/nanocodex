@@ -1,9 +1,16 @@
-use std::{fs, hint::black_box, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    hint::black_box,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nanocodex_core::{
     AgentEvent, AgentEventKind, ContentItem, FunctionOutputBody, FunctionOutputContent,
-    MessageRole, ResponseItem,
+    MessageRole, ResponseItem, responses::ServerEvent,
 };
 use nanocodex_service::EncodedRequest;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -38,6 +45,33 @@ struct OutputTextDelta {
     #[serde(rename = "type")]
     _kind: String,
     delta: String,
+}
+
+#[derive(Deserialize)]
+struct RetainedApiEvent {
+    direction: String,
+    event: Box<RawValue>,
+}
+
+#[derive(Serialize)]
+struct ApiEventRef<'a> {
+    direction: &'static str,
+    transport: &'static str,
+    phase: &'static str,
+    model_call_index: u32,
+    event: &'a RawValue,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum MetadataEvent {
+    #[serde(rename = "response.metadata")]
+    Metadata {
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Serialize)]
@@ -141,6 +175,31 @@ fn request_encoding(criterion: &mut Criterion) {
             &bytes,
             |bencher, _| {
                 bencher.iter(|| EncodedRequest::new(black_box(&request(prompt))).unwrap());
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("telemetry_input_bytes_then_encode", bytes),
+            &bytes,
+            |bencher, _| {
+                bencher.iter(|| {
+                    let request = request(prompt);
+                    let input_bytes = serde_json::to_vec(black_box(&request.input)).unwrap().len();
+                    let encoded = EncodedRequest::new(black_box(&request)).unwrap();
+                    black_box((input_bytes, encoded))
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("two_telemetry_sizes_then_encode", bytes),
+            &bytes,
+            |bencher, _| {
+                bencher.iter(|| {
+                    let request = request(prompt);
+                    let first_size = serde_json::to_vec(black_box(&request.input)).unwrap().len();
+                    let second_size = serde_json::to_vec(black_box(&request.input)).unwrap().len();
+                    let encoded = EncodedRequest::new(black_box(&request)).unwrap();
+                    black_box((first_size, second_size, encoded))
+                });
             },
         );
         group.bench_with_input(
@@ -374,6 +433,118 @@ fn retained_agent_event_trace(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn retained_response_event_pipeline(criterion: &mut Criterion) {
+    let Some(path) = std::env::var_os("NANOCODEX_BENCH_EVENTS") else {
+        return;
+    };
+    let mut path = PathBuf::from(path);
+    if path.is_relative() {
+        path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(path);
+    }
+    let events = retained_inbound_events(&path);
+    let event_bytes = events.iter().map(|event| event.get().len()).sum::<usize>();
+    eprintln!(
+        "retained response events: events={} bytes={event_bytes}",
+        events.len()
+    );
+
+    let mut group = criterion.benchmark_group("retained_response_event_pipeline");
+    group.sample_size(30);
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Bytes(event_bytes as u64));
+    group.bench_function("metadata_full_decode", |bencher| {
+        bencher.iter(|| {
+            let metadata_events = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        serde_json::from_str::<MetadataEvent>(black_box(event.get())).unwrap(),
+                        MetadataEvent::Metadata { headers } if !headers.is_empty()
+                    )
+                })
+                .count();
+            black_box(metadata_events)
+        });
+    });
+    group.bench_function("metadata_type_prefix_guard", |bencher| {
+        bencher.iter(|| {
+            let metadata_events = events
+                .iter()
+                .filter(|event| {
+                    (!event.get().starts_with(r#"{"type":""#)
+                        || event.get().starts_with(r#"{"type":"response.metadata""#))
+                        && matches!(
+                            serde_json::from_str::<MetadataEvent>(event.get()).unwrap(),
+                            MetadataEvent::Metadata { headers } if !headers.is_empty()
+                        )
+                })
+                .count();
+            black_box(metadata_events)
+        });
+    });
+    group.bench_function("validate_raw", |bencher| {
+        bencher.iter(|| {
+            let bytes = events
+                .iter()
+                .map(|event| {
+                    let decoded =
+                        serde_json::from_str::<&RawValue>(black_box(event.get())).unwrap();
+                    decoded.get().len()
+                })
+                .sum::<usize>();
+            black_box(bytes)
+        });
+    });
+    group.bench_function("decode_typed", |bencher| {
+        bencher.iter(|| {
+            let outputs = events
+                .iter()
+                .filter(|event| {
+                    !matches!(
+                        serde_json::from_str::<ServerEvent>(black_box(event.get())).unwrap(),
+                        ServerEvent::Other
+                    )
+                })
+                .count();
+            black_box(outputs)
+        });
+    });
+    group.bench_function("encode_event_payload", |bencher| {
+        bencher.iter(|| {
+            let bytes = events
+                .iter()
+                .map(|event| {
+                    serde_json::value::to_raw_value(&ApiEventRef {
+                        direction: "inbound",
+                        transport: "responses_websocket_v2",
+                        phase: "generation",
+                        model_call_index: 1,
+                        event,
+                    })
+                    .unwrap()
+                    .get()
+                    .len()
+                })
+                .sum::<usize>();
+            black_box(bytes)
+        });
+    });
+    group.finish();
+}
+
+fn retained_inbound_events(path: &Path) -> Vec<Box<RawValue>> {
+    let encoded = fs::read(path).expect("NANOCODEX_BENCH_EVENTS should name a readable trace");
+    decode_jsonl::<AgentEvent>(&encoded)
+        .into_iter()
+        .filter(|event| event.kind == AgentEventKind::ApiEvent)
+        .filter_map(|event| serde_json::from_str::<RetainedApiEvent>(event.payload.get()).ok())
+        .filter(|event| event.direction == "inbound")
+        .map(|event| event.event)
+        .collect()
+}
+
 fn realistic_history(bytes: usize) -> (Vec<u8>, Vec<Value>, Vec<ResponseItem>) {
     let encrypted = "opaque-reasoning-state".repeat(12);
     let tool_output = "bounded command output".repeat(16);
@@ -559,6 +730,7 @@ criterion_group!(
     event_decoding,
     agent_event_encoding,
     retained_agent_event_trace,
+    retained_response_event_pipeline,
     response_item_history,
     message_content_storage,
     tower_dispatch

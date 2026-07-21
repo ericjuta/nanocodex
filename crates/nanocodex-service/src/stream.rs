@@ -26,6 +26,7 @@ pub struct TurnResult {
     pub usage: Option<Usage>,
     pub time_to_first_event_ns: u64,
     pub time_to_first_output_ns: Option<u64>,
+    pub pipeline_stats: ResponsePipelineStats,
 }
 
 pub struct CompactionResult {
@@ -35,6 +36,17 @@ pub struct CompactionResult {
     pub usage: Option<Usage>,
     pub time_to_first_event_ns: u64,
     pub time_to_first_output_ns: Option<u64>,
+    pub pipeline_stats: ResponsePipelineStats,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ResponsePipelineStats {
+    pub event_count: u64,
+    pub event_bytes: u64,
+    pub receive_wait_duration_ns: u64,
+    pub parse_duration_ns: u64,
+    pub emit_duration_ns: u64,
+    pub decode_duration_ns: u64,
 }
 
 pub struct CodeCall {
@@ -86,6 +98,7 @@ struct StreamTiming {
     started_at: Instant,
     first_event_ns: Option<u64>,
     first_output_ns: Option<u64>,
+    pipeline: ResponsePipelineStats,
 }
 
 impl StreamTiming {
@@ -94,6 +107,14 @@ impl StreamTiming {
             started_at,
             first_event_ns: None,
             first_output_ns: None,
+            pipeline: ResponsePipelineStats {
+                event_count: 0,
+                event_bytes: 0,
+                receive_wait_duration_ns: 0,
+                parse_duration_ns: 0,
+                emit_duration_ns: 0,
+                decode_duration_ns: 0,
+            },
         }
     }
 }
@@ -194,6 +215,7 @@ pub(crate) async fn receive(
                     usage: response.usage,
                     time_to_first_event_ns: timing.first_event_ns.unwrap_or_default(),
                     time_to_first_output_ns: timing.first_output_ns,
+                    pipeline_stats: timing.pipeline,
                 });
             }
             _ => {}
@@ -264,6 +286,7 @@ pub(crate) async fn receive_compaction(
                     usage: response.usage,
                     time_to_first_event_ns: timing.first_event_ns.unwrap_or_default(),
                     time_to_first_output_ns: timing.first_output_ns,
+                    pipeline_stats: timing.pipeline,
                 });
             }
             _ => {}
@@ -278,10 +301,28 @@ async fn next_event(
     call_index: u32,
     timing: &mut StreamTiming,
 ) -> Result<ServerEvent, ResponsesServiceError> {
+    let receive_started_at = Instant::now();
     let text = socket.next_text_or_idle_timeout().await?;
+    timing.pipeline.receive_wait_duration_ns = timing
+        .pipeline
+        .receive_wait_duration_ns
+        .saturating_add(elapsed_ns(receive_started_at));
+    timing.pipeline.event_count = timing.pipeline.event_count.saturating_add(1);
+    timing.pipeline.event_bytes = timing
+        .pipeline
+        .event_bytes
+        .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+
+    let parse_started_at = Instant::now();
     let raw_event = parse_raw_json(text.as_str())?;
+    timing.pipeline.parse_duration_ns = timing
+        .pipeline
+        .parse_duration_ns
+        .saturating_add(elapsed_ns(parse_started_at));
     let elapsed = elapsed_ns(timing.started_at);
     timing.first_event_ns.get_or_insert(elapsed);
+
+    let emit_started_at = Instant::now();
     events.emit(
         AgentEventKind::ApiEvent,
         ApiEvent {
@@ -292,7 +333,17 @@ async fn next_event(
             event: raw_event,
         },
     )?;
+    timing.pipeline.emit_duration_ns = timing
+        .pipeline
+        .emit_duration_ns
+        .saturating_add(elapsed_ns(emit_started_at));
+
+    let decode_started_at = Instant::now();
     let event = decode_event::<ServerEvent>(raw_event)?;
+    timing.pipeline.decode_duration_ns = timing
+        .pipeline
+        .decode_duration_ns
+        .saturating_add(elapsed_ns(decode_started_at));
     if matches!(
         event,
         ServerEvent::OutputTextDelta { .. }

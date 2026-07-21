@@ -169,7 +169,13 @@ impl ResponsesService {
             self.connect(connection, request).await?;
         }
         let generation = connection.generation;
+        let encode_started_at = Instant::now();
         let encoded = self.encode_request(connection, request)?;
+        let encode_duration_ns = elapsed_ns(encode_started_at);
+        let request_bytes = encoded.raw().get().len();
+        let span = tracing::Span::current();
+        span.record("request.bytes", request_bytes);
+        span.record("request.encode.duration_ns", encode_duration_ns);
         request.observer.emit(
             AgentEventKind::ApiEvent,
             ApiEvent {
@@ -187,9 +193,12 @@ impl ResponsesService {
                 generation,
             )
         })?;
+        let send_started_at = Instant::now();
         socket.send(encoded).await.map_err(|error| {
             ResponsesServiceError::responses(error, FailurePhase::Send, generation)
         })?;
+        let send_duration_ns = elapsed_ns(send_started_at);
+        span.record("request.send.duration_ns", send_duration_ns);
         let output = match request.kind {
             ResponsesAttemptKind::Warmup => ResponsesOutput::Warmup(
                 receive_warmup(socket, request)
@@ -217,6 +226,20 @@ impl ResponsesService {
                 .map_err(|error| error.with_connection_generation(generation))?,
             ),
         };
+        let pipeline_stats = match &output {
+            ResponsesOutput::Warmup(_) => None,
+            ResponsesOutput::Generation(result) => Some(result.pipeline_stats),
+            ResponsesOutput::Compaction(result) => Some(result.pipeline_stats),
+        };
+        if let Some(stats) = pipeline_stats {
+            record_pipeline_stats(
+                &span,
+                request_bytes,
+                encode_duration_ns,
+                send_duration_ns,
+                stats,
+            );
+        }
         Ok(ResponsesServiceResponse {
             output,
             attempt: request.attempt,
@@ -388,6 +411,38 @@ impl ResponsesService {
     }
 }
 
+fn record_pipeline_stats(
+    span: &tracing::Span,
+    request_bytes: usize,
+    encode_duration_ns: u64,
+    send_duration_ns: u64,
+    stats: stream::ResponsePipelineStats,
+) {
+    span.record("response.event.count", stats.event_count);
+    span.record("response.bytes", stats.event_bytes);
+    span.record(
+        "response.receive.wait_duration_ns",
+        stats.receive_wait_duration_ns,
+    );
+    span.record("response.parse.duration_ns", stats.parse_duration_ns);
+    span.record("response.emit.duration_ns", stats.emit_duration_ns);
+    span.record("response.decode.duration_ns", stats.decode_duration_ns);
+    tracing::info!(
+        target: "nanocodex_service",
+        stage = "responses.pipeline.completed",
+        request.bytes = request_bytes,
+        request.encode.duration_ns = encode_duration_ns,
+        request.send.duration_ns = send_duration_ns,
+        response.event.count = stats.event_count,
+        response.bytes = stats.event_bytes,
+        response.receive.wait_duration_ns = stats.receive_wait_duration_ns,
+        response.parse.duration_ns = stats.parse_duration_ns,
+        response.emit.duration_ns = stats.emit_duration_ns,
+        response.decode.duration_ns = stats.decode_duration_ns,
+        "Responses attempt pipeline timing"
+    );
+}
+
 impl Service<ResponsesAttempt> for ResponsesService {
     type Response = ResponsesServiceResponse;
     type Error = ResponsesServiceError;
@@ -400,7 +455,6 @@ impl Service<ResponsesAttempt> for ResponsesService {
     fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
         let service = self.clone();
         let input_item_count = request.input_item_count();
-        let input_bytes = serde_json::to_vec(&request.input()).map_or(0, |encoded| encoded.len());
         let span = info_span!(
             target: "nanocodex_service",
             "responses.attempt",
@@ -412,7 +466,15 @@ impl Service<ResponsesAttempt> for ResponsesService {
             max_attempts = request.max_attempts,
             replay.mode = request.replay_mode(),
             model.input.item_count = input_item_count,
-            model.input.bytes = input_bytes,
+            request.bytes = tracing::field::Empty,
+            request.encode.duration_ns = tracing::field::Empty,
+            request.send.duration_ns = tracing::field::Empty,
+            response.event.count = tracing::field::Empty,
+            response.bytes = tracing::field::Empty,
+            response.receive.wait_duration_ns = tracing::field::Empty,
+            response.parse.duration_ns = tracing::field::Empty,
+            response.emit.duration_ns = tracing::field::Empty,
+            response.decode.duration_ns = tracing::field::Empty,
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );

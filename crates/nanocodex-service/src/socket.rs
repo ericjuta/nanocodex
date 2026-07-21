@@ -218,14 +218,21 @@ impl ResponsesSocket {
         if self.turn_state.is_some() {
             return;
         }
-        let Ok(MetadataEvent::Metadata { headers }) = serde_json::from_str(text) else {
-            return;
-        };
-        self.turn_state = headers.into_iter().find_map(|(name, value)| {
-            name.eq_ignore_ascii_case(TURN_STATE_HEADER)
-                .then_some(value)
-        });
+        self.turn_state = turn_state_from_event(text);
     }
+}
+
+fn turn_state_from_event(text: &str) -> Option<String> {
+    if text.starts_with(r#"{"type":""#) && !text.starts_with(r#"{"type":"response.metadata""#) {
+        return None;
+    }
+    let Ok(MetadataEvent::Metadata { headers }) = serde_json::from_str(text) else {
+        return None;
+    };
+    headers.into_iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case(TURN_STATE_HEADER)
+            .then_some(value)
+    })
 }
 
 #[derive(Deserialize)]
@@ -394,7 +401,24 @@ mod tests {
         tungstenite::{Message, handshake::server::Request},
     };
 
-    use super::{ResponsesSocket, parse_raw_json};
+    use super::{ResponsesSocket, parse_raw_json, turn_state_from_event};
+
+    #[test]
+    fn only_decodes_turn_state_metadata_events() {
+        assert_eq!(
+            turn_state_from_event(
+                r#"{"headers":{"X-Codex-Turn-State":"state-1"},"type":"response.metadata"}"#,
+            )
+            .as_deref(),
+            Some("state-1")
+        );
+        assert_eq!(
+            turn_state_from_event(
+                r#"{"type":"response.output_text.delta","delta":"ordinary output"}"#,
+            ),
+            None
+        );
+    }
 
     #[tokio::test]
     #[allow(

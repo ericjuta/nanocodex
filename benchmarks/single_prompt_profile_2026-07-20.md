@@ -10,6 +10,11 @@ orders of magnitude and request boundaries; they are not a controlled model
 runtime comparison. Full event and fmt-subscriber traces are retained under
 `.nanocodex/profile-single-prompt/` and intentionally remain outside Git.
 
+The representative 41-task and long-output follow-up is in
+[`long_prompt_profile_2026-07-20.md`](long_prompt_profile_2026-07-20.md). It
+confirms the API/tool bottleneck, removes a redundant request-sizing pass, and
+adds per-attempt pipeline timings.
+
 ## Results
 
 ### One model call, no tool
