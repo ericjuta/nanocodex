@@ -13,6 +13,10 @@ pub enum OpenAiAuthMode {
 }
 
 impl OpenAiAuthMode {
+    pub(crate) const fn stores_responses(self) -> bool {
+        matches!(self, Self::ApiKey)
+    }
+
     #[must_use]
     pub const fn default_api_base_url(self) -> &'static str {
         match self {

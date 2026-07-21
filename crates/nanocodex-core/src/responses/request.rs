@@ -405,7 +405,7 @@ impl<'a> ResponseCreate<'a> {
                 summary: "detailed",
                 context: "all_turns",
             },
-            store: true,
+            store: config.auth.mode().stores_responses(),
             stream: true,
             include: ["reasoning.encrypted_content"],
             prompt_cache_key: profile.prompt_cache_key(),
@@ -482,6 +482,12 @@ mod tests {
     #[test]
     fn thinking_defaults_to_medium() {
         assert_eq!(ModelConfig::default().thinking, Thinking::Medium);
+    }
+
+    #[test]
+    fn response_storage_tracks_auth_mode() {
+        assert!(crate::OpenAiAuthMode::ApiKey.stores_responses());
+        assert!(!crate::OpenAiAuthMode::ChatGpt.stores_responses());
     }
 
     #[test]
