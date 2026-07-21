@@ -166,6 +166,11 @@ that this removes all 55 wait-selection model calls without delaying ordinary
    from 180.0 to 92.0 us, and 10,000 items from 2.05 to 0.98 ms. This remains
    small beside API and subprocess time, but it removes linear duplicate work
    from the long-session tool boundary.
+6. Four of the 61 retained nested shell results that returned a live session
+   ID lost that ID from the enclosing Code Mode output because the JavaScript
+   emitted only `result.output`. Code Mode now appends a resume notice when a
+   live nested session is not otherwise present in cell output, while avoiding
+   a duplicate notice when the script emits the complete result.
 
 ## Remaining boundaries
 

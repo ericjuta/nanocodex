@@ -428,6 +428,55 @@ text("after");
 }
 
 #[tokio::test]
+async fn running_shell_session_survives_output_only_javascript() -> Result<()> {
+    let workspace = temporary_workspace("running-shell-session-output")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const result = await tools.exec_command({ cmd: "sleep 5", yield_time_ms: 250 });
+text(result.output);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(
+        execution_output(&execution)
+            .contains("Nested shell process is still running with session ID 1")
+    );
+    tools.control().cancel().await;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_shell_session_notice_is_not_duplicated_for_full_results() -> Result<()> {
+    let workspace = temporary_workspace("visible-running-shell-session")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const result = await tools.exec_command({ cmd: "sleep 5", yield_time_ms: 250 });
+text(result);
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let output = execution_output(&execution);
+    assert!(output.contains(r#""session_id":1"#));
+    assert!(!output.contains("Nested shell process is still running"));
+    tools.control().cancel().await;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_terminates_yielded_code_cells() -> Result<()> {
     let workspace = temporary_workspace("cancelled-cell")?;
     let tools = test_tools(&workspace);

@@ -798,11 +798,12 @@ fn observed_execution(
     status: &str,
     success: bool,
     started_at: Instant,
-    content: Vec<ToolOutputContent>,
+    mut content: Vec<ToolOutputContent>,
     max_output_tokens: Option<usize>,
     nested_calls: Vec<(u64, NestedToolCall)>,
     notifications: Vec<CodeModeNotification>,
 ) -> CodeModeExecution {
+    expose_running_shell_sessions(&mut content, &nested_calls);
     let content = output::truncate_content(content, max_output_tokens);
     CodeModeExecution {
         output: with_status(status, started_at.elapsed().as_secs_f64(), content),
@@ -810,6 +811,48 @@ fn observed_execution(
         nested_calls: ordered_calls(nested_calls),
         notifications,
     }
+}
+
+fn expose_running_shell_sessions(
+    content: &mut Vec<ToolOutputContent>,
+    nested_calls: &[(u64, NestedToolCall)],
+) {
+    for (_, call) in nested_calls {
+        if !matches!(call.name.as_str(), "exec_command" | "write_stdin") {
+            continue;
+        }
+        let ToolOutputBody::Text(result) = &call.output else {
+            continue;
+        };
+        let Some(session_id) = serde_json::from_str::<Value>(result)
+            .ok()
+            .and_then(|result| result.get("session_id")?.as_i64())
+        else {
+            continue;
+        };
+        if content
+            .iter()
+            .filter_map(|item| match item {
+                ToolOutputContent::InputText { text } => Some(text),
+                ToolOutputContent::InputImage { .. } => None,
+            })
+            .any(|text| text_exposes_session_id(text, session_id))
+        {
+            continue;
+        }
+        content.push(ToolOutputContent::InputText {
+            text: format!(
+                "Nested shell process is still running with session ID {session_id}. Resume it with tools.write_stdin({{ session_id: {session_id}, chars: \"\" }})."
+            ),
+        });
+    }
+}
+
+fn text_exposes_session_id(text: &str, session_id: i64) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|value| {
+        value.as_i64() == Some(session_id)
+            || value.get("session_id").and_then(Value::as_i64) == Some(session_id)
+    })
 }
 
 impl NodeHost {
