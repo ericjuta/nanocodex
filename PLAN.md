@@ -414,6 +414,43 @@ Gate:
   Harbor holdout when credentials are available; reserve the full eval for the
   completed hardening milestone.
 
+#### 4.2 Standalone Hashline tool ergonomics (planned)
+
+Expose `hashline__read`, `hashline__find_block`, `hashline__patch`, and
+`hashline__transaction` as direct model-callable tools alongside their Code
+Mode bindings. Both surfaces must use the existing `HashlineHandler`,
+definitions, workspace policy, limits, telemetry, and transaction machinery;
+do not add a second parser, mutation owner, or compatibility adapter.
+
+Delivery order:
+
+1. [ ] Register the four existing Hashline handlers in the normal heterogeneous
+   tool registry with an explicit builder policy. Keep Code Mode registration
+   available for orchestration, and reject duplicate names deterministically.
+2. [ ] Make `hashline__read` return one unambiguous, copy-ready patch header and
+   describe it as the value accepted by `hashline__patch`. Visually and
+   structurally distinguish the 8-character Hashline file hash from the exact
+   byte digest used by transaction mutations.
+3. [ ] Add a direct single-file patch input that accepts the complete header
+   separately from its operations, while retaining the fully sectioned patch
+   program for multi-file edits. Both forms must normalize into the same
+   guarded patch request and preserve dry-run semantics.
+4. [ ] Add deterministic direct-call, schema, conflict, dry-run/apply, telemetry,
+   and nested-versus-standalone parity tests. Exercise a routine edit without a
+   JavaScript wrapper and prove stale evidence fails identically on both
+   surfaces.
+
+Gate:
+
+- A consumer can read, preview, apply, and verify a guarded edit using direct
+  tool calls only; the copy-ready header can be passed back without extracting
+  or transforming a digest.
+- Existing Code Mode Hashline round trips, recoverable transactions, public
+  custom tools, tool ordering, and warnings-denied workspace checks remain
+  green. Run a focused native smoke when credentials are available and inspect
+  the exact tool calls to confirm the model chooses the direct path for a
+  routine edit while Code Mode remains available for orchestration.
+
 ## Performance policy
 
 - Optimize representative retained API/JSONL traces and real turns, not type
