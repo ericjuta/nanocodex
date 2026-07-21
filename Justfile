@@ -165,6 +165,11 @@ otel-stress-baseline turns="32" parallel_calls="16":
 otel-down:
     @docker compose -f docker-compose.otel.yml down
 
+# Build the native CLI and TUI executable without running it.
+build-cli:
+    cargo install --locked --path bin/nanocodex --force
+    # cargo build --locked --manifest-path bin/nanocodex/Cargo.toml
+
 # Tight inner loop: native model process with local code mode, no Harbor or Docker.
 run:
     @cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- run --thinking=low "Use the available exec tool to run pwd exactly once without modifying anything, then report the path."

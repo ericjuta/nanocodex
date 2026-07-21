@@ -319,6 +319,7 @@ enum Submission {
     CloseBtw,
     Cancel,
     Trace,
+    Exit,
 }
 
 pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Result<()> {
@@ -1384,7 +1385,7 @@ fn handle_key(
         {
             app.insert_char('\n');
         }
-        KeyCode::Enter => submit(app, root_session_id, commands, SubmitIntent::Immediate)?,
+        KeyCode::Enter => return submit(app, root_session_id, commands, SubmitIntent::Immediate),
         KeyCode::Char(character) => app.insert_char(character),
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
@@ -1404,7 +1405,7 @@ fn handle_key(
             }
         }
         KeyCode::Tab if app.has_input() => {
-            submit(app, root_session_id, commands, SubmitIntent::Queue)?;
+            return submit(app, root_session_id, commands, SubmitIntent::Queue);
         }
         KeyCode::Tab | KeyCode::BackTab => app.toggle_focus(),
         KeyCode::Insert
@@ -1627,9 +1628,9 @@ fn submit(
     root_session_id: &str,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
     intent: SubmitIntent,
-) -> Result<()> {
+) -> Result<TerminalAction> {
     let Some(input) = app.take_submission() else {
-        return Ok(());
+        return Ok(TerminalAction::Redraw);
     };
     match classify_submission(input) {
         Submission::Prompt(prompt) => {
@@ -1698,15 +1699,16 @@ fn submit(
         Submission::Trace => {
             let Some(session_id) = active_session_id(app, root_session_id) else {
                 app.push_active_error("BTW traces are available after the fork finishes");
-                return Ok(());
+                return Ok(TerminalAction::Redraw);
             };
             match open_session_traces(session_id) {
                 Ok(()) => app.set_active_status("Opened session traces in Jaeger"),
                 Err(error) => app.push_active_error(format!("failed to open Jaeger: {error}")),
             }
         }
+        Submission::Exit => return Ok(TerminalAction::Quit),
     }
-    Ok(())
+    Ok(TerminalAction::Redraw)
 }
 
 fn send_command(
@@ -1735,6 +1737,9 @@ fn classify_submission(input: String) -> Submission {
     }
     if trimmed == "/trace" {
         return Submission::Trace;
+    }
+    if trimmed == "/exit" {
+        return Submission::Exit;
     }
     Submission::Prompt(input)
 }
@@ -1837,6 +1842,7 @@ mod tests {
             classify_submission(" /trace ".to_owned()),
             Submission::Trace
         );
+        assert_eq!(classify_submission(" /exit ".to_owned()), Submission::Exit);
         assert_eq!(
             classify_submission("/btw-not-a-command".to_owned()),
             Submission::Prompt("/btw-not-a-command".to_owned())
@@ -1845,6 +1851,29 @@ mod tests {
             classify_submission("/trace-this".to_owned()),
             Submission::Prompt("/trace-this".to_owned())
         );
+        assert_eq!(
+            classify_submission("/exit-now".to_owned()),
+            Submission::Prompt("/exit-now".to_owned())
+        );
+    }
+
+    #[test]
+    fn exit_submission_quits_without_sending_an_agent_command() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        app.insert_str("/exit");
+
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Quit
+        );
+        assert!(worker.try_recv().is_err());
     }
 
     #[test]
