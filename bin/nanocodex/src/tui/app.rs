@@ -378,6 +378,7 @@ impl Conversation {
             .saturating_add(self.smooth_scroll_from_bottom)
             .saturating_add(rows);
         self.smooth_scroll_from_bottom = 0;
+        self.pending_scroll_anchor = None;
         self.clamp_scroll();
     }
 
@@ -386,6 +387,7 @@ impl Conversation {
             .scroll_from_bottom
             .saturating_add(self.smooth_scroll_from_bottom);
         self.smooth_scroll_from_bottom = 0;
+        self.pending_scroll_anchor = None;
         self.clamp_scroll();
         self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(rows);
     }
@@ -1975,6 +1977,30 @@ mod tests {
             animated_position.saturating_add(3).min(max_scroll)
         );
         assert_eq!(app.main.smooth_scroll_from_bottom, 0);
+    }
+
+    #[test]
+    fn reversing_manual_scroll_discards_an_unsettled_automatic_anchor() {
+        let mut app = App::new(".".into());
+        app.main.settle_viewport(20, 6);
+        app.main.push_assistant_delta("one\ntwo\nthree");
+        app.main.settle_viewport(20, 6);
+        app.main
+            .push_assistant_delta("\nfour\nfive\nsix\nseven\neight");
+        app.main.settle_viewport(20, 6);
+        assert!(app.smooth_scroll_pending());
+
+        app.main.push_assistant_delta("\nnine\nten\neleven");
+        assert!(app.main.pending_scroll_anchor.is_some());
+        app.scroll_down(usize::MAX);
+        app.scroll_up(3);
+        let manual_position = app.main.display_scroll_from_bottom();
+
+        app.main.settle_viewport(20, 6);
+
+        assert_eq!(app.main.display_scroll_from_bottom(), manual_position);
+        assert_eq!(app.main.smooth_scroll_from_bottom, 0);
+        assert!(app.main.pending_scroll_anchor.is_none());
     }
 
     #[test]
