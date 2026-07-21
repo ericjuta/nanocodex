@@ -1381,7 +1381,7 @@ fn request_profile(
 }
 
 fn tool_runtime(workspace: &str, config: &ModelConfig, tools: &Tools) -> ToolRuntime {
-    ToolRuntime::new(
+    ToolRuntime::new_with_tools(
         workspace,
         tools.web_search_enabled().then(|| WebSearchConfig {
             endpoint: config.search_endpoint(),
@@ -1394,8 +1394,8 @@ fn tool_runtime(workspace: &str, config: &ModelConfig, tools: &Tools) -> ToolRun
                 auth: config.auth.clone(),
                 save_root: Path::new(workspace).to_path_buf(),
             }),
+        tools,
     )
-    .with_tools(tools)
 }
 
 const fn status(success: bool) -> &'static str {

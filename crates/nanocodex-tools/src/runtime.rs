@@ -342,6 +342,7 @@ pub struct ImageGenerationConfig {
 /// Declarative selection of the built-in tools installed for an agent.
 #[derive(Clone)]
 pub struct Tools {
+    workspace: bool,
     web_search: bool,
     image_generation: bool,
     registered: Vec<Arc<dyn Tool>>,
@@ -351,6 +352,7 @@ pub struct Tools {
 impl Default for Tools {
     fn default() -> Self {
         Self {
+            workspace: true,
             web_search: true,
             image_generation: true,
             registered: Vec::new(),
@@ -363,6 +365,7 @@ impl fmt::Debug for Tools {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Tools")
+            .field("workspace", &self.workspace)
             .field("web_search", &self.web_search)
             .field("image_generation", &self.image_generation)
             .field(
@@ -389,6 +392,12 @@ impl Tools {
     #[must_use]
     pub fn into_builder(self) -> ToolsBuilder {
         ToolsBuilder { tools: self }
+    }
+
+    /// Returns whether the standard workspace tools are enabled.
+    #[must_use]
+    pub const fn workspace_enabled(&self) -> bool {
+        self.workspace
     }
 
     /// Returns whether the standard web-search tool is enabled.
@@ -439,8 +448,16 @@ impl ToolsBuilder {
     /// Starts from an empty built-in tool set.
     #[must_use]
     pub fn without_defaults(mut self) -> Self {
+        self.tools.workspace = false;
         self.tools.web_search = false;
         self.tools.image_generation = false;
+        self
+    }
+
+    /// Enables or disables the standard command, patch, plan, and file tools.
+    #[must_use]
+    pub fn workspace(mut self, enabled: bool) -> Self {
+        self.tools.workspace = enabled;
         self
     }
 
@@ -505,10 +522,12 @@ impl ToolsBuilder {
 }
 
 fn built_in_name(tools: &Tools, name: &str) -> bool {
-    matches!(
-        name,
-        "exec_command" | "write_stdin" | "update_plan" | "apply_patch" | "view_image"
-    ) || (tools.web_search && name == "web__run")
+    (tools.workspace
+        && matches!(
+            name,
+            "exec_command" | "write_stdin" | "update_plan" | "apply_patch" | "view_image"
+        ))
+        || (tools.web_search && name == "web__run")
         || (tools.image_generation && name == "image_gen__imagegen")
 }
 
@@ -532,20 +551,49 @@ impl ToolRuntime {
         web_search: Option<WebSearchConfig>,
         image_generation: Option<ImageGenerationConfig>,
     ) -> Self {
+        Self::new_inner(workspace, web_search, image_generation, true)
+    }
+
+    /// Builds the runtime from one complete declarative tool selection.
+    #[must_use]
+    pub fn new_with_tools(
+        workspace: impl Into<PathBuf>,
+        web_search: Option<WebSearchConfig>,
+        image_generation: Option<ImageGenerationConfig>,
+        tools: &Tools,
+    ) -> Self {
+        Self::new_inner(
+            workspace,
+            web_search,
+            image_generation,
+            tools.workspace_enabled(),
+        )
+        .with_tools(tools)
+    }
+
+    fn new_inner(
+        workspace: impl Into<PathBuf>,
+        web_search: Option<WebSearchConfig>,
+        image_generation: Option<ImageGenerationConfig>,
+        workspace_enabled: bool,
+    ) -> Self {
         let workspace = workspace.into();
         let sessions = Arc::new(ShellSessions::new());
         let default_shell_name = sessions.default_shell_name();
         let code_mode_workspace = workspace.clone();
-        let mut handlers: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(shell::ExecCommandHandler::new(
-                workspace.clone(),
-                Arc::clone(&sessions),
-            )),
-            Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
-            Arc::new(plan::PlanHandler::new()),
-            Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
-            Arc::new(view_image::ViewImageHandler::new(workspace)),
-        ];
+        let mut handlers: Vec<Arc<dyn Tool>> = Vec::new();
+        if workspace_enabled {
+            handlers.extend([
+                Arc::new(shell::ExecCommandHandler::new(
+                    workspace.clone(),
+                    Arc::clone(&sessions),
+                )) as Arc<dyn Tool>,
+                Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
+                Arc::new(plan::PlanHandler::new()),
+                Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
+                Arc::new(view_image::ViewImageHandler::new(workspace.clone())),
+            ]);
+        }
         if let Some(web_search) = web_search {
             handlers.push(Arc::new(web_search::WebSearchHandler::new(web_search)));
         }
@@ -906,6 +954,8 @@ mod tests {
 
     struct Fails;
 
+    struct ReplacementExec;
+
     struct Search {
         activated: Arc<AtomicBool>,
     }
@@ -961,6 +1011,30 @@ mod tests {
 
         async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
             Err(std::io::Error::other("intentional handler failure").into())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ReplacementExec {
+        fn name(&self) -> &'static str {
+            "exec_command"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::function(
+                self.name(),
+                "Replacement command executor.",
+                json!({
+                    "type": "object",
+                    "properties": { "cmd": { "type": "string" } },
+                    "required": ["cmd"],
+                    "additionalProperties": false
+                }),
+            )
+        }
+
+        async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+            Ok(ToolExecution::text("replacement"))
         }
     }
 
@@ -1073,6 +1147,25 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| !description.contains("`web__run`"))
         );
+    }
+
+    #[test]
+    fn without_defaults_allows_replacing_a_standard_workspace_tool() {
+        assert!(Tools::builder().tool(ReplacementExec).build().is_err());
+
+        let tools = Tools::builder()
+            .without_defaults()
+            .tool(ReplacementExec)
+            .build()
+            .unwrap();
+        let runtime = ToolRuntime::new_with_tools(".", None, None, &tools);
+        let names = runtime
+            .registry
+            .entries()
+            .map(|(handler, _)| handler.name())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["exec_command"]);
     }
 
     #[tokio::test]
