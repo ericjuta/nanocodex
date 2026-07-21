@@ -194,6 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.1.0
 - [release] Refresh 0.1.0 changelogs
 - [release] Add per-crate changelogs
 - [release] Finalize 0.1.0 changelog
@@ -312,6 +313,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- [python] Align empty credential error
 - [tui] Cover escape cancellation
 - [observability] Add retained-session stress coverage
 - Stabilize PTY readiness checks
