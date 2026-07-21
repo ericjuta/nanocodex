@@ -65,16 +65,24 @@ case "${SHELL:-}" in
   */zsh) profile="${ZDOTDIR:-$HOME}/.zshenv" ;;
   */bash) profile="$HOME/.bashrc" ;;
   */fish)
-    profile="$HOME/.config/fish/config.fish"
+    profile="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish"
     path_line="fish_add_path -a \"$bin_dir\""
     ;;
+  */ash|*/dash|*/ksh|*/sh) profile="$HOME/.profile" ;;
 esac
 
 if [[ ":$PATH:" != *":$bin_dir:"* && -n "$profile" ]]; then
-  mkdir -p "$(dirname "$profile")"
-  touch "$profile"
-  if ! grep -Fq "$bin_dir" "$profile"; then
-    printf '\n# Nanocodex\n%s\n' "$path_line" >> "$profile"
+  if [[ ( -e "$profile" || -L "$profile" ) && ! -w "$profile" ]]; then
+    echo "nanocodex: cannot update $profile; add this line yourself:" >&2
+    echo "  $path_line" >&2
+  elif ! mkdir -p "$(dirname "$profile")" || ! touch "$profile"; then
+    echo "nanocodex: cannot create $profile; add this line yourself:" >&2
+    echo "  $path_line" >&2
+  elif ! grep -Fq "$bin_dir" "$profile"; then
+    if ! printf '\n# Nanocodex\n%s\n' "$path_line" >> "$profile"; then
+      echo "nanocodex: cannot update $profile; add this line yourself:" >&2
+      echo "  $path_line" >&2
+    fi
   fi
 fi
 
