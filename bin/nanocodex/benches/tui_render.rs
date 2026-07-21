@@ -378,7 +378,7 @@ mod tui {
                 BatchSize::SmallInput,
             );
         });
-        group.bench_function("drain_bounded_backlog/120x40", |bencher| {
+        group.bench_function("drain_128_row_backlog/120x40", |bencher| {
             bencher.iter_batched(
                 queued_animation,
                 |(mut app, mut terminal)| {

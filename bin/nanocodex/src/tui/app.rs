@@ -362,7 +362,7 @@ impl Conversation {
                     .saturating_add(changed_tail_rows)
                     .saturating_add(new_entry_rows)
                     .saturating_sub(usize::from(height));
-                self.queue_smooth_scroll(viewport_shift, height);
+                self.queue_smooth_scroll(viewport_shift);
             }
         }
         self.viewport_width = Some(width);
@@ -397,18 +397,11 @@ impl Conversation {
             .saturating_add(self.smooth_scroll_from_bottom)
     }
 
-    fn queue_smooth_scroll(&mut self, rows: usize, viewport_height: u16) {
+    fn queue_smooth_scroll(&mut self, rows: usize) {
         if rows == 0 {
             return;
         }
-        let was_animating = self.smooth_scroll_from_bottom > 0;
-        self.smooth_scroll_from_bottom = self
-            .smooth_scroll_from_bottom
-            .saturating_add(rows)
-            .min(usize::from(viewport_height));
-        if !was_animating {
-            self.smooth_scroll_from_bottom = self.smooth_scroll_from_bottom.saturating_sub(1);
-        }
+        self.smooth_scroll_from_bottom = self.smooth_scroll_from_bottom.saturating_add(rows);
     }
 
     fn advance_smooth_scroll(&mut self) {
@@ -1945,18 +1938,28 @@ mod tests {
     }
 
     #[test]
-    fn follow_bottom_catch_up_is_bounded_to_one_viewport() {
+    fn follow_bottom_retains_every_burst_row_for_paced_drain() {
         let mut app = App::new(".".into());
         app.main.settle_viewport(20, 6);
         app.main.push_assistant_delta("one\ntwo\nthree");
         app.main.settle_viewport(20, 6);
 
+        let overflow_before = app.main.transcript.height_from(0, 20).saturating_sub(6);
         app.main
             .push_assistant_delta(&format!("\n{}", "new row\n".repeat(100)));
         app.main.settle_viewport(20, 6);
+        let overflow_after = app.main.transcript.height_from(0, 20).saturating_sub(6);
 
-        assert!(app.main.display_scroll_from_bottom() > 0);
-        assert!(app.main.display_scroll_from_bottom() < 6);
+        assert_eq!(
+            app.main.display_scroll_from_bottom(),
+            overflow_after.saturating_sub(overflow_before)
+        );
+
+        app.advance_smooth_scroll();
+        assert_eq!(
+            app.main.display_scroll_from_bottom(),
+            overflow_after.saturating_sub(overflow_before) - 1
+        );
     }
 
     #[test]
