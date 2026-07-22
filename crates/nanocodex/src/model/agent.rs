@@ -678,6 +678,7 @@ where
         // Match Codex's ordering: always sample the turn's initial prompt once
         // before injecting input that arrived while that first request ran.
         let mut can_drain_steers = false;
+        let mut overflow_compacted = false;
         loop {
             if can_drain_steers {
                 self.drain_steers(&mut session.conversation, &mut steers)
@@ -685,9 +686,12 @@ where
             }
             Self::publish_fork_snapshot(session, fork_snapshots);
             let call_index = self.stats.model_calls + 1;
-            let response = self
-                .perform_model_call(call_index, &session.conversation, &session.factory)
-                .await?;
+            let Some(response) = self
+                .model_call_with_overflow_recovery(call_index, session, &mut overflow_compacted)
+                .await?
+            else {
+                continue;
+            };
             session
                 .conversation
                 .update_token_info(response.usage.as_ref());
@@ -723,16 +727,7 @@ where
                     session.conversation.clear_delta();
                     continue;
                 }
-                if let Some(message) = final_message {
-                    return Ok(if message.trim().is_empty() {
-                        "The model completed without emitting assistant text.".to_owned()
-                    } else {
-                        message
-                    });
-                }
-                return Err(NanocodexError::MalformedResponse {
-                    detail: "model completed without a final message or exec call",
-                });
+                return Self::final_turn_message(final_message);
             }
 
             if self.pending_tool_response.is_some() {
@@ -927,6 +922,57 @@ where
         started_at
     }
 
+    fn final_turn_message(final_message: Option<String>) -> Result<String> {
+        let Some(message) = final_message else {
+            return Err(NanocodexError::MalformedResponse {
+                detail: "model completed without a final message or exec call",
+            });
+        };
+        Ok(if message.trim().is_empty() {
+            "The model completed without emitting assistant text.".to_owned()
+        } else {
+            message
+        })
+    }
+
+    /// Performs a model call; on a server-side context-window rejection it
+    /// compacts once against the retained checkpoint and returns `None` so the
+    /// caller retries. The local estimate can undercount the server's, so the
+    /// request may be rejected before `maybe_compact` would have triggered.
+    async fn model_call_with_overflow_recovery(
+        &mut self,
+        call_index: u32,
+        session: &mut ModelSessionState,
+        overflow_compacted: &mut bool,
+    ) -> Result<Option<TurnResult>> {
+        match self
+            .perform_model_call(call_index, &session.conversation, &session.factory)
+            .await
+        {
+            Ok(response) => {
+                *overflow_compacted = false;
+                Ok(Some(response))
+            }
+            Err(error)
+                if error.is_context_overflow()
+                    && !*overflow_compacted
+                    && session.conversation.previous_response_id.is_some() =>
+            {
+                *overflow_compacted = true;
+                self.compact_for_overflow(
+                    call_index,
+                    &mut session.conversation,
+                    &session.factory,
+                    &session.workspace,
+                    session.tools.default_shell_name(),
+                )
+                .await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn maybe_compact(
         &mut self,
         after_model_call_index: u32,
@@ -943,6 +989,55 @@ where
         if active_context_tokens < auto_compact_token_limit {
             return Ok(());
         }
+        self.compact_history(
+            after_model_call_index,
+            conversation,
+            factory,
+            workspace,
+            shell,
+            active_context_tokens,
+            auto_compact_token_limit,
+        )
+        .await
+    }
+
+    /// Compacts immediately after the server rejected a request for exceeding
+    /// its context-window guard, regardless of the local token estimate.
+    async fn compact_for_overflow(
+        &mut self,
+        after_model_call_index: u32,
+        conversation: &mut ConversationState,
+        factory: &ResponsesAttemptFactory,
+        workspace: &str,
+        shell: &str,
+    ) -> Result<()> {
+        let auto_compact_token_limit =
+            compaction::auto_compact_token_limit(MODEL).unwrap_or_default();
+        let active_context_tokens =
+            conversation.active_context_tokens(self.server_reasoning_included);
+        self.compact_history(
+            after_model_call_index,
+            conversation,
+            factory,
+            workspace,
+            shell,
+            active_context_tokens,
+            auto_compact_token_limit,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_history(
+        &mut self,
+        after_model_call_index: u32,
+        conversation: &mut ConversationState,
+        factory: &ResponsesAttemptFactory,
+        workspace: &str,
+        shell: &str,
+        active_context_tokens: u64,
+        auto_compact_token_limit: u64,
+    ) -> Result<()> {
         let previous_response_id = conversation.previous_response_id.as_deref().ok_or(
             NanocodexError::MalformedResponse {
                 detail: "compaction did not have a previous response ID",

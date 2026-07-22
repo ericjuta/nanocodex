@@ -64,7 +64,11 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<Mutex<OriginalImageEstimateCache>
     LazyLock::new(|| Mutex::new(OriginalImageEstimateCache::default()));
 
 pub(super) fn auto_compact_token_limit(model: &str) -> Option<u64> {
-    (model == "gpt-5.6-sol").then_some((SOL_CONTEXT_WINDOW * 9) / 10)
+    // Compact at 85% rather than matching the proxy's 90% context-window
+    // guard: the local bytes/4 estimate undercounts the server's tokenizer
+    // by a few percent, so an exact 90% trigger lets requests the client
+    // thinks are safe get rejected upstream with context_length_exceeded.
+    (model == "gpt-5.6-sol").then_some((SOL_CONTEXT_WINDOW * 85) / 100)
 }
 
 pub(super) const fn trigger() -> ResponseItem {
@@ -390,8 +394,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sol_compacts_at_ninety_percent_of_its_context_window() {
-        assert_eq!(auto_compact_token_limit("gpt-5.6-sol"), Some(244_800));
+    fn sol_compacts_at_eighty_five_percent_of_its_context_window() {
+        assert_eq!(auto_compact_token_limit("gpt-5.6-sol"), Some(231_200));
         assert_eq!(auto_compact_token_limit("unknown-model"), None);
     }
 

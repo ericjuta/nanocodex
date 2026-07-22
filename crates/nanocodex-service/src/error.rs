@@ -110,6 +110,7 @@ impl ResponsesError {
             Self::InvalidPayload { .. } => "invalid_payload",
             Self::Closed { .. } => "closed",
             Self::Api { event } if is_checkpoint_missing_api_error(event) => "checkpoint_missing",
+            Self::Api { event } if is_context_overflow_api_error(event) => "context_overflow",
             Self::Api { .. } => "api",
             Self::InvalidImageRequest { .. } => "invalid_image_request",
         }
@@ -118,6 +119,11 @@ impl ResponsesError {
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
         matches!(self, Self::Api { event } if is_checkpoint_missing_api_error(event))
+    }
+
+    #[must_use]
+    pub fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::Api { event } if is_context_overflow_api_error(event))
     }
 }
 
@@ -187,6 +193,10 @@ fn is_checkpoint_missing_api_error(event: &str) -> bool {
         || api_error_has_code(event, "codex_previous_response_stale")
 }
 
+fn is_context_overflow_api_error(event: &str) -> bool {
+    api_error_has_code(event, "context_length_exceeded")
+}
+
 fn retry_after_header(headers: &HashMap<String, RetryAfterValue>) -> Option<Duration> {
     headers
         .iter()
@@ -232,5 +242,32 @@ impl RetryAfterValue {
             Self::Number(seconds) => Some(*seconds),
             Self::String(seconds) => seconds.parse().ok(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResponsesError;
+
+    fn api_error(code: &str) -> ResponsesError {
+        ResponsesError::Api {
+            event: format!(r#"{{"type":"error","error":{{"code":"{code}","message":"m"}}}}"#),
+        }
+    }
+
+    #[test]
+    fn context_length_exceeded_classifies_as_context_overflow() {
+        let error = api_error("context_length_exceeded");
+        assert!(error.is_context_overflow());
+        assert_eq!(error.class(), "context_overflow");
+        assert!(error.retry_advice().is_none());
+        assert!(!error.is_checkpoint_missing());
+    }
+
+    #[test]
+    fn checkpoint_missing_is_not_context_overflow() {
+        let error = api_error("previous_response_not_found");
+        assert!(error.is_checkpoint_missing());
+        assert!(!error.is_context_overflow());
     }
 }

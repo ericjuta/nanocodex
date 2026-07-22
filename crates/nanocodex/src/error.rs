@@ -105,6 +105,14 @@ impl NanocodexError {
         }
         None
     }
+
+    /// True when the model rejected the request because the assembled
+    /// history exceeded the server-side context-window guard.
+    #[must_use]
+    pub fn is_context_overflow(&self) -> bool {
+        self.responses_error()
+            .is_some_and(ResponsesError::is_context_overflow)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, NanocodexError>;

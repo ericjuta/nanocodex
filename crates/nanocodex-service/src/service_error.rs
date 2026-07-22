@@ -107,6 +107,12 @@ impl ResponsesServiceError {
     }
 
     #[must_use]
+    pub fn is_context_overflow(&self) -> bool {
+        self.responses_error()
+            .is_some_and(ResponsesError::is_context_overflow)
+    }
+
+    #[must_use]
     pub fn server_retry_after(&self) -> Option<Duration> {
         self.retry_advice.and_then(|advice| advice.server_delay)
     }

@@ -72,6 +72,7 @@ impl ResponsesError {
             Self::InvalidPayload { .. } => "invalid_payload",
             Self::Closed { .. } => "closed",
             Self::Api { event } if is_checkpoint_missing_api_error(event) => "checkpoint_missing",
+            Self::Api { event } if is_context_overflow_api_error(event) => "context_overflow",
             Self::Api { .. } => "api",
             Self::InvalidImageRequest { .. } => "invalid_image_request",
         }
@@ -80,6 +81,11 @@ impl ResponsesError {
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
         matches!(self, Self::Api { event } if is_checkpoint_missing_api_error(event))
+    }
+
+    #[must_use]
+    pub fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::Api { event } if is_context_overflow_api_error(event))
     }
 }
 
@@ -109,6 +115,10 @@ fn api_error_has_code(event: &str, expected: &str) -> bool {
 fn is_checkpoint_missing_api_error(event: &str) -> bool {
     api_error_has_code(event, "previous_response_not_found")
         || api_error_has_code(event, "codex_previous_response_stale")
+}
+
+fn is_context_overflow_api_error(event: &str) -> bool {
+    api_error_has_code(event, "context_length_exceeded")
 }
 
 #[derive(serde::Deserialize)]
