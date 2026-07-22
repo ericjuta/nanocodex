@@ -6,9 +6,21 @@ use serde_json::Value;
 
 use super::{
     CellUpdate, CodeModeExecution, LiveCell, NestedToolCall, nested_tool_yield_after, observe_cell,
-    parse_exec_source,
+    observer_yield_timeout, parse_exec_source,
 };
 use crate::{ToolContext, ToolOutputBody, ToolOutputContent, ToolRuntime, WebSearchConfig};
+
+#[test]
+fn long_observer_yields_include_completion_grace() {
+    assert_eq!(
+        observer_yield_timeout(Duration::from_secs(10)),
+        Duration::from_secs(11)
+    );
+    assert_eq!(
+        observer_yield_timeout(Duration::from_millis(9_999)),
+        Duration::from_millis(9_999)
+    );
+}
 
 #[tokio::test]
 async fn prewarms_embedded_quickjs_host() -> Result<()> {
@@ -691,14 +703,18 @@ async fn freeform_apply_patch_accepts_a_string() -> Result<()> {
     let execution = tools
         .execute_code(
             r#"
-await tools.apply_patch("*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch");
-text("done");
+const result = await tools.apply_patch("*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch");
+text(result);
 "#,
             test_context(&history),
         )
         .await;
 
     assert!(execution.success, "{}", execution_output(&execution));
+    assert!(
+        execution_output(&execution)
+            .contains("Success. Updated the following files:\nA created.txt")
+    );
     assert_eq!(execution.nested_calls.len(), 1);
     assert_eq!(
         execution.nested_calls[0].input,
