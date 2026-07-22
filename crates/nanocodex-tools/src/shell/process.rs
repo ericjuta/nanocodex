@@ -239,6 +239,22 @@ impl ProcessGroupGuard {
     }
 
     #[cfg(unix)]
+    pub(super) fn interrupt(&self) -> io::Result<()> {
+        let Some(process_group) = self.process_group else {
+            return Err(io::Error::other("process identifier exceeds i32::MAX"));
+        };
+        match killpg(process_group, Signal::SIGINT) {
+            Ok(()) | Err(Errno::ESRCH) => Ok(()),
+            Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn interrupt(&self) -> io::Result<()> {
+        self.terminate()
+    }
+
+    #[cfg(unix)]
     fn terminate(&self) -> io::Result<()> {
         let Some(process_group) = self.process_group else {
             return Err(io::Error::other("process identifier exceeds i32::MAX"));

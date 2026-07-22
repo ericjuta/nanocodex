@@ -143,6 +143,7 @@ impl ShellSessions {
             }
         };
         let session = Session::new(session_id, spawned, secrets);
+        let _interaction_guard = session.interaction.lock().await;
         let pruned = self.sessions.lock().await.insert(Arc::clone(&session));
         if let Some(pruned) = pruned {
             pruned.terminate().await;
@@ -169,17 +170,23 @@ impl ShellSessions {
             );
         };
 
+        let _interaction_guard = session.interaction.lock().await;
         let _interaction = session.begin_interaction();
-        if !request.chars.is_empty()
-            && let Err(error) = session.write(&request.chars).await
-        {
-            return ExecCommandResult::failed(
-                started_at.elapsed(),
-                format!(
-                    "failed to write to exec session {}: {error}",
-                    request.session_id
-                ),
-            );
+        if !request.chars.is_empty() {
+            let written = if request.chars == "\u{3}" && !session.tty {
+                session.interrupt().await
+            } else {
+                session.write(&request.chars).await
+            };
+            if let Err(error) = written {
+                return ExecCommandResult::failed(
+                    started_at.elapsed(),
+                    format!(
+                        "failed to write to exec session {}: {error}",
+                        request.session_id
+                    ),
+                );
+            }
         }
         let (default, minimum, maximum) = if request.chars.is_empty() {
             (DEFAULT_POLL_YIELD_MS, 5_000, 300_000)
@@ -262,6 +269,8 @@ impl SessionStore {
 
 struct Session {
     id: i64,
+    tty: bool,
+    interaction: Mutex<()>,
     child: Mutex<process::ProcessChild>,
     stdin: Mutex<Option<process::ProcessStdin>>,
     process_group: Mutex<process::ProcessGroupGuard>,
@@ -274,6 +283,7 @@ struct Session {
 
 impl Session {
     fn new(id: i64, spawned: process::SpawnedProcess, secrets: Vec<String>) -> Arc<Self> {
+        let tty = matches!(spawned.stdin.as_ref(), Some(process::ProcessStdin::Pty(_)));
         let captured = Arc::new(Mutex::new(CapturedOutput::default()));
         let drains = match spawned.output {
             process::ProcessOutput::Pipes { stdout, stderr } => vec![
@@ -296,6 +306,8 @@ impl Session {
         };
         Arc::new(Self {
             id,
+            tty,
+            interaction: Mutex::new(()),
             child: Mutex::new(spawned.child),
             stdin: Mutex::new(spawned.stdin),
             process_group: Mutex::new(spawned.process_group),
@@ -318,6 +330,10 @@ impl Session {
 
     async fn terminate(&self) {
         let _ = self.process_group.lock().await.terminate_and_disarm();
+    }
+
+    async fn interrupt(&self) -> std::io::Result<()> {
+        self.process_group.lock().await.interrupt()
     }
 
     async fn write(&self, chars: &str) -> std::io::Result<()> {
@@ -574,6 +590,34 @@ mod tests {
             .await;
         assert_eq!(second.exit_code, Some(0));
         assert_eq!(second.output, "got:hello");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn control_c_interrupts_a_non_tty_process_group() {
+        let sessions = ShellSessions::new();
+        let first = sessions
+            .execute(
+                ExecCommand::new(
+                    "sleep 30".to_owned(),
+                    None,
+                    None,
+                    Some(false),
+                    false,
+                    Some(250),
+                    None,
+                ),
+                std::path::Path::new("/"),
+            )
+            .await;
+        assert_eq!(first.session_id, Some(1));
+
+        let interrupted = sessions
+            .write_stdin(WriteStdin::new(1, "\u{3}".to_owned(), Some(1_000), None))
+            .await;
+
+        assert_eq!(interrupted.exit_code, Some(130));
+        assert_eq!(interrupted.session_id, None);
     }
 
     #[cfg(unix)]
