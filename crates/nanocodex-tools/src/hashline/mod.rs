@@ -1287,7 +1287,7 @@ fn model_error<T>(message: impl Into<String>) -> Result<T, FunctionCallError> {
 fn read_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__read",
-        "Read a bounded UTF-8 file range with compact file/line anchors, an unambiguous copy-ready patchHeader, and a distinct exact-byte SHA-256 digest.",
+        "Preferred first step for editing a known UTF-8 workspace file: read the smallest useful range with compact file/line anchors, an unambiguous copy-ready patchHeader, and a distinct exact-byte SHA-256 digest.",
         json!({
             "type": "object",
             "properties": {
@@ -1308,7 +1308,7 @@ fn read_definition() -> ToolDefinition {
 fn block_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__find_block",
-        "Resolve a recent Hashline line or block anchor to a reproducible language-aware block and bounded excerpt.",
+        "Resolve a recent Hashline line or block anchor to a reproducible language-aware block and bounded excerpt. Prefer this when the intended edit covers a complete syntactic block.",
         json!({
             "type": "object",
             "properties": {
@@ -1328,7 +1328,7 @@ fn block_definition() -> ToolDefinition {
 fn patch_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__patch",
-        "Apply a complete Hashline routine patch. For a direct single-file edit, pass hashline__read.patchHeader as header plus one operations DSL string, for example `SWAP 2:f589:\\n+bravo`. Do not pass operations as a JSON array or object. For multi-file edits, pass a fully sectioned patch program. Routine commits are not crash-atomic; use hashline__transaction for recoverable batches.",
+        "Preferred default for routine UTF-8 workspace edits. For a direct single-file edit, pass hashline__read.patchHeader as header plus one operations DSL string, for example `SWAP 2:f589:\\n+bravo`. Copy recent anchors verbatim; do not invent hashes or pass operations as a JSON array/object. For multi-file edits, pass a fully sectioned patch program. Routine commits are not crash-atomic; use hashline__transaction for recoverable batches.",
         json!({
             "type": "object",
             "properties": {
@@ -1370,7 +1370,7 @@ fn patch_definition() -> ToolDefinition {
 fn transaction_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__transaction",
-        "Preview, immediately commit, or commit an exact previously previewed bounded multi-file Hashline transaction. commitPreviewed requires resubmitting the identical mutations together with the returned expectedPlanDigest; changed files or mutations are rejected. Retains restart-recovery evidence.",
+        "Preferred for recoverable multi-file edits. Preview, immediately commit, or commit an exact previously previewed bounded Hashline transaction. commitPreviewed requires resubmitting the identical mutations together with the returned expectedPlanDigest; changed files or mutations are rejected. Retains restart-recovery evidence.",
         json!({
             "type": "object",
             "properties": {

@@ -282,7 +282,7 @@ impl FromStr for Thinking {
 mod tests {
     use serde_json::json;
 
-    use super::Prompt;
+    use super::{ModelConfig, Prompt};
 
     #[test]
     fn prompt_serialization_contains_only_user_input() {
@@ -291,6 +291,14 @@ mod tests {
             serde_json::to_value(prompt).unwrap(),
             json!({ "instruction": "inspect the repository" })
         );
+    }
+
+    #[test]
+    fn default_system_prompt_prefers_hashline_edits() {
+        let prompt = ModelConfig::default().system_prompt;
+        assert!(prompt.contains("Use Hashline as the default"));
+        assert!(prompt.contains("`hashline__transaction`"));
+        assert!(prompt.contains("`apply_patch` is a fallback"));
     }
 
     #[test]

@@ -942,6 +942,7 @@ fn model_description_uses_codex_style_declarations() {
     assert!(description.contains("// @exec:"));
     assert!(description.contains("must be a base64-encoded `data:` URL"));
     assert!(description.contains("apply_patch(input: string): Promise<unknown>"));
+    assert!(description.contains("prefer `hashline__read`"));
     assert!(description.contains("exec_command(args: {"));
     assert!(!description.contains("Input schema:"));
     assert_eq!(

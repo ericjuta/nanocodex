@@ -226,6 +226,12 @@ fn tool_schemas_explain_relative_paths_and_patch_grammar() {
             .contains("patchHeader")
     );
     assert!(
+        read["description"]
+            .as_str()
+            .expect("read description should be text")
+            .contains("Preferred first step")
+    );
+    assert!(
         read["parameters"]["properties"]["path"]["description"]
             .as_str()
             .expect("read path description should be text")
@@ -267,6 +273,7 @@ fn tool_schemas_explain_relative_paths_and_patch_grammar() {
         "REM",
         "MV",
         "fully sectioned",
+        "Preferred default",
     ] {
         assert!(
             patch_contract.contains(required),
@@ -289,6 +296,7 @@ fn tool_schemas_explain_relative_paths_and_patch_grammar() {
         "commitPreviewed",
         "identical mutations",
         "expectedPlanDigest",
+        "Preferred for recoverable multi-file edits",
     ] {
         assert!(transaction_description.contains(required));
     }

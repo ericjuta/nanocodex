@@ -35,7 +35,7 @@ impl Tool for ApplyPatchHandler {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::custom(
             self.name(),
-            "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+            "Fallback patch editor. Prefer `hashline__read` plus `hashline__patch` for ordinary UTF-8 workspace edits; use this tool when Hashline does not fit or the caller supplied apply_patch syntax. This is a FREEFORM tool, so do not wrap the patch in JSON.",
             CustomToolFormat::grammar("lark", GRAMMAR),
         )
     }
@@ -149,7 +149,7 @@ fn apply_chunks(original: &str, chunks: &[UpdateFileChunk], path: &Path) -> Resu
             let found = seek_sequence::seek_sequence(&original_lines, &context, line_index, false)
                 .ok_or_else(|| {
                     format!(
-                        "Failed to find context '{}' in {}",
+                        "Failed to find context '{}' in {}. Prefer a fresh `hashline__read` + `hashline__patch` anchored edit instead of retrying stale context.",
                         context[0],
                         path.display()
                     )
@@ -189,7 +189,7 @@ fn apply_chunks(original: &str, chunks: &[UpdateFileChunk], path: &Path) -> Resu
         }
         let found = found.ok_or_else(|| {
             format!(
-                "Failed to find expected lines in {}:\n{}",
+                "Failed to find expected lines in {}:\n{}\nPrefer a fresh `hashline__read` + `hashline__patch` anchored edit instead of retrying stale context.",
                 path.display(),
                 chunk.old_lines.join("\n")
             )
@@ -322,6 +322,23 @@ mod tests {
             error,
             "invalid hunk at line 2, Update file hunk for path 'file.txt' is empty"
         );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn stale_context_diagnostic_points_to_hashline() -> Result<(), Box<dyn std::error::Error>> {
+        let root = test_root("stale-context")?;
+        std::fs::write(root.join("notes.txt"), "current\n")?;
+
+        let error = apply(
+            "*** Begin Patch\n*** Update File: notes.txt\n@@\n-stale\n+fresh\n*** End Patch",
+            &root,
+        )
+        .expect_err("stale context should fail");
+
+        assert!(error.contains("hashline__read"));
+        assert!(error.contains("hashline__patch"));
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

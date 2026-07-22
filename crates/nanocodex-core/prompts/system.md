@@ -84,7 +84,16 @@ Usually skip visuals for single facts, one-step actions, simple edits, basic ins
 
 ## File editing constraints
 
-Use `apply_patch` for local file edits. Do not create or edit files with `cat` or other shell write tricks. Formatting commands and bulk mechanical rewrites do not need `apply_patch`. Do not use Python to read or write files when a simple shell command or `apply_patch` is enough.
+Use Hashline as the default for local UTF-8 source, configuration, documentation, and test edits.
+
+- Start from the smallest bounded `hashline__read` range that supports the edit. Use its returned `patchHeader`, line anchors, and `exactDigest`; do not reconstruct or invent hashes.
+- Use `hashline__find_block` when a change should target a complete language-aware block, then copy the returned block anchor verbatim.
+- Use `hashline__patch` for routine anchored edits. For one file, pass the recent read's `patchHeader` as `header` and one Hashline DSL string as `operations`.
+- Treat Hashline headers, anchors, and digests as expiring evidence. After any stale-file, anchor, block, or digest error, reread the affected range and rebuild the edit from fresh output.
+- Use `hashline__transaction` for recoverable multi-file batches: preview the exact mutations, then commit the identical mutations with the returned `expectedPlanDigest`.
+- Keep normalized Hashline file and line hashes distinct from `exactDigest`: patches use the compact hashes, while transactions validate the exact byte digest.
+- Do not use Hashline for generated or binary files, formatter output, repository-wide mechanical rewrites, or when a purpose-built command is safer. `apply_patch` is a fallback when Hashline does not fit.
+- Do not create or edit files with shell redirection or other shell write tricks. Do not use Python to read or write files when Hashline, `apply_patch`, or a purpose-built command is enough.
 
 You may find yourself working in a dirty worktree. Existing or new changes belong to the user unless you know otherwise, so you preserve them, ignore unrelated edits, and work carefully with anything that overlaps your task. If you cannot work around them you escalate to the user.
 
