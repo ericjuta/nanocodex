@@ -353,8 +353,9 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
         || drop(ui_loop),
         || async {
             if let Some(child_agents) = child_agents {
-                child_agents.shutdown().await;
+                child_agents.shutdown().await?;
             }
+            Result::<(), std::io::Error>::Ok(())
         },
     )
     .await
@@ -489,19 +490,23 @@ impl UiLoop {
     }
 }
 
-async fn restore_before_shutdown<T, E, R, S, F>(
+async fn restore_before_shutdown<T, E, C, R, S, F>(
     result: std::result::Result<T, E>,
     restore: R,
     shutdown: S,
 ) -> std::result::Result<T, E>
 where
+    E: From<C>,
     R: FnOnce(),
     S: FnOnce() -> F,
-    F: Future<Output = ()>,
+    F: Future<Output = std::result::Result<(), C>>,
 {
     restore();
-    shutdown().await;
-    result
+    let cleanup = shutdown().await;
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => cleanup.map(|()| value).map_err(Into::into),
+    }
 }
 
 fn render_due_frame(
@@ -2003,6 +2008,7 @@ mod tests {
                     );
                     let _ = polled.send(());
                     drop(release_rx.await);
+                    Ok::<(), &str>(())
                 },
             ));
 
@@ -2014,6 +2020,20 @@ mod tests {
             let _ = release.send(());
             assert_eq!(lifecycle.await?, expected);
         }
+        let original = restore_before_shutdown(
+            Err::<(), &str>("ui failed"),
+            || {},
+            || async { Err::<(), &str>("cleanup failed") },
+        )
+        .await;
+        assert_eq!(original, Err("ui failed"));
+        let cleanup = restore_before_shutdown(
+            Ok::<(), &str>(()),
+            || {},
+            || async { Err::<(), &str>("cleanup failed") },
+        )
+        .await;
+        assert_eq!(cleanup, Err("cleanup failed"));
         Ok(())
     }
 

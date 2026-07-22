@@ -1,14 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
+    io,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use nanocodex::{
-    AgentEventKind, AgentEvents, AgentHandle, Nanocodex, Tool, ToolContext, ToolDefinition,
-    ToolExecution, ToolInput, ToolResult, Tools, ToolsBuildError, TurnControl, async_trait,
+    AgentEventKind, AgentEvents, AgentHandle, Nanocodex, NanocodexError, Tool, ToolContext,
+    ToolDefinition, ToolExecution, ToolInput, ToolResult, Tools, ToolsBuildError, TurnControl,
+    async_trait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -50,14 +52,42 @@ struct ChildSession {
 }
 
 impl ChildSession {
-    async fn drain(self) {
+    async fn drain_owned(self) -> Result<(), StoredIoError> {
         tracing::debug!(
             child.session_id = self.session_id,
             child.parent_session_id = self.parent_session_id,
             "draining child agent"
         );
         drop(self.agent);
-        drop(self.event_task.await);
+        self.event_task.await.map_err(|error| {
+            StoredIoError::new(
+                io::ErrorKind::Other,
+                format!("child event-drain task failed: {error}"),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StoredIoError {
+    kind: io::ErrorKind,
+    message: Arc<str>,
+}
+
+impl StoredIoError {
+    fn new(kind: io::ErrorKind, message: impl Into<Arc<str>>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn from_error(error: impl std::fmt::Display) -> Self {
+        Self::new(io::ErrorKind::Other, error.to_string())
+    }
+
+    fn to_io_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.to_string())
     }
 }
 
@@ -71,9 +101,16 @@ struct ActiveInvocation {
 #[derive(Default)]
 struct RegistryState {
     admitting: bool,
+    pending_creations: usize,
+    pending_session_handoffs: usize,
     agents: HashMap<u64, ChildSession>,
     invocations: HashMap<u64, ActiveInvocation>,
     waits: HashMap<String, HashMap<String, HashSet<u64>>>,
+    shutdown_result: Option<Result<(), StoredIoError>>,
+    shutdown_task: Option<JoinHandle<()>>,
+    fallback_session_drains: Vec<JoinHandle<()>>,
+    #[cfg(test)]
+    cleanup_worker_joins: usize,
 }
 
 #[cfg(test)]
@@ -82,6 +119,11 @@ enum TestBarrierPoint {
     Creation,
     Prompt,
     Control,
+    ShutdownAdmission,
+    ShutdownControl,
+    CleanupInvocation,
+    SessionDrain,
+    WorkerJoin,
 }
 
 #[cfg(test)]
@@ -96,6 +138,11 @@ struct TestBarriers {
     creation: Mutex<Option<TestBarrier>>,
     prompt: Mutex<Option<TestBarrier>>,
     control: Mutex<Option<TestBarrier>>,
+    shutdown_admission: Mutex<Option<TestBarrier>>,
+    shutdown_control: Mutex<Option<TestBarrier>>,
+    cleanup_invocation: Mutex<Option<TestBarrier>>,
+    session_drain: Mutex<Option<TestBarrier>>,
+    worker_join: Mutex<Option<TestBarrier>>,
 }
 
 #[cfg(test)]
@@ -105,7 +152,25 @@ impl TestBarriers {
             TestBarrierPoint::Creation => &self.creation,
             TestBarrierPoint::Prompt => &self.prompt,
             TestBarrierPoint::Control => &self.control,
+            TestBarrierPoint::ShutdownAdmission => &self.shutdown_admission,
+            TestBarrierPoint::ShutdownControl => &self.shutdown_control,
+            TestBarrierPoint::CleanupInvocation => &self.cleanup_invocation,
+            TestBarrierPoint::SessionDrain => &self.session_drain,
+            TestBarrierPoint::WorkerJoin => &self.worker_join,
         }
+    }
+}
+
+#[cfg(test)]
+async fn pause_test_barrier(barriers: &TestBarriers, point: TestBarrierPoint) {
+    let barrier = barriers
+        .slot(point)
+        .lock()
+        .expect("test barrier mutex should not be poisoned")
+        .take();
+    if let Some(barrier) = barrier {
+        let _ = barrier.reached.send(());
+        drop(barrier.release.await);
     }
 }
 
@@ -116,10 +181,12 @@ pub(crate) struct ChildAgents {
     cleanup_tx: tokio::sync::mpsc::UnboundedSender<CleanupRequest>,
     cleanup_task: Mutex<Option<JoinHandle<()>>>,
     cleanup_progress: Arc<tokio::sync::Notify>,
-    shutdown_complete: AtomicBool,
+    cleanup_failures: Arc<Mutex<Vec<StoredIoError>>>,
     shutdown_notify: tokio::sync::Notify,
     #[cfg(test)]
-    test_barriers: TestBarriers,
+    shutdown_panic: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_barriers: Arc<TestBarriers>,
 }
 
 impl Default for ChildAgents {
@@ -132,11 +199,28 @@ impl Default for ChildAgents {
         let cleanup_state = Arc::clone(&state);
         let cleanup_progress = Arc::new(tokio::sync::Notify::new());
         let worker_progress = Arc::clone(&cleanup_progress);
+        let cleanup_failures = Arc::new(Mutex::new(Vec::new()));
+        let worker_failures = Arc::clone(&cleanup_failures);
+        #[cfg(test)]
+        let test_barriers = Arc::new(TestBarriers::default());
+        #[cfg(test)]
+        let worker_barriers = Arc::clone(&test_barriers);
         let cleanup_task = tokio::spawn(async move {
             while let Some(request) = cleanup_rx.recv().await {
                 match request {
                     CleanupRequest::Invocation(request) => {
-                        cleanup_dropped_invocation(&cleanup_state, request).await;
+                        #[cfg(test)]
+                        pause_test_barrier(&worker_barriers, TestBarrierPoint::CleanupInvocation)
+                            .await;
+                        let failures = cleanup_dropped_invocation(&cleanup_state, request).await;
+                        record_cleanup_failures(&worker_failures, failures);
+                        worker_progress.notify_waiters();
+                    }
+                    CleanupRequest::Session { session, complete } => {
+                        #[cfg(test)]
+                        pause_test_barrier(&worker_barriers, TestBarrierPoint::SessionDrain).await;
+                        let result = session.drain_owned().await;
+                        publish_drain_receipt(result, complete, &worker_failures);
                         worker_progress.notify_waiters();
                     }
                     CleanupRequest::Barrier(complete) => {
@@ -153,10 +237,12 @@ impl Default for ChildAgents {
             cleanup_tx,
             cleanup_task: Mutex::new(Some(cleanup_task)),
             cleanup_progress,
-            shutdown_complete: AtomicBool::new(false),
+            cleanup_failures,
             shutdown_notify: tokio::sync::Notify::new(),
             #[cfg(test)]
-            test_barriers: TestBarriers::default(),
+            shutdown_panic: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_barriers,
         }
     }
 }
@@ -168,6 +254,19 @@ impl ChildAgents {
 
     fn state(&self) -> Result<MutexGuard<'_, RegistryState>, std::io::Error> {
         lock_registry(&self.state)
+    }
+
+    fn begin_creation(&self) -> Result<CreationGuard, io::Error> {
+        let mut state = self.state()?;
+        if !state.admitting {
+            return Err(registry_stopped());
+        }
+        state.pending_creations += 1;
+        Ok(CreationGuard {
+            state: Arc::clone(&self.state),
+            cleanup_progress: Arc::clone(&self.cleanup_progress),
+            active: true,
+        })
     }
 
     #[cfg(test)]
@@ -193,16 +292,7 @@ impl ChildAgents {
 
     #[cfg(test)]
     async fn pause_at_barrier(&self, point: TestBarrierPoint) {
-        let barrier = self
-            .test_barriers
-            .slot(point)
-            .lock()
-            .expect("test barrier mutex should not be poisoned")
-            .take();
-        if let Some(barrier) = barrier {
-            let _ = barrier.reached.send(());
-            drop(barrier.release.await);
-        }
+        pause_test_barrier(&self.test_barriers, point).await;
     }
 
     fn insert(
@@ -238,8 +328,13 @@ impl ChildAgents {
             .map(|session| (session.session_id.clone(), session.agent.clone())))
     }
 
-    fn take_child(&self, id: u64) -> Result<Option<ChildSession>, std::io::Error> {
-        Ok(self.state()?.agents.remove(&id))
+    fn take_child_for_drain(&self, id: u64) -> Result<Option<ChildSession>, std::io::Error> {
+        let mut state = self.state()?;
+        let session = state.agents.remove(&id);
+        if session.is_some() {
+            state.pending_session_handoffs += 1;
+        }
+        Ok(session)
     }
 
     fn reserve(
@@ -288,92 +383,297 @@ impl ChildAgents {
         })
     }
 
-    pub(crate) async fn shutdown(&self) {
-        let owns_shutdown = {
-            let mut state = self.state_for_shutdown();
-            if state.admitting {
-                state.admitting = false;
-                true
-            } else {
-                false
+    fn transfer_session(
+        &self,
+        session: ChildSession,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), StoredIoError>>, io::Error> {
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        match self
+            .cleanup_tx
+            .send(CleanupRequest::Session { session, complete })
+        {
+            Ok(()) => Ok(completed),
+            Err(error) => {
+                let CleanupRequest::Session { session, complete } = error.0 else {
+                    return Err(io::Error::other(
+                        "child cleanup worker rejected an unexpected request",
+                    ));
+                };
+                let failures = Arc::clone(&self.cleanup_failures);
+                let task = tokio::spawn(async move {
+                    let result = session.drain_owned().await;
+                    publish_drain_receipt(result, complete, &failures);
+                });
+                self.state()?.fallback_session_drains.push(task);
+                Ok(completed)
             }
-        };
-        if !owns_shutdown {
-            self.wait_for_shutdown().await;
-            return;
         }
+    }
 
+    async fn drain_session(
+        &self,
+        session: ChildSession,
+        tracked_handoff: bool,
+    ) -> Result<(), io::Error> {
+        let completed = self.transfer_session(session)?;
+        if tracked_handoff {
+            let mut state = self.state()?;
+            state.pending_session_handoffs = state.pending_session_handoffs.saturating_sub(1);
+            drop(state);
+            self.cleanup_progress.notify_waiters();
+        }
+        completed
+            .await
+            .map_err(|_| io::Error::other("child cleanup worker dropped a session receipt"))?
+            .map_err(|error| error.to_io_error())
+    }
+
+    pub(crate) async fn shutdown(self: &Arc<Self>) -> Result<(), io::Error> {
+        self.start_shutdown()?;
+        loop {
+            let notified = self.shutdown_notify.notified();
+            if let Some(result) = self.state()?.shutdown_result.clone() {
+                return result.map_err(|error| error.to_io_error());
+            }
+            notified.await;
+        }
+    }
+
+    fn start_shutdown(self: &Arc<Self>) -> Result<(), io::Error> {
+        let mut state = self.state()?;
+        if !state.admitting {
+            return Ok(());
+        }
+        state.admitting = false;
+        let agents = Arc::clone(self);
+        let worker = tokio::spawn(async move { agents.run_shutdown().await });
+        let agents = Arc::downgrade(self);
+        state.shutdown_task = Some(tokio::spawn(async move {
+            let result = match worker.await {
+                Ok(result) => result.map_err(StoredIoError::from_error),
+                Err(error) => Err(StoredIoError::new(
+                    io::ErrorKind::Other,
+                    format!("child-agent shutdown worker failed: {error}"),
+                )),
+            };
+            if let Some(agents) = agents.upgrade() {
+                agents.publish_shutdown(result);
+            }
+        }));
+        Ok(())
+    }
+
+    async fn run_shutdown(&self) -> Result<(), io::Error> {
+        let mut failures = Vec::new();
+        #[cfg(test)]
+        self.pause_at_barrier(TestBarrierPoint::ShutdownAdmission)
+            .await;
+        self.cancel_shutdown_controls(&mut failures).await?;
+        self.wait_for_owned_work().await?;
+        self.drain_shutdown_sessions(&mut failures).await?;
+        self.join_fallback_session_drains().await?;
+        self.join_cleanup_worker().await?;
+
+        failures.extend(
+            self.cleanup_failures
+                .lock()
+                .map_err(|_| io::Error::other("child cleanup failure mutex poisoned"))?
+                .iter()
+                .cloned(),
+        );
+        finish_cleanup(&failures)
+    }
+
+    async fn cancel_shutdown_controls(
+        &self,
+        failures: &mut Vec<StoredIoError>,
+    ) -> Result<(), io::Error> {
         let controls = self
-            .state_for_shutdown()
+            .state()?
             .invocations
             .values()
             .filter_map(|invocation| invocation.control.clone())
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.pause_at_barrier(TestBarrierPoint::ShutdownControl)
+            .await;
         for control in controls {
-            drop(control.cancel().await);
+            if let Err(error) = control.cancel().await
+                && let Some(error) = cancellation_error("shutdown", &error)
+            {
+                failures.push(error);
+            }
         }
+        Ok(())
+    }
 
+    async fn wait_for_owned_work(&self) -> Result<(), io::Error> {
         loop {
-            self.cleanup_barrier().await;
+            self.cleanup_barrier().await?;
             let progress = self.cleanup_progress.notified();
-            let empty = self.state_for_shutdown().invocations.is_empty();
+            let empty = {
+                let state = self.state()?;
+                state.invocations.is_empty()
+                    && state.pending_creations == 0
+                    && state.pending_session_handoffs == 0
+            };
             if empty {
                 break;
             }
             progress.await;
         }
+        Ok(())
+    }
 
+    async fn drain_shutdown_sessions(
+        &self,
+        failures: &mut Vec<StoredIoError>,
+    ) -> Result<(), io::Error> {
         let sessions = {
-            let mut state = self.state_for_shutdown();
+            let mut state = self.state()?;
             state.waits.clear();
             std::mem::take(&mut state.agents)
         };
+        let mut receipts = Vec::with_capacity(sessions.len());
         for session in sessions.into_values() {
-            session.drain().await;
+            match self.transfer_session(session) {
+                Ok(receipt) => receipts.push(receipt),
+                Err(error) => failures.push(StoredIoError::from_error(error)),
+            }
         }
+        for receipt in receipts {
+            match receipt.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(error),
+                Err(_) => failures.push(StoredIoError::new(
+                    io::ErrorKind::Other,
+                    "child cleanup worker dropped a session receipt",
+                )),
+            }
+        }
+        Ok(())
+    }
 
-        self.cleanup_barrier().await;
+    async fn join_fallback_session_drains(&self) -> Result<(), io::Error> {
+        loop {
+            let fallback_drains = {
+                let mut state = self.state()?;
+                std::mem::take(&mut state.fallback_session_drains)
+            };
+            if fallback_drains.is_empty() {
+                break;
+            }
+            for fallback in fallback_drains {
+                fallback.await.map_err(|error| {
+                    io::Error::other(format!("fallback child session drain failed: {error}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn join_cleanup_worker(&self) -> Result<(), io::Error> {
+        self.cleanup_barrier().await?;
         self.cleanup_tx
             .send(CleanupRequest::Shutdown)
-            .unwrap_or_else(|_| panic!("child cleanup worker stopped before shutdown"));
+            .map_err(|_| io::Error::other("child cleanup worker stopped before shutdown"))?;
         let cleanup_task = self
             .cleanup_task
             .lock()
-            .unwrap_or_else(|_| panic!("child cleanup task mutex poisoned"))
+            .map_err(|_| io::Error::other("child cleanup task mutex poisoned"))?
             .take();
-        if let Some(cleanup_task) = cleanup_task
-            && let Err(error) = cleanup_task.await
+        let cleanup_task = cleanup_task
+            .ok_or_else(|| io::Error::other("child cleanup worker was already joined"))?;
+        cleanup_task
+            .await
+            .map_err(|error| io::Error::other(format!("child cleanup worker failed: {error}")))?;
+        #[cfg(test)]
+        self.pause_at_barrier(TestBarrierPoint::WorkerJoin).await;
+        #[cfg(test)]
         {
-            panic!("child cleanup worker failed: {error}");
+            self.state()?.cleanup_worker_joins += 1;
+            assert!(
+                !self.shutdown_panic.swap(false, Ordering::SeqCst),
+                "injected child-agent shutdown panic"
+            );
         }
-        self.shutdown_complete.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn publish_shutdown(&self, result: Result<(), StoredIoError>) {
+        match self.state() {
+            Ok(mut state) => {
+                state.shutdown_result = Some(result);
+                drop(state.shutdown_task.take());
+            }
+            Err(error) => tracing::error!(%error, "failed to publish child-agent shutdown"),
+        }
         self.shutdown_notify.notify_waiters();
     }
 
-    fn state_for_shutdown(&self) -> MutexGuard<'_, RegistryState> {
-        self.state()
-            .unwrap_or_else(|error| panic!("cannot safely shut down child agents: {error}"))
+    #[cfg(test)]
+    fn inject_shutdown_panic(&self) {
+        self.shutdown_panic.store(true, Ordering::SeqCst);
     }
 
-    async fn cleanup_barrier(&self) {
+    async fn cleanup_barrier(&self) -> Result<(), io::Error> {
         let (complete, completed) = tokio::sync::oneshot::channel();
         self.cleanup_tx
             .send(CleanupRequest::Barrier(complete))
-            .unwrap_or_else(|_| panic!("child cleanup worker stopped before its drain barrier"));
+            .map_err(|_| {
+                io::Error::other("child cleanup worker stopped before its drain barrier")
+            })?;
         completed
             .await
-            .unwrap_or_else(|_| panic!("child cleanup worker dropped its drain barrier"));
+            .map_err(|_| io::Error::other("child cleanup worker dropped its drain barrier"))
     }
+}
 
-    async fn wait_for_shutdown(&self) {
-        loop {
-            let notified = self.shutdown_notify.notified();
-            if self.shutdown_complete.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
+fn finish_cleanup(failures: &[StoredIoError]) -> Result<(), io::Error> {
+    if failures.is_empty() {
+        return Ok(());
     }
+    let message = failures
+        .iter()
+        .map(|error| error.message.as_ref())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(io::Error::new(failures[0].kind, message))
+}
+
+fn record_cleanup_failures(
+    failures: &Mutex<Vec<StoredIoError>>,
+    new_failures: impl IntoIterator<Item = StoredIoError>,
+) {
+    match failures.lock() {
+        Ok(mut failures) => failures.extend(new_failures),
+        Err(error) => tracing::error!(%error, "failed to retain child cleanup errors"),
+    }
+}
+
+fn publish_drain_receipt(
+    result: Result<(), StoredIoError>,
+    complete: tokio::sync::oneshot::Sender<Result<(), StoredIoError>>,
+    failures: &Mutex<Vec<StoredIoError>>,
+) {
+    if let Err(result) = complete.send(result)
+        && let Err(error) = result
+    {
+        record_cleanup_failures(failures, [error]);
+    }
+}
+
+fn cancellation_error(context: &str, error: &NanocodexError) -> Option<StoredIoError> {
+    if matches!(
+        error,
+        NanocodexError::TurnNotCancellable | NanocodexError::AgentStopped
+    ) {
+        return None;
+    }
+    Some(StoredIoError::new(
+        io::ErrorKind::Other,
+        format!("failed to cancel child turn during {context}: {error}"),
+    ))
 }
 
 fn registry_stopped() -> std::io::Error {
@@ -388,7 +688,11 @@ fn lock_registry(
         .map_err(|_| std::io::Error::other("child-agent registry state poisoned"))
 }
 
-async fn cleanup_dropped_invocation(state: &Mutex<RegistryState>, request: DroppedInvocation) {
+async fn cleanup_dropped_invocation(
+    state: &Mutex<RegistryState>,
+    request: DroppedInvocation,
+) -> Vec<StoredIoError> {
+    let mut failures = Vec::new();
     let (control, session) = match lock_registry(state) {
         Ok(mut state) => {
             let stored = state.invocations.remove(&request.invocation_id);
@@ -416,15 +720,22 @@ async fn cleanup_dropped_invocation(state: &Mutex<RegistryState>, request: Dropp
         }
         Err(error) => {
             tracing::error!(%error, "failed to remove dropped child invocation");
+            failures.push(StoredIoError::from_error(error));
             (request.control, None)
         }
     };
-    if let Some(control) = control {
-        drop(control.cancel().await);
+    if let Some(control) = control
+        && let Err(error) = control.cancel().await
+        && let Some(error) = cancellation_error("dropped invocation cleanup", &error)
+    {
+        failures.push(error);
     }
-    if let Some(session) = session {
-        session.drain().await;
+    if let Some(session) = session
+        && let Err(error) = session.drain_owned().await
+    {
+        failures.push(error);
     }
+    failures
 }
 
 fn reaches(
@@ -473,6 +784,27 @@ struct InvocationGuard {
     cleanup_progress: Arc<tokio::sync::Notify>,
 }
 
+struct CreationGuard {
+    state: Arc<Mutex<RegistryState>>,
+    cleanup_progress: Arc<tokio::sync::Notify>,
+    active: bool,
+}
+
+impl Drop for CreationGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        match lock_registry(&self.state) {
+            Ok(mut state) => {
+                state.pending_creations = state.pending_creations.saturating_sub(1);
+            }
+            Err(error) => tracing::error!(%error, "failed to finish child creation ownership"),
+        }
+        self.cleanup_progress.notify_waiters();
+    }
+}
+
 struct DroppedInvocation {
     invocation_id: u64,
     caller: String,
@@ -483,6 +815,10 @@ struct DroppedInvocation {
 
 enum CleanupRequest {
     Invocation(DroppedInvocation),
+    Session {
+        session: ChildSession,
+        complete: tokio::sync::oneshot::Sender<Result<(), StoredIoError>>,
+    },
     Barrier(tokio::sync::oneshot::Sender<()>),
     Shutdown,
 }
@@ -527,6 +863,9 @@ impl InvocationGuard {
         } else {
             initial_child.and_then(|id| state.agents.remove(&id))
         };
+        if session.is_some() {
+            state.pending_session_handoffs += 1;
+        }
         self.request = None;
         drop(state);
         self.cleanup_progress.notify_waiters();
@@ -670,6 +1009,7 @@ impl Tool for ChildAgent {
             .agents
             .upgrade()
             .ok_or_else(|| std::io::Error::other("child-agent registry stopped"))?;
+        let creation = agents.begin_creation()?;
         let agent_id = agents.next_id();
         let (child, events) = match self.kind {
             ChildKind::Spawn => self.agent.spawn().await,
@@ -687,20 +1027,21 @@ impl Tool for ChildAgent {
             event_task,
         ) {
             drop(child);
-            session.drain().await;
+            agents.drain_session(session, false).await?;
             return Err(error.into());
         }
         let mut guard = match agents.reserve(context.session_id, &child_session_id, Some(agent_id))
         {
             Ok(guard) => guard,
             Err(error) => {
-                if let Some(session) = agents.take_child(agent_id)? {
+                if let Some(session) = agents.take_child_for_drain(agent_id)? {
                     drop(child);
-                    session.drain().await;
+                    agents.drain_session(session, true).await?;
                 }
                 return Err(error.into());
             }
         };
+        drop(creation);
         #[cfg(test)]
         agents.pause_at_barrier(TestBarrierPoint::Prompt).await;
         let turn = match child.prompt(self.kind.prompt(&task)).await {
@@ -708,7 +1049,7 @@ impl Tool for ChildAgent {
             Err(error) => {
                 if let Some(session) = guard.finish_terminal(false)? {
                     drop(child);
-                    session.drain().await;
+                    agents.drain_session(session, true).await?;
                 }
                 return Err(error.into());
             }
@@ -723,7 +1064,7 @@ impl Tool for ChildAgent {
         let result = turn.result().await;
         if let Some(session) = guard.finish_terminal(result.is_ok())? {
             drop(child);
-            session.drain().await;
+            agents.drain_session(session, true).await?;
         }
         let result = result?;
         Ok(ToolExecution::json(&WorkerResult {
@@ -1310,7 +1651,7 @@ mod tests {
         async fn close(self) -> Result<()> {
             timeout(TEST_TIMEOUT, self.agents.shutdown())
                 .await
-                .map_err(|_| eyre!("child registry shutdown timed out"))?;
+                .map_err(|_| eyre!("child registry shutdown timed out"))??;
             drop(self.root);
             drop(self.root_events);
             self.tracker.wait_connections(0).await?;
@@ -1350,6 +1691,65 @@ mod tests {
             Err(error) => Err(error.into()),
             Ok(_) => Err(eyre!("aborted child invocation unexpectedly completed")),
         }
+    }
+
+    async fn abort_shutdown_waiter(waiter: JoinHandle<Result<(), io::Error>>) -> Result<()> {
+        waiter.abort();
+        match waiter.await {
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error.into()),
+            Ok(_) => Err(eyre!("aborted shutdown waiter unexpectedly completed")),
+        }
+    }
+
+    fn shutdown_call(agents: &Arc<ChildAgents>) -> JoinHandle<Result<(), io::Error>> {
+        let agents = Arc::clone(agents);
+        tokio::spawn(async move { agents.shutdown().await })
+    }
+
+    async fn finish_shutdown_after_waiter_abort(
+        harness: &Harness,
+        reached: oneshot::Receiver<()>,
+        release: oneshot::Sender<()>,
+    ) -> Result<()> {
+        let first = shutdown_call(&harness.agents);
+        timeout(TEST_TIMEOUT, reached)
+            .await
+            .map_err(|_| eyre!("shutdown did not reach the requested phase"))??;
+        wait_for_registry(&harness.agents, |state| !state.admitting).await?;
+        abort_shutdown_waiter(first).await?;
+        let second = shutdown_call(&harness.agents);
+        let _ = release.send(());
+        timeout(TEST_TIMEOUT, second)
+            .await
+            .map_err(|_| eyre!("replacement shutdown waiter timed out"))???;
+        assert_shutdown_drained(harness).await
+    }
+
+    async fn assert_shutdown_drained(harness: &Harness) -> Result<()> {
+        harness.tracker.wait_active(0).await?;
+        harness.tracker.wait_connections(0).await?;
+        let state = harness.agents.state()?;
+        assert!(!state.admitting);
+        assert_eq!(state.pending_creations, 0);
+        assert_eq!(state.pending_session_handoffs, 0);
+        assert!(state.agents.is_empty());
+        assert!(state.invocations.is_empty());
+        assert!(state.waits.is_empty());
+        assert!(state.fallback_session_drains.is_empty());
+        assert!(state.shutdown_result.is_some());
+        assert_eq!(state.cleanup_worker_joins, 1);
+        assert!(state.shutdown_task.is_none());
+        drop(state);
+        assert!(
+            harness
+                .agents
+                .cleanup_task
+                .lock()
+                .map_err(|_| eyre!("cleanup task mutex poisoned"))?
+                .is_none()
+        );
+        Ok(())
     }
 
     async fn wait_for_registry(
@@ -1396,7 +1796,7 @@ mod tests {
                 .await
                 .map_err(|_| eyre!("child invocation did not reach test barrier"))??;
             abort_invocation(invocation).await?;
-            harness.agents.cleanup_barrier().await;
+            harness.agents.cleanup_barrier().await?;
             wait_for_registry(&harness.agents, |state| {
                 state.agents.is_empty() && state.invocations.is_empty()
             })
@@ -1418,7 +1818,7 @@ mod tests {
         abort_invocation(invocation).await?;
         timeout(TEST_TIMEOUT, harness.agents.shutdown())
             .await
-            .map_err(|_| eyre!("shutdown did not drain dropped initial child"))?;
+            .map_err(|_| eyre!("shutdown did not drain dropped initial child"))??;
         harness.tracker.wait_active(0).await?;
         {
             let state = harness.agents.state()?;
@@ -1458,7 +1858,7 @@ mod tests {
         abort_invocation(invocation).await?;
         timeout(TEST_TIMEOUT, harness.agents.shutdown())
             .await
-            .map_err(|_| eyre!("recursive child shutdown timed out"))?;
+            .map_err(|_| eyre!("recursive child shutdown timed out"))??;
         harness.tracker.wait_active(0).await?;
         {
             let state = harness.agents.state()?;
@@ -1509,7 +1909,7 @@ mod tests {
         );
         assert_eq!(harness.tracker.requests_for(&session_a), before_a);
         abort_invocation(a_waits_for_b).await?;
-        harness.agents.cleanup_barrier().await;
+        harness.agents.cleanup_barrier().await?;
         harness.tracker.wait_active(0).await?;
 
         let child_c = harness.spawn_child("NORMAL_C").await?;
@@ -1532,7 +1932,7 @@ mod tests {
         let second = harness.prompt_call(ROOT_SESSION, child, "GATE_SECOND");
         wait_for_registry(&harness.agents, |state| state.invocations.len() == 2).await?;
         abort_invocation(second).await?;
-        harness.agents.cleanup_barrier().await;
+        harness.agents.cleanup_barrier().await?;
         {
             let state = harness.agents.state()?;
             assert_eq!(state.invocations.len(), 1);
@@ -1573,6 +1973,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborted_shutdown_waiter_after_admission_close_does_not_cancel_shutdown() -> Result<()>
+    {
+        let harness = Harness::new().await?;
+        let (reached, release) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::ShutdownAdmission);
+        finish_shutdown_after_waiter_abort(&harness, reached, release).await?;
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn aborted_shutdown_waiter_during_control_cancel_does_not_cancel_shutdown() -> Result<()>
+    {
+        let harness = Harness::new().await?;
+        let child = harness.spawn_child("NORMAL_CONTROL_ABORT").await?;
+        let invocation = harness.prompt_call(ROOT_SESSION, child, "BLOCK_CONTROL_ABORT");
+        harness.tracker.wait_active(1).await?;
+        let (reached, release) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::ShutdownControl);
+        finish_shutdown_after_waiter_abort(&harness, reached, release).await?;
+        assert!(invocation.await?.is_err());
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn aborted_shutdown_waiter_during_invocation_cleanup_does_not_cancel_shutdown()
+    -> Result<()> {
+        let harness = Harness::new().await?;
+        let (cleanup_reached, cleanup_release) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::CleanupInvocation);
+        let (control_reached, _control_release) =
+            harness.agents.install_barrier(TestBarrierPoint::Control);
+        let invocation = harness.spawn_call("BLOCK_CLEANUP_ABORT");
+        timeout(TEST_TIMEOUT, control_reached)
+            .await
+            .map_err(|_| eyre!("child invocation did not attach its control"))??;
+        abort_invocation(invocation).await?;
+        timeout(TEST_TIMEOUT, cleanup_reached)
+            .await
+            .map_err(|_| eyre!("cleanup worker did not start invocation cleanup"))??;
+        let first = shutdown_call(&harness.agents);
+        wait_for_registry(&harness.agents, |state| !state.admitting).await?;
+        abort_shutdown_waiter(first).await?;
+        let second = shutdown_call(&harness.agents);
+        let _ = cleanup_release.send(());
+        timeout(TEST_TIMEOUT, second)
+            .await
+            .map_err(|_| eyre!("replacement shutdown waiter timed out"))???;
+        assert_shutdown_drained(&harness).await?;
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn aborted_shutdown_waiter_during_session_drain_does_not_cancel_shutdown() -> Result<()> {
+        let harness = Harness::new().await?;
+        harness.spawn_child("NORMAL_SESSION_DRAIN_ABORT").await?;
+        let (reached, release) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::SessionDrain);
+        finish_shutdown_after_waiter_abort(&harness, reached, release).await?;
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn aborted_shutdown_waiter_before_worker_join_publication_does_not_cancel_shutdown()
+    -> Result<()> {
+        let harness = Harness::new().await?;
+        let (reached, release) = harness.agents.install_barrier(TestBarrierPoint::WorkerJoin);
+        finish_shutdown_after_waiter_abort(&harness, reached, release).await?;
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn aborted_failed_initial_drain_caller_leaves_cleanup_owned() -> Result<()> {
+        let harness = Harness::new().await?;
+        let (reached, release) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::SessionDrain);
+        let invocation = harness.spawn_call("FAIL_INITIAL_ABORT_DRAIN");
+        timeout(TEST_TIMEOUT, reached)
+            .await
+            .map_err(|_| eyre!("failed initial child did not enter session drain"))??;
+        abort_invocation(invocation).await?;
+        let _ = release.send(());
+        timeout(TEST_TIMEOUT, harness.agents.shutdown())
+            .await
+            .map_err(|_| eyre!("shutdown did not await failed-initial drain"))??;
+        assert_shutdown_drained(&harness).await?;
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn aborted_admission_drain_caller_leaves_cleanup_owned() -> Result<()> {
+        let harness = Harness::new().await?;
+        let (created, release_creation) =
+            harness.agents.install_barrier(TestBarrierPoint::Creation);
+        let (draining, release_drain) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::SessionDrain);
+        let invocation = harness.spawn_call("NORMAL_ADMISSION_ABORT_DRAIN");
+        timeout(TEST_TIMEOUT, created)
+            .await
+            .map_err(|_| eyre!("late child did not reach creation barrier"))??;
+        let shutdown = shutdown_call(&harness.agents);
+        wait_for_registry(&harness.agents, |state| !state.admitting).await?;
+        let _ = release_creation.send(());
+        timeout(TEST_TIMEOUT, draining)
+            .await
+            .map_err(|_| eyre!("rejected child did not enter session drain"))??;
+        abort_invocation(invocation).await?;
+        let _ = release_drain.send(());
+        timeout(TEST_TIMEOUT, shutdown)
+            .await
+            .map_err(|_| eyre!("shutdown did not await rejected-child drain"))???;
+        assert_shutdown_drained(&harness).await?;
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn shutdown_worker_panic_is_cached_and_never_hangs_repeated_callers() -> Result<()> {
+        let harness = Harness::new().await?;
+        harness.agents.inject_shutdown_panic();
+        let first = timeout(TEST_TIMEOUT, harness.agents.shutdown())
+            .await
+            .map_err(|_| eyre!("shutdown panic was not published"))?
+            .expect_err("injected shutdown panic unexpectedly succeeded");
+        let second = timeout(TEST_TIMEOUT, harness.agents.shutdown())
+            .await
+            .map_err(|_| eyre!("cached shutdown panic was not returned"))?
+            .expect_err("cached shutdown panic unexpectedly succeeded");
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(first.to_string().contains("shutdown worker failed"));
+        {
+            let state = harness.agents.state()?;
+            assert!(state.shutdown_task.is_none());
+            assert_eq!(state.cleanup_worker_joins, 1);
+        }
+        drop(harness.root);
+        drop(harness.root_events);
+        harness.tracker.wait_connections(0).await?;
+        harness.server.stop().await
+    }
+
+    #[tokio::test]
     async fn shutdown_is_idempotent_rejects_late_insert_and_cancels_queued_turns() -> Result<()> {
         let harness = Harness::new().await?;
         let child = harness.spawn_child("NORMAL_SHUTDOWN").await?;
@@ -1610,8 +2157,8 @@ mod tests {
         drop(late_cleanup);
         let _ = release_creation.send(());
         timeout(TEST_TIMEOUT, async {
-            first_shutdown.await?;
-            second_shutdown.await?;
+            first_shutdown.await??;
+            second_shutdown.await??;
             Result::<()>::Ok(())
         })
         .await
@@ -1620,7 +2167,7 @@ mod tests {
         for invocation in queued {
             assert!(invocation.await?.is_err());
         }
-        harness.agents.shutdown().await;
+        harness.agents.shutdown().await?;
         harness.tracker.wait_active(0).await?;
         {
             let state = harness.agents.state()?;

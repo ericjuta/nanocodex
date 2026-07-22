@@ -31,9 +31,14 @@ impl Run {
         }
         .await;
         drop(handle);
-        if let Some(child_agents) = configured.child_agents {
-            child_agents.shutdown().await;
+        let cleanup = if let Some(child_agents) = configured.child_agents {
+            child_agents.shutdown().await.map_err(eyre::Report::from)
+        } else {
+            Ok(())
+        };
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => cleanup,
         }
-        result
     }
 }
