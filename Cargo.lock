@@ -1634,6 +1634,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "unicode-segmentation",
  "unicode-width 0.2.0",
 ]
 

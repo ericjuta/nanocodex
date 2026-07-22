@@ -1,11 +1,15 @@
 use criterion::{criterion_group, criterion_main};
 
 mod tui {
-    use std::{hint::black_box, sync::Arc, time::Instant};
+    use std::{cell::Cell, hint::black_box, rc::Rc, sync::Arc, time::Instant};
 
     use criterion::{BatchSize, BenchmarkId, Criterion, Throughput};
     use nanocodex::{AgentEvent, AgentEventKind, AgentEventTiming, TimedAgentEvent};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{
+        Terminal, TerminalOptions, Viewport,
+        backend::{CrosstermBackend, TestBackend},
+        layout::Rect,
+    };
 
     #[allow(dead_code, unused_imports)]
     mod transcript {
@@ -42,7 +46,7 @@ mod tui {
 
     use app::App;
     use telemetry::StreamTelemetry;
-    use terminal::DrawMetrics;
+    use terminal::{ByteCountingWriter, DrawMetrics, MeasuredBackend};
     use transcript::{ToolStatus, Transcript, TranscriptItem};
 
     #[derive(Clone, Copy)]
@@ -117,7 +121,7 @@ mod tui {
         base + usize::from(index < remainder)
     }
 
-    fn trace_app(shape: TraceShape) -> App {
+    fn trace_app_with_tail(shape: TraceShape, tail_chars: usize) -> App {
         let mut app = App::new("/workspace/nanocodex".into());
         let turns = shape
             .user_messages
@@ -157,8 +161,67 @@ mod tui {
         // The benchmark models a partially streamed tail after retained history.
         app.main
             .transcript
-            .push(TranscriptItem::Assistant(sized_text(2_048, turns + 1)));
+            .push(TranscriptItem::Assistant(sized_text(tail_chars, turns + 1)));
         app
+    }
+
+    fn trace_app(shape: TraceShape) -> App {
+        trace_app_with_tail(shape, 2_048)
+    }
+
+    fn trace_app_with_single_line_tail(shape: TraceShape, tail_chars: usize) -> App {
+        let mut app = trace_app_with_tail(shape, 0);
+        assert!(
+            app.main
+                .transcript
+                .append_assistant_delta(&"x".repeat(tail_chars))
+        );
+        app
+    }
+
+    type OutputTerminal = Terminal<MeasuredBackend<CrosstermBackend<ByteCountingWriter<Vec<u8>>>>>;
+
+    fn output_terminal() -> (OutputTerminal, Rc<Cell<u64>>) {
+        let output_bytes = Rc::new(Cell::new(0));
+        let writer = ByteCountingWriter {
+            inner: Vec::new(),
+            bytes: Rc::clone(&output_bytes),
+        };
+        let backend = MeasuredBackend {
+            inner: CrosstermBackend::new(writer),
+            changed_cells: 0,
+        };
+        let terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 120, 40)),
+            },
+        )
+        .expect("output benchmark terminal should initialize");
+        (terminal, output_bytes)
+    }
+
+    fn output_backlog_setup() -> (App, OutputTerminal, Rc<Cell<u64>>) {
+        let mut app = App::new("/workspace/nanocodex".into());
+        for index in 0..50 {
+            app.main
+                .transcript
+                .push(TranscriptItem::User(sized_text(160, index)));
+        }
+        app.main.push_assistant_delta(&sized_text(2_048, 51));
+        app.main.settle_viewport(118, 38);
+        let (mut terminal, output_bytes) = output_terminal();
+        terminal
+            .draw(|frame| view::render(frame, &mut app))
+            .expect("initial output benchmark frame should render");
+        for _ in 0..128 {
+            app.main.push_assistant_delta("\nstreamed viewport row");
+        }
+        terminal
+            .draw(|frame| view::render(frame, &mut app))
+            .expect("burst output benchmark frame should render");
+        assert!(app.smooth_scroll_pending());
+        (app, terminal, output_bytes)
     }
 
     pub(super) fn render_benchmarks(criterion: &mut Criterion) {
@@ -223,20 +286,96 @@ mod tui {
     }
 
     pub(super) fn transcript_update_benchmark(criterion: &mut Criterion) {
-        criterion.bench_function("tui_transcript_delta/assistant_2k", |bencher| {
-            bencher.iter_batched(
-                || {
-                    let mut transcript = Transcript::default();
-                    transcript.push(TranscriptItem::Assistant(sized_text(2_048, 1)));
-                    transcript
-                },
-                |mut transcript| {
-                    assert!(transcript.append_assistant_delta(black_box("delta")));
-                    black_box(transcript);
-                },
-                BatchSize::SmallInput,
-            );
-        });
+        let mut group = criterion.benchmark_group("tui_transcript_delta");
+        group.sample_size(20);
+        for (name, tail_chars) in [
+            ("assistant_2k", 2_048),
+            ("assistant_100k", 100 * 1_024),
+            ("assistant_1m", 1_024 * 1_024),
+        ] {
+            group.bench_function(name, |bencher| {
+                bencher.iter_batched(
+                    || {
+                        let mut transcript = Transcript::default();
+                        transcript.push(TranscriptItem::Assistant(sized_text(tail_chars, 1)));
+                        black_box(transcript.tail_height(118));
+                        transcript
+                    },
+                    |mut transcript| {
+                        assert!(
+                            transcript.append_assistant_delta(black_box("\nstreamed code line"))
+                        );
+                        black_box(transcript.tail_height(118));
+                        transcript
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+        group.finish();
+    }
+
+    pub(super) fn live_tail_render_benchmark(criterion: &mut Criterion) {
+        let mut group = criterion.benchmark_group("tui_live_tail_render");
+        group.sample_size(20);
+        for (name, tail_chars, single_line) in [
+            ("assistant_2k", 2_048, false),
+            ("assistant_100k", 100 * 1_024, false),
+            ("assistant_1m", 1_024 * 1_024, false),
+            ("assistant_1m_single_line", 1_024 * 1_024, true),
+        ] {
+            let mut app = if single_line {
+                trace_app_with_single_line_tail(TRACE_SHAPES[0], tail_chars)
+            } else {
+                trace_app_with_tail(TRACE_SHAPES[0], tail_chars)
+            };
+            let mut terminal = Terminal::new(TestBackend::new(120, 40))
+                .expect("live-tail benchmark terminal should initialize");
+            terminal
+                .draw(|frame| view::render(frame, &mut app))
+                .expect("initial live-tail benchmark frame should render");
+            group.bench_function(BenchmarkId::new(name, "120x40"), |bencher| {
+                bencher.iter(|| {
+                    terminal
+                        .draw(|frame| view::render(frame, &mut app))
+                        .expect("live-tail benchmark frame should render");
+                });
+            });
+        }
+        group.finish();
+    }
+
+    pub(super) fn live_tail_first_frame_benchmark(criterion: &mut Criterion) {
+        let mut group = criterion.benchmark_group("tui_live_tail_first_frame");
+        group.sample_size(10);
+        for (name, tail_chars, single_line) in [
+            ("assistant_100k", 100 * 1_024, false),
+            ("assistant_1m", 1_024 * 1_024, false),
+            ("assistant_1m_single_line", 1_024 * 1_024, true),
+        ] {
+            group.bench_function(BenchmarkId::new(name, "120x40"), |bencher| {
+                bencher.iter_batched(
+                    || {
+                        let app = if single_line {
+                            trace_app_with_single_line_tail(TRACE_SHAPES[0], tail_chars)
+                        } else {
+                            trace_app_with_tail(TRACE_SHAPES[0], tail_chars)
+                        };
+                        let terminal = Terminal::new(TestBackend::new(120, 40))
+                            .expect("live-tail first-frame terminal should initialize");
+                        (app, terminal)
+                    },
+                    |(mut app, mut terminal)| {
+                        terminal
+                            .draw(|frame| view::render(frame, &mut app))
+                            .expect("live-tail first frame should render");
+                        (app, terminal)
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+        group.finish();
     }
 
     pub(super) fn scroll_anchor_benchmark(criterion: &mut Criterion) {
@@ -395,6 +534,51 @@ mod tui {
                 BatchSize::SmallInput,
             );
         });
+        group.finish();
+    }
+
+    pub(super) fn terminal_output_benchmark(criterion: &mut Criterion) {
+        fn draw_catch_up_frame(
+            app: &mut App,
+            terminal: &mut OutputTerminal,
+            output_bytes: &Cell<u64>,
+        ) -> DrawMetrics {
+            let bytes_before = output_bytes.get();
+            terminal.backend_mut().changed_cells = 0;
+            app.advance_smooth_scroll();
+            terminal
+                .draw(|frame| view::render(frame, app))
+                .expect("catch-up output benchmark frame should render");
+            DrawMetrics {
+                changed_cells: terminal.backend().changed_cells,
+                output_bytes: output_bytes.get().saturating_sub(bytes_before),
+            }
+        }
+
+        let (mut sample_app, mut sample_terminal, sample_bytes) = output_backlog_setup();
+        let sample =
+            draw_catch_up_frame(&mut sample_app, &mut sample_terminal, sample_bytes.as_ref());
+        let mut group = criterion.benchmark_group("tui_terminal_output");
+        group.sample_size(20);
+        group.throughput(Throughput::Bytes(sample.output_bytes));
+        group.bench_function(
+            format!(
+                "catch_up_frame_{}cells_{}bytes/120x40",
+                sample.changed_cells, sample.output_bytes
+            ),
+            |bencher| {
+                bencher.iter_batched(
+                    output_backlog_setup,
+                    |(mut app, mut terminal, output_bytes)| {
+                        let metrics =
+                            draw_catch_up_frame(&mut app, &mut terminal, output_bytes.as_ref());
+                        black_box(metrics);
+                        (app, terminal, output_bytes)
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
         group.finish();
     }
 
@@ -649,8 +833,11 @@ criterion_group!(
     tui::render_benchmarks,
     tui::resize_benchmarks,
     tui::transcript_update_benchmark,
+    tui::live_tail_render_benchmark,
+    tui::live_tail_first_frame_benchmark,
     tui::scroll_anchor_benchmark,
     tui::smooth_follow_benchmark,
+    tui::terminal_output_benchmark,
     tui::stream_telemetry_benchmark,
     tui::first_frame_benchmarks,
     tui::composer_benchmarks,

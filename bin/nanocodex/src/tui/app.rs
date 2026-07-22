@@ -15,6 +15,8 @@ use super::transcript::{ToolStatus, Transcript, TranscriptItem};
 const MAX_REASONING_STATUS_CHARS: usize = 160;
 const MAX_TOOL_ARGUMENT_CHARS: usize = 180;
 const CANCEL_CONFIRMATION_WINDOW: Duration = Duration::from_secs(1);
+const SMOOTH_SCROLL_BACKLOG_ROWS: usize = 8;
+const MAX_SMOOTH_SCROLL_CATCH_UP_ROWS: usize = 32;
 
 struct PendingScrollAnchor {
     width: u16,
@@ -405,7 +407,8 @@ impl Conversation {
     }
 
     fn advance_smooth_scroll(&mut self) {
-        self.smooth_scroll_from_bottom = self.smooth_scroll_from_bottom.saturating_sub(1);
+        let drain = smooth_scroll_drain(self.smooth_scroll_from_bottom);
+        self.smooth_scroll_from_bottom = self.smooth_scroll_from_bottom.saturating_sub(drain);
     }
 
     fn smooth_scroll_pending(&self) -> bool {
@@ -519,6 +522,18 @@ impl Conversation {
         self.has_unseen_output = false;
         self.pending_scroll_anchor = None;
     }
+}
+
+fn smooth_scroll_drain(pending_rows: usize) -> usize {
+    if pending_rows == 0 {
+        return 0;
+    }
+    if pending_rows <= SMOOTH_SCROLL_BACKLOG_ROWS {
+        return 1;
+    }
+    pending_rows
+        .saturating_sub(SMOOTH_SCROLL_BACKLOG_ROWS)
+        .clamp(2, MAX_SMOOTH_SCROLL_CATCH_UP_ROWS)
 }
 
 pub(super) struct BtwPane {
@@ -1765,7 +1780,7 @@ mod tests {
     use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
     use serde_json::{Value, json};
 
-    use super::{App, PaneId};
+    use super::{App, PaneId, smooth_scroll_drain};
     use crate::tui::transcript::TranscriptItem;
 
     fn event(kind: AgentEventKind, payload: &Value) -> AgentEvent {
@@ -1938,7 +1953,7 @@ mod tests {
     }
 
     #[test]
-    fn follow_bottom_retains_every_burst_row_for_paced_drain() {
+    fn follow_bottom_catches_up_when_a_burst_exceeds_the_smooth_backlog() {
         let mut app = App::new(".".into());
         app.main.settle_viewport(20, 6);
         app.main.push_assistant_delta("one\ntwo\nthree");
@@ -1955,11 +1970,23 @@ mod tests {
             overflow_after.saturating_sub(overflow_before)
         );
 
+        let pending = overflow_after.saturating_sub(overflow_before);
+        let drained = smooth_scroll_drain(pending);
         app.advance_smooth_scroll();
         assert_eq!(
             app.main.display_scroll_from_bottom(),
-            overflow_after.saturating_sub(overflow_before) - 1
+            pending.saturating_sub(drained)
         );
+        assert!(drained > 1);
+    }
+
+    #[test]
+    fn smooth_scroll_drain_preserves_small_steps_and_bounds_catch_up() {
+        assert_eq!(smooth_scroll_drain(0), 0);
+        assert_eq!(smooth_scroll_drain(8), 1);
+        assert_eq!(smooth_scroll_drain(9), 2);
+        assert_eq!(smooth_scroll_drain(40), 32);
+        assert_eq!(smooth_scroll_drain(1_000), 32);
     }
 
     #[test]
