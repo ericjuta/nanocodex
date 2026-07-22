@@ -9,8 +9,10 @@ any of those application shapes part of the core SDK.
 
 The library owns model execution, conversation history, prompt caching,
 Responses WebSocket state, tools, retries, and cancellation. Applications own
-their presentation, event selection, tracing subscriber, persistence, and
-transport to their users.
+their presentation, event selection, tracing subscriber, persistence policy,
+and transport to their users. Native callers may explicitly enable a
+Codex-compatible committed-history rollout; the CLI enables that policy by
+default so its completed threads can be handed off to `codex resume`.
 
 ## Product contract
 

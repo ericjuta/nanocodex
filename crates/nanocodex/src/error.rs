@@ -65,6 +65,20 @@ pub enum NanocodexError {
     #[error("building an agent requires an active Tokio runtime")]
     TokioRuntimeUnavailable,
 
+    #[error("failed to initialize a Codex rollout under {codex_home}: {source}")]
+    InitializeRollout {
+        codex_home: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to persist Codex rollout at {path}: {source}")]
+    PersistRollout {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
     #[error(transparent)]
     Event(#[from] nanocodex_core::EventError),
 

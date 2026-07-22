@@ -409,6 +409,29 @@ let (agent, events) = Nanocodex::builder(api_key)
     .build()?;
 ```
 
+Native applications can opt into a Codex-compatible committed-history rollout.
+The agent session ID is also the UUID accepted by `codex resume`:
+
+```rust
+use nanocodex::{Nanocodex, RolloutConfig};
+
+let (agent, events) = Nanocodex::builder(api_key)
+    .rollout(RolloutConfig::new("/home/me/.codex"))
+    .build()?;
+
+println!("codex resume {}", agent.session_id());
+println!("rollout: {}", agent.rollout().unwrap().path().display());
+agent.flush_rollout().await?;
+```
+
+Recording appends Codex's model-context response items and its legacy turn and
+message events after each completed or cancelled turn, so both resumed model
+context and the visible Codex transcript are restored. Compaction uses explicit
+replacement-history records, and failed partial output is excluded.
+`flush_rollout()` retries pending writes and provides a durability barrier.
+Treat a resume as a single-writer handoff: release the Nanocodex session before
+continuing the same rollout in Codex.
+
 Use `tools_factory` when a tool must spawn or fork the agent that invoked it.
 The factory receives a weak `AgentHandle`, not credentials:
 
@@ -485,6 +508,18 @@ nanocodex auth login
 nanocodex --auth-file "${CODEX_HOME:-$HOME/.codex}/auth.json"
 ```
 
+The CLI records Codex-compatible rollouts beneath
+`${CODEX_HOME:-$HOME/.codex}/sessions` by default. The `request_id` in headless
+JSONL is the resumable UUID, so a completed handoff is:
+
+```sh
+nanocodex run "Remember this thread"
+codex resume <request_id>
+```
+
+Use `nanocodex --rollouts false ...` (or `NANOCODEX_ROLLOUTS=false`) when a CLI
+consumer does not want local session recording.
+
 The TUI retains one session across prompts. Enter submits, Tab explicitly queues
 a follow-up while work is active, and `/cancel` stops the focused turn. At any
 safe model/tool boundary, `/btw <question>` opens a fast fork in a vertical pane
@@ -540,7 +575,7 @@ integrations, managed subagents, and a mature TUI and IDE ecosystem.
 | | Nanocodex | Codex |
 | --- | --- | --- |
 | Product boundary | Rust library in your process | Application and durable agent runtime |
-| State | One owned in-memory session | Persisted threads and rollouts |
+| State | In-memory authority; optional Codex-compatible rollout | Persisted threads and rollouts |
 | Follow-on turns | New input delta on one persistent WebSocket | Full Codex session lifecycle |
 | Historical forks | Exact completed checkpoint; parent keeps running | Durable thread reconstruction |
 | Tools | Code Mode over Rust tools and MCP | Broad built-in tool and integration surface |

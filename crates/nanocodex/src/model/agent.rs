@@ -72,6 +72,15 @@ impl ModelCheckpoint {
     pub(crate) fn workspace(&self) -> &str {
         &self.workspace
     }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn history(&self) -> nanocodex_core::responses::ResponseHistory {
+        self.conversation.shared_history()
+    }
+
+    pub(crate) const fn history_revision(&self) -> u64 {
+        self.conversation.history_revision
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -110,6 +119,7 @@ struct ConversationState {
     context: ContextManager,
     delta_start: usize,
     previous_response_id: Option<String>,
+    history_revision: u64,
 }
 
 impl ConversationState {
@@ -126,6 +136,7 @@ impl ConversationState {
             context: ContextManager::new(history),
             delta_start: 0,
             previous_response_id: None,
+            history_revision: 0,
         })
     }
 
@@ -170,6 +181,7 @@ impl ConversationState {
         self.context.replace_and_recompute(history, request_prefix);
         self.delta_start = 0;
         self.previous_response_id = None;
+        self.history_revision = self.history_revision.saturating_add(1);
     }
 
     fn reset_for_full_request(&mut self) {
