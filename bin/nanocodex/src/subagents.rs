@@ -9,8 +9,8 @@ use std::{
 
 use nanocodex::{
     AgentEventKind, AgentEvents, AgentHandle, Nanocodex, NanocodexError, Tool, ToolContext,
-    ToolDefinition, ToolExecution, ToolInput, ToolResult, Tools, ToolsBuildError, TurnControl,
-    async_trait,
+    ToolDefinition, ToolError, ToolExecution, ToolInput, ToolResult, Tools, ToolsBuildError,
+    TurnControl, async_trait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -91,6 +91,46 @@ impl StoredIoError {
     }
 }
 
+#[derive(Debug)]
+struct ToolCleanupError {
+    primary: ToolError,
+    cleanup: io::Error,
+}
+
+impl std::fmt::Display for ToolCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}; child session cleanup also failed: {}",
+            self.primary, self.cleanup
+        )
+    }
+}
+
+impl std::error::Error for ToolCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.primary.as_ref())
+    }
+}
+
+fn preserve_tool_primary<T, E>(
+    result: Result<T, E>,
+    cleanup: Result<(), io::Error>,
+) -> Result<T, ToolError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(Box::new(cleanup)),
+        (Err(primary), Ok(())) => Err(Box::new(primary)),
+        (Err(primary), Err(cleanup)) => Err(Box::new(ToolCleanupError {
+            primary: Box::new(primary),
+            cleanup,
+        })),
+    }
+}
+
 struct ActiveInvocation {
     caller: String,
     target: String,
@@ -111,6 +151,8 @@ struct RegistryState {
     fallback_session_drains: Vec<JoinHandle<()>>,
     #[cfg(test)]
     cleanup_worker_joins: usize,
+    #[cfg(test)]
+    cleanup_worker_join_attempts: usize,
 }
 
 #[cfg(test)]
@@ -186,6 +228,8 @@ pub(crate) struct ChildAgents {
     #[cfg(test)]
     shutdown_panic: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    cleanup_worker_panic: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
     test_barriers: Arc<TestBarriers>,
 }
 
@@ -205,8 +249,17 @@ impl Default for ChildAgents {
         let test_barriers = Arc::new(TestBarriers::default());
         #[cfg(test)]
         let worker_barriers = Arc::clone(&test_barriers);
+        #[cfg(test)]
+        let cleanup_worker_panic = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(test)]
+        let worker_panic = Arc::clone(&cleanup_worker_panic);
         let cleanup_task = tokio::spawn(async move {
             while let Some(request) = cleanup_rx.recv().await {
+                #[cfg(test)]
+                assert!(
+                    !worker_panic.swap(false, Ordering::SeqCst),
+                    "injected child cleanup-worker panic"
+                );
                 match request {
                     CleanupRequest::Invocation(request) => {
                         #[cfg(test)]
@@ -241,6 +294,8 @@ impl Default for ChildAgents {
             shutdown_notify: tokio::sync::Notify::new(),
             #[cfg(test)]
             shutdown_panic: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            cleanup_worker_panic,
             #[cfg(test)]
             test_barriers,
         }
@@ -468,19 +523,25 @@ impl ChildAgents {
         #[cfg(test)]
         self.pause_at_barrier(TestBarrierPoint::ShutdownAdmission)
             .await;
-        self.cancel_shutdown_controls(&mut failures).await?;
-        self.wait_for_owned_work().await?;
-        self.drain_shutdown_sessions(&mut failures).await?;
-        self.join_fallback_session_drains().await?;
-        self.join_cleanup_worker().await?;
+        if let Err(error) = self.cancel_shutdown_controls(&mut failures).await {
+            failures.push(StoredIoError::from_error(error));
+        }
+        if let Err(error) = self.wait_for_owned_work().await {
+            failures.push(StoredIoError::from_error(error));
+        }
+        if let Err(error) = self.drain_shutdown_sessions(&mut failures).await {
+            failures.push(StoredIoError::from_error(error));
+        }
+        self.join_fallback_session_drains(&mut failures).await;
+        self.join_cleanup_worker(&mut failures).await;
 
-        failures.extend(
-            self.cleanup_failures
-                .lock()
-                .map_err(|_| io::Error::other("child cleanup failure mutex poisoned"))?
-                .iter()
-                .cloned(),
-        );
+        match self.cleanup_failures.lock() {
+            Ok(cleanup_failures) => failures.extend(cleanup_failures.iter().cloned()),
+            Err(_) => failures.push(StoredIoError::new(
+                io::ErrorKind::Other,
+                "child cleanup failure mutex poisoned",
+            )),
+        }
         finish_cleanup(&failures)
     }
 
@@ -554,50 +615,85 @@ impl ChildAgents {
         Ok(())
     }
 
-    async fn join_fallback_session_drains(&self) -> Result<(), io::Error> {
+    async fn join_fallback_session_drains(&self, failures: &mut Vec<StoredIoError>) {
         loop {
-            let fallback_drains = {
-                let mut state = self.state()?;
-                std::mem::take(&mut state.fallback_session_drains)
+            let fallback_drains = match self.state() {
+                Ok(mut state) => std::mem::take(&mut state.fallback_session_drains),
+                Err(error) => {
+                    failures.push(StoredIoError::from_error(error));
+                    return;
+                }
             };
             if fallback_drains.is_empty() {
                 break;
             }
             for fallback in fallback_drains {
-                fallback.await.map_err(|error| {
-                    io::Error::other(format!("fallback child session drain failed: {error}"))
-                })?;
+                if let Err(error) = fallback.await {
+                    failures.push(StoredIoError::new(
+                        io::ErrorKind::Other,
+                        format!("fallback child session drain failed: {error}"),
+                    ));
+                }
             }
         }
-        Ok(())
     }
 
-    async fn join_cleanup_worker(&self) -> Result<(), io::Error> {
-        self.cleanup_barrier().await?;
-        self.cleanup_tx
-            .send(CleanupRequest::Shutdown)
-            .map_err(|_| io::Error::other("child cleanup worker stopped before shutdown"))?;
-        let cleanup_task = self
-            .cleanup_task
-            .lock()
-            .map_err(|_| io::Error::other("child cleanup task mutex poisoned"))?
-            .take();
-        let cleanup_task = cleanup_task
-            .ok_or_else(|| io::Error::other("child cleanup worker was already joined"))?;
-        cleanup_task
-            .await
-            .map_err(|error| io::Error::other(format!("child cleanup worker failed: {error}")))?;
+    async fn join_cleanup_worker(&self, failures: &mut Vec<StoredIoError>) {
+        if let Err(error) = self.cleanup_barrier().await {
+            failures.push(StoredIoError::from_error(error));
+        }
+        if self.cleanup_tx.send(CleanupRequest::Shutdown).is_err() {
+            failures.push(StoredIoError::new(
+                io::ErrorKind::Other,
+                "child cleanup worker stopped before shutdown",
+            ));
+        }
+        let cleanup_task = {
+            let mut cleanup_task = match self.cleanup_task.lock() {
+                Ok(cleanup_task) => cleanup_task,
+                Err(poisoned) => {
+                    failures.push(StoredIoError::new(
+                        io::ErrorKind::Other,
+                        "child cleanup task mutex poisoned",
+                    ));
+                    poisoned.into_inner()
+                }
+            };
+            cleanup_task.take()
+        };
+        if let Some(cleanup_task) = cleanup_task {
+            #[cfg(test)]
+            match self.state() {
+                Ok(mut state) => state.cleanup_worker_join_attempts += 1,
+                Err(error) => failures.push(StoredIoError::from_error(error)),
+            }
+            let join_result = cleanup_task.await;
+            #[cfg(test)]
+            match self.state() {
+                Ok(mut state) => state.cleanup_worker_joins += 1,
+                Err(error) => failures.push(StoredIoError::from_error(error)),
+            }
+            if let Err(error) = join_result {
+                failures.push(StoredIoError::new(
+                    io::ErrorKind::Other,
+                    format!("child cleanup worker failed: {error}"),
+                ));
+            }
+        } else {
+            failures.push(StoredIoError::new(
+                io::ErrorKind::Other,
+                "child cleanup worker was already joined",
+            ));
+        }
         #[cfg(test)]
         self.pause_at_barrier(TestBarrierPoint::WorkerJoin).await;
         #[cfg(test)]
         {
-            self.state()?.cleanup_worker_joins += 1;
             assert!(
                 !self.shutdown_panic.swap(false, Ordering::SeqCst),
                 "injected child-agent shutdown panic"
             );
         }
-        Ok(())
     }
 
     fn publish_shutdown(&self, result: Result<(), StoredIoError>) {
@@ -614,6 +710,11 @@ impl ChildAgents {
     #[cfg(test)]
     fn inject_shutdown_panic(&self) {
         self.shutdown_panic.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_cleanup_worker_panic(&self) {
+        self.cleanup_worker_panic.store(true, Ordering::SeqCst);
     }
 
     async fn cleanup_barrier(&self) -> Result<(), io::Error> {
@@ -952,6 +1053,8 @@ fn drain_events(
 ) -> JoinHandle<()> {
     let log_jsonl = std::env::var_os("NANOCODEX_SUBAGENT_JSONL").is_some();
     tokio::spawn(async move {
+        #[cfg(test)]
+        assert_ne!(role, "panic-event-drain", "injected event-drain panic");
         while let Some(event) = events.recv().await {
             if log_jsonl
                 && matches!(
@@ -1027,8 +1130,8 @@ impl Tool for ChildAgent {
             event_task,
         ) {
             drop(child);
-            agents.drain_session(session, false).await?;
-            return Err(error.into());
+            let cleanup = agents.drain_session(session, false).await;
+            return preserve_tool_primary(Err::<ToolExecution, _>(error), cleanup);
         }
         let mut guard = match agents.reserve(context.session_id, &child_session_id, Some(agent_id))
         {
@@ -1036,7 +1139,8 @@ impl Tool for ChildAgent {
             Err(error) => {
                 if let Some(session) = agents.take_child_for_drain(agent_id)? {
                     drop(child);
-                    agents.drain_session(session, true).await?;
+                    let cleanup = agents.drain_session(session, true).await;
+                    return preserve_tool_primary(Err::<ToolExecution, _>(error), cleanup);
                 }
                 return Err(error.into());
             }
@@ -1049,7 +1153,8 @@ impl Tool for ChildAgent {
             Err(error) => {
                 if let Some(session) = guard.finish_terminal(false)? {
                     drop(child);
-                    agents.drain_session(session, true).await?;
+                    let cleanup = agents.drain_session(session, true).await;
+                    return preserve_tool_primary(Err::<ToolExecution, _>(error), cleanup);
                 }
                 return Err(error.into());
             }
@@ -1062,11 +1167,13 @@ impl Tool for ChildAgent {
         #[cfg(test)]
         agents.pause_at_barrier(TestBarrierPoint::Control).await;
         let result = turn.result().await;
-        if let Some(session) = guard.finish_terminal(result.is_ok())? {
+        let cleanup = if let Some(session) = guard.finish_terminal(result.is_ok())? {
             drop(child);
-            agents.drain_session(session, true).await?;
-        }
-        let result = result?;
+            agents.drain_session(session, true).await
+        } else {
+            Ok(())
+        };
+        let result = preserve_tool_primary(result, cleanup)?;
         Ok(ToolExecution::json(&WorkerResult {
             agent_id,
             kind: self.kind.result_name(),
@@ -1599,15 +1706,20 @@ mod tests {
         }
 
         fn spawn_call(&self, task: &str) -> JoinHandle<ToolResult> {
+            self.spawn_call_with_role("worker", task)
+        }
+
+        fn spawn_call_with_role(&self, role: &str, task: &str) -> JoinHandle<ToolResult> {
             let tool = ChildAgent::new(
                 self.root_handle.clone(),
                 Arc::downgrade(&self.agents),
                 ChildKind::Spawn,
             );
+            let role = role.to_owned();
             let task = task.to_owned();
             tokio::spawn(async move {
                 tool.execute(
-                    function_input(&json!({ "role": "worker", "task": task })),
+                    function_input(&json!({ "role": role, "task": task })),
                     tool_context(ROOT_SESSION),
                 )
                 .await
@@ -1739,6 +1851,7 @@ mod tests {
         assert!(state.fallback_session_drains.is_empty());
         assert!(state.shutdown_result.is_some());
         assert_eq!(state.cleanup_worker_joins, 1);
+        assert_eq!(state.cleanup_worker_join_attempts, 1);
         assert!(state.shutdown_task.is_none());
         drop(state);
         assert!(
@@ -1846,6 +1959,47 @@ mod tests {
                 .prompt_call(ROOT_SESSION, child, "NORMAL_RECOVERY")
                 .await?,
         )?;
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn failed_initial_turn_retains_turn_and_session_drain_errors() -> Result<()> {
+        let harness = Harness::new().await?;
+        let error = harness
+            .spawn_call_with_role("panic-event-drain", "FAIL_INITIAL_DUAL_ERROR")
+            .await?
+            .err()
+            .ok_or_else(|| eyre!("failed initial turn unexpectedly succeeded"))?;
+        let error = error.to_string();
+        assert!(error.contains("deterministic non-retryable failure"));
+        assert!(error.contains("child event-drain task failed"));
+        harness.close().await
+    }
+
+    #[tokio::test]
+    async fn rejected_insert_retains_registry_and_session_drain_errors() -> Result<()> {
+        let harness = Harness::new().await?;
+        let (created, release_creation) =
+            harness.agents.install_barrier(TestBarrierPoint::Creation);
+        let invocation =
+            harness.spawn_call_with_role("panic-event-drain", "NORMAL_INSERT_DUAL_ERROR");
+        timeout(TEST_TIMEOUT, created)
+            .await
+            .map_err(|_| eyre!("late child did not reach creation barrier"))??;
+        let shutdown = shutdown_call(&harness.agents);
+        wait_for_registry(&harness.agents, |state| !state.admitting).await?;
+        let _ = release_creation.send(());
+        let error = invocation
+            .await?
+            .err()
+            .ok_or_else(|| eyre!("late child insert unexpectedly succeeded"))?
+            .to_string();
+        assert!(error.contains("child-agent registry is shutting down"));
+        assert!(error.contains("child event-drain task failed"));
+        timeout(TEST_TIMEOUT, shutdown)
+            .await
+            .map_err(|_| eyre!("shutdown did not finish after rejected insert"))???;
+        assert_shutdown_drained(&harness).await?;
         harness.close().await
     }
 
@@ -2112,11 +2266,125 @@ mod tests {
             let state = harness.agents.state()?;
             assert!(state.shutdown_task.is_none());
             assert_eq!(state.cleanup_worker_joins, 1);
+            assert_eq!(state.cleanup_worker_join_attempts, 1);
         }
         drop(harness.root);
         drop(harness.root_events);
         harness.tracker.wait_connections(0).await?;
         harness.server.stop().await
+    }
+
+    #[tokio::test]
+    async fn cleanup_worker_panic_is_joined_once_and_cached_for_repeated_shutdown() -> Result<()> {
+        let harness = Harness::new().await?;
+        harness.agents.inject_cleanup_worker_panic();
+        let first = timeout(TEST_TIMEOUT, harness.agents.shutdown())
+            .await
+            .map_err(|_| eyre!("cleanup-worker panic was not published"))?
+            .expect_err("cleanup-worker panic unexpectedly succeeded");
+        let second = timeout(TEST_TIMEOUT, harness.agents.shutdown())
+            .await
+            .map_err(|_| eyre!("cached cleanup-worker panic was not returned"))?
+            .expect_err("cached cleanup-worker panic unexpectedly succeeded");
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(first.to_string().contains("drain barrier"));
+        assert!(first.to_string().contains("cleanup worker failed"));
+        {
+            let state = harness.agents.state()?;
+            assert!(state.shutdown_task.is_none());
+            assert_eq!(state.cleanup_worker_join_attempts, 1);
+            assert_eq!(state.cleanup_worker_joins, 1);
+        }
+        assert!(
+            harness
+                .agents
+                .cleanup_task
+                .lock()
+                .map_err(|_| eyre!("cleanup task mutex poisoned"))?
+                .is_none()
+        );
+        drop(harness.root);
+        drop(harness.root_events);
+        harness.tracker.wait_connections(0).await?;
+        harness.server.stop().await
+    }
+
+    #[tokio::test]
+    async fn fallback_session_join_awaits_every_taken_handle_after_failure() -> Result<()> {
+        let agents = Arc::new(ChildAgents::default());
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_task = Arc::clone(&completed);
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let failed = tokio::spawn(async { panic!("injected fallback drain panic") });
+        let delayed = tokio::spawn(async move {
+            let _ = started.send(());
+            let _ = release_rx.await;
+            completed_task.fetch_add(1, Ordering::SeqCst);
+        });
+        {
+            let mut state = agents.state()?;
+            state.fallback_session_drains.extend([failed, delayed]);
+        }
+        let join = {
+            let agents = Arc::clone(&agents);
+            tokio::spawn(async move {
+                let mut failures = Vec::new();
+                agents.join_fallback_session_drains(&mut failures).await;
+                failures
+            })
+        };
+        timeout(TEST_TIMEOUT, started_rx)
+            .await
+            .map_err(|_| eyre!("delayed fallback drain did not start"))??;
+        assert!(!join.is_finished(), "later fallback drain was detached");
+        let _ = release.send(());
+        let failures = timeout(TEST_TIMEOUT, join)
+            .await
+            .map_err(|_| eyre!("fallback drains did not all join"))??;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        agents.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poisoned_cleanup_task_mutex_still_joins_worker_once() -> Result<()> {
+        let agents = Arc::new(ChildAgents::default());
+        let poisoned = Arc::clone(&agents);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _cleanup_task = poisoned
+                .cleanup_task
+                .lock()
+                .expect("cleanup task mutex should initially be healthy");
+            panic!("inject cleanup task mutex poison");
+        }));
+        let first = timeout(TEST_TIMEOUT, agents.shutdown())
+            .await
+            .map_err(|_| eyre!("poisoned cleanup task shutdown hung"))?
+            .expect_err("poisoned cleanup task shutdown unexpectedly succeeded");
+        let second = timeout(TEST_TIMEOUT, agents.shutdown())
+            .await
+            .map_err(|_| eyre!("cached poisoned cleanup task error hung"))?
+            .expect_err("cached poisoned cleanup task error unexpectedly succeeded");
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(first.to_string().contains("cleanup task mutex poisoned"));
+        {
+            let state = agents.state()?;
+            assert_eq!(state.cleanup_worker_join_attempts, 1);
+            assert_eq!(state.cleanup_worker_joins, 1);
+            assert!(state.shutdown_task.is_none());
+        }
+        assert!(
+            agents
+                .cleanup_task
+                .lock()
+                .expect_err("cleanup task mutex poison was lost")
+                .into_inner()
+                .is_none()
+        );
+        Ok(())
     }
 
     #[tokio::test]

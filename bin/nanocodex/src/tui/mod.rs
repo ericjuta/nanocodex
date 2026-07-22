@@ -38,7 +38,7 @@ use self::{
     terminal::TerminalSession,
     transcript::TranscriptItem,
 };
-use crate::config::AgentArgs;
+use crate::{config::AgentArgs, run::preserve_primary_with_cleanup};
 
 const BTW_BOUNDARY: &str = r"You are answering an ephemeral BTW side question.
 Treat inherited conversation history only as reference context. Do not resume or complete an
@@ -490,23 +490,19 @@ impl UiLoop {
     }
 }
 
-async fn restore_before_shutdown<T, E, C, R, S, F>(
-    result: std::result::Result<T, E>,
+async fn restore_before_shutdown<T, R, S, F>(
+    result: Result<T>,
     restore: R,
     shutdown: S,
-) -> std::result::Result<T, E>
+) -> Result<T>
 where
-    E: From<C>,
     R: FnOnce(),
     S: FnOnce() -> F,
-    F: Future<Output = std::result::Result<(), C>>,
+    F: Future<Output = std::result::Result<(), std::io::Error>>,
 {
     restore();
     let cleanup = shutdown().await;
-    match result {
-        Err(error) => Err(error),
-        Ok(value) => cleanup.map(|()| value).map_err(Into::into),
-    }
+    preserve_primary_with_cleanup(result, cleanup)
 }
 
 fn render_due_frame(
@@ -1992,14 +1988,19 @@ mod tests {
 
     #[tokio::test]
     async fn tui_restores_terminal_before_awaiting_child_shutdown() -> eyre::Result<()> {
-        for expected in [Ok("completed"), Err("failed")] {
+        for ui_fails in [false, true] {
             let restored = Arc::new(AtomicBool::new(false));
             let restore_flag = Arc::clone(&restored);
             let shutdown_flag = Arc::clone(&restored);
             let (polled, polled_rx) = oneshot::channel();
             let (release, release_rx) = oneshot::channel();
+            let result = if ui_fails {
+                Err(eyre::eyre!("ui failed"))
+            } else {
+                Ok("completed")
+            };
             let lifecycle = tokio::spawn(restore_before_shutdown(
-                expected,
+                result,
                 move || restore_flag.store(true, Ordering::SeqCst),
                 move || async move {
                     assert!(
@@ -2008,7 +2009,7 @@ mod tests {
                     );
                     let _ = polled.send(());
                     drop(release_rx.await);
-                    Ok::<(), &str>(())
+                    Ok::<(), std::io::Error>(())
                 },
             ));
 
@@ -2018,22 +2019,34 @@ mod tests {
             assert!(restored.load(Ordering::SeqCst));
             assert!(!lifecycle.is_finished(), "shutdown future did not block");
             let _ = release.send(());
-            assert_eq!(lifecycle.await?, expected);
+            let result = lifecycle.await?;
+            if ui_fails {
+                assert_eq!(
+                    result.expect_err("UI failure was lost").to_string(),
+                    "ui failed"
+                );
+            } else {
+                assert_eq!(result?, "completed");
+            }
         }
         let original = restore_before_shutdown(
-            Err::<(), &str>("ui failed"),
+            Err::<(), _>(eyre::eyre!("ui failed")),
             || {},
-            || async { Err::<(), &str>("cleanup failed") },
+            || async { Err(std::io::Error::other("cleanup failed")) },
         )
-        .await;
-        assert_eq!(original, Err("ui failed"));
+        .await
+        .expect_err("dual UI/cleanup failure unexpectedly succeeded");
+        assert!(original.to_string().contains("ui failed"));
+        assert!(original.to_string().contains("cleanup failed"));
+        assert_eq!(original.root_cause().to_string(), "ui failed");
         let cleanup = restore_before_shutdown(
-            Ok::<(), &str>(()),
+            Ok(()),
             || {},
-            || async { Err::<(), &str>("cleanup failed") },
+            || async { Err(std::io::Error::other("cleanup failed")) },
         )
-        .await;
-        assert_eq!(cleanup, Err("cleanup failed"));
+        .await
+        .expect_err("cleanup failure unexpectedly succeeded");
+        assert_eq!(cleanup.to_string(), "cleanup failed");
         Ok(())
     }
 

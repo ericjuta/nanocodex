@@ -32,13 +32,44 @@ impl Run {
         .await;
         drop(handle);
         let cleanup = if let Some(child_agents) = configured.child_agents {
-            child_agents.shutdown().await.map_err(eyre::Report::from)
+            child_agents.shutdown().await
         } else {
             Ok(())
         };
-        match result {
-            Err(error) => Err(error),
-            Ok(()) => cleanup,
+        preserve_primary_with_cleanup(result, cleanup)
+    }
+}
+
+pub(crate) fn preserve_primary_with_cleanup<T>(
+    result: Result<T>,
+    cleanup: std::result::Result<(), io::Error>,
+) -> Result<T> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(cleanup.into()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(cleanup)) => {
+            let context = format!("{primary}; child-agent cleanup also failed: {cleanup}");
+            Err(primary.wrap_err(context))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eyre::eyre;
+
+    use super::preserve_primary_with_cleanup;
+
+    #[test]
+    fn primary_run_and_cleanup_failures_are_both_retained() {
+        let error = preserve_primary_with_cleanup::<()>(
+            Err(eyre!("primary run failed")),
+            Err(std::io::Error::other("cleanup failed")),
+        )
+        .expect_err("dual failure unexpectedly succeeded");
+        assert!(error.to_string().contains("primary run failed"));
+        assert!(error.to_string().contains("cleanup failed"));
+        assert_eq!(error.root_cause().to_string(), "primary run failed");
     }
 }
