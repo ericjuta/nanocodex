@@ -170,6 +170,24 @@ let (historical, _events) = agent.fork_from(&checkpoint).await?;
 `prompt().await` means accepted, not completed. The agent retains conversation
 history, tools, cache identity, response chain, and its WebSocket automatically.
 
+Independent agents that use the same immutable instructions and tool definitions
+may deliberately share only their provider-side prompt cache while retaining
+separate conversations, response chains, tools, and workspaces:
+
+```rust
+let (agent, _events) = Nanocodex::builder(api_key)
+    .session_id(attempt_id)
+    .prompt_cache_key(agent_recipe_id)
+    .shared_prompt_cache()
+    .build()?;
+```
+
+Builders cloned after `shared_prompt_cache()` singleflight the first warmup for
+each exact prefix. Later agents skip that redundant request and send their first
+complete generation with the shared provider cache key. The cache key is
+inherited by forks and clean spawned agents. Without an explicit key, every
+clean root or spawned agent retains its own cache identity.
+
 ### Lifecycle and dataflow
 
 ```text
