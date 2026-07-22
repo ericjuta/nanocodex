@@ -1469,6 +1469,442 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn fork_during_compaction_inherits_completed_tool_boundary() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (compaction_started, compaction_started_rx) = tokio::sync::oneshot::channel();
+    let (release_compaction, release_compaction_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut root = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut root).await?);
+        send_warmup(&mut root, "resp-warmup").await?;
+
+        let generation = next_json(&mut root).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut root,
+            completed_response_with_usage(
+                "resp-tool",
+                &[
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": "call-first",
+                        "name": "exec",
+                        "input": "text(\"first tool completed\")"
+                    }),
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": "call-second",
+                        "name": "exec",
+                        "input": "text(\"second tool completed\")"
+                    }),
+                ],
+                372_001,
+            ),
+        )
+        .await?;
+
+        let compact = next_json(&mut root).await?;
+        assert_eq!(compact["previous_response_id"], "resp-tool");
+        assert_eq!(compact["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(compact["input"][0]["type"], "custom_tool_call_output");
+        assert_eq!(compact["input"][0]["call_id"], "call-first");
+        assert_eq!(compact["input"][1]["type"], "custom_tool_call_output");
+        assert_eq!(compact["input"][1]["call_id"], "call-second");
+        assert_eq!(compact["input"][2]["type"], "compaction_trigger");
+        compaction_started
+            .send(())
+            .map_err(|()| eyre!("compaction signal receiver dropped"))?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut branch = accept_async(stream).await?;
+        let fork = next_json(&mut branch).await?;
+        assert_eq!(fork["previous_response_id"], "resp-tool");
+        assert_eq!(fork["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(fork["input"][0]["type"], "custom_tool_call_output");
+        assert_eq!(fork["input"][0]["call_id"], "call-first");
+        assert!(
+            fork["input"][0]
+                .to_string()
+                .contains("first tool completed")
+        );
+        assert_eq!(fork["input"][1]["type"], "custom_tool_call_output");
+        assert_eq!(fork["input"][1]["call_id"], "call-second");
+        assert!(
+            fork["input"][1]
+                .to_string()
+                .contains("second tool completed")
+        );
+        assert_eq!(
+            fork["input"][2]["content"][0]["text"],
+            "fork while tool compaction is blocked"
+        );
+        send_final(&mut branch, "resp-branch").await?;
+
+        release_compaction_rx
+            .await
+            .map_err(|_| eyre!("compaction release sender dropped"))?;
+        send_json(
+            &mut root,
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "tool-boundary-summary"
+                }
+            }),
+        )
+        .await?;
+        send_json(
+            &mut root,
+            completed_response_with_usage("resp-compact", &[], 120),
+        )
+        .await?;
+        let continuation = next_json(&mut root).await?;
+        assert!(continuation.get("previous_response_id").is_none());
+        send_final(&mut root, "resp-root").await
+    });
+
+    let workspace = temporary_workspace("fork-tool-compaction")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, root_events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    let root = agent.prompt("root tool compaction").await?;
+    compaction_started_rx
+        .await
+        .map_err(|_| eyre!("compaction was not observed"))?;
+
+    let (fork, fork_events) = agent.fork().await?;
+    let branch = fork.prompt("fork while tool compaction is blocked").await?;
+    assert_eq!(branch.result().await?.final_message, "done");
+    release_compaction
+        .send(())
+        .map_err(|()| eyre!("compaction release receiver dropped"))?;
+    assert_eq!(root.result().await?.final_message, "done");
+
+    drop((agent, fork, root_events, fork_events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn fork_during_tool_free_compaction_inherits_completed_response() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let (compaction_started, compaction_started_rx) = tokio::sync::oneshot::channel();
+    let (release_compaction, release_compaction_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut root = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut root).await?);
+        send_warmup(&mut root, "resp-warmup").await?;
+
+        let generation = next_json(&mut root).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        let mut response = completed_response_with_usage(
+            "resp-continue",
+            &[json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "intermediate safe response" }]
+            })],
+            372_001,
+        );
+        response["response"]["end_turn"] = json!(false);
+        send_json(&mut root, response).await?;
+
+        let compact = next_json(&mut root).await?;
+        assert_eq!(compact["previous_response_id"], "resp-continue");
+        assert_eq!(compact["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(compact["input"][0]["type"], "compaction_trigger");
+        compaction_started
+            .send(())
+            .map_err(|()| eyre!("compaction signal receiver dropped"))?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut branch = accept_async(stream).await?;
+        let checkpoint = next_json(&mut branch).await?;
+        assert_eq!(checkpoint["previous_response_id"], "resp-continue");
+        assert_eq!(checkpoint["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            checkpoint["input"][0]["content"][0]["text"],
+            "fork while tool-free compaction is blocked"
+        );
+        send_json(
+            &mut branch,
+            json!({
+                "type": "error",
+                "error": {
+                    "code": "previous_response_not_found",
+                    "message": "checkpoint expired"
+                }
+            }),
+        )
+        .await?;
+
+        let replay = next_json(&mut branch).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        let replay_text = replay.to_string();
+        assert_eq!(replay_text.matches("intermediate safe response").count(), 1);
+        assert!(replay_text.contains("root tool-free compaction"));
+        assert!(replay_text.contains("fork while tool-free compaction is blocked"));
+        send_final(&mut branch, "resp-branch").await?;
+
+        release_compaction_rx
+            .await
+            .map_err(|_| eyre!("compaction release sender dropped"))?;
+        send_json(
+            &mut root,
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "compaction",
+                    "encrypted_content": "tool-free-boundary-summary"
+                }
+            }),
+        )
+        .await?;
+        send_json(
+            &mut root,
+            completed_response_with_usage("resp-compact", &[], 120),
+        )
+        .await?;
+        let continuation = next_json(&mut root).await?;
+        assert!(continuation.get("previous_response_id").is_none());
+        send_final(&mut root, "resp-root").await
+    });
+
+    let workspace = temporary_workspace("fork-tool-free-compaction")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, root_events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+    let root = agent.prompt("root tool-free compaction").await?;
+    compaction_started_rx
+        .await
+        .map_err(|_| eyre!("compaction was not observed"))?;
+
+    let (fork, fork_events) = agent.fork().await?;
+    let branch = fork
+        .prompt("fork while tool-free compaction is blocked")
+        .await?;
+    assert_eq!(branch.result().await?.final_message, "done");
+    release_compaction
+        .send(())
+        .map_err(|()| eyre!("compaction release receiver dropped"))?;
+    assert_eq!(root.result().await?.final_message, "done");
+
+    drop((agent, fork, root_events, fork_events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn failed_continuation_replays_complete_safe_history_on_next_turn() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut socket = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut socket).await?);
+        send_warmup(&mut socket, "resp-warmup").await?;
+
+        let initial = next_json(&mut socket).await?;
+        assert_eq!(initial["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut socket,
+            completed_response(
+                "resp-tool",
+                &[json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call-exec",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({cmd: \"printf x >> marker.txt\"}); text(result.output);"
+                })],
+            ),
+        )
+        .await?;
+
+        let failed_continuation = next_json(&mut socket).await?;
+        assert_eq!(failed_continuation["previous_response_id"], "resp-tool");
+        assert_eq!(
+            failed_continuation["input"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            failed_continuation["input"][0]["type"],
+            "custom_tool_call_output"
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-failed",
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_image",
+                        "message": "The image data you provided does not represent a valid image"
+                    }
+                }
+            }),
+        )
+        .await?;
+
+        let replay = next_json(&mut socket).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        let input = replay["input"]
+            .as_array()
+            .ok_or_else(|| eyre!("recovery request input was not an array"))?;
+        assert_eq!(input.len(), 7);
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "custom_tool_call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "custom_tool_call_output")
+                .count(),
+            1
+        );
+        assert!(replay.to_string().contains("call-exec"));
+        assert_eq!(
+            input
+                .last()
+                .and_then(|item| item["content"][0]["text"].as_str()),
+            Some("recover on the next turn")
+        );
+        send_json(
+            &mut socket,
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-failed-again",
+                    "status": "failed",
+                    "error": {
+                        "code": "invalid_image",
+                        "message": "The image data you provided does not represent a valid image"
+                    }
+                }
+            }),
+        )
+        .await?;
+
+        let replay_after_another_failure = next_json(&mut socket).await?;
+        assert!(
+            replay_after_another_failure
+                .get("previous_response_id")
+                .is_none()
+        );
+        let input = replay_after_another_failure["input"]
+            .as_array()
+            .ok_or_else(|| eyre!("second recovery request input was not an array"))?;
+        assert_eq!(input.len(), 8);
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "custom_tool_call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "custom_tool_call_output")
+                .count(),
+            1
+        );
+        assert!(
+            replay_after_another_failure
+                .to_string()
+                .contains("call-exec")
+        );
+        assert!(
+            replay_after_another_failure
+                .to_string()
+                .contains("recover on the next turn")
+        );
+        assert_eq!(
+            input
+                .last()
+                .and_then(|item| item["content"][0]["text"].as_str()),
+            Some("recover after another failure")
+        );
+        send_final(&mut socket, "resp-recovered").await?;
+
+        let incremental = next_json(&mut socket).await?;
+        assert_eq!(incremental["previous_response_id"], "resp-recovered");
+        assert_eq!(incremental["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            incremental["input"][0]["content"][0]["text"],
+            "healthy incremental turn"
+        );
+        send_final(&mut socket, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("failed-continuation-replay")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+
+    let failed = agent.prompt("run one side effect").await?;
+    let error = failed
+        .result()
+        .await
+        .expect_err("the non-retryable continuation should fail the turn");
+    assert!(matches!(
+        error.responses_error(),
+        Some(ResponsesError::InvalidImageRequest { .. })
+    ));
+    let failed_recovery = agent.prompt("recover on the next turn").await?;
+    let error = failed_recovery
+        .result()
+        .await
+        .expect_err("another non-retryable failure should re-arm recovery replay");
+    assert!(matches!(
+        error.responses_error(),
+        Some(ResponsesError::InvalidImageRequest { .. })
+    ));
+    let recovered = agent.prompt("recover after another failure").await?;
+    assert_eq!(recovered.result().await?.final_message, "done");
+    let healthy = agent.prompt("healthy incremental turn").await?;
+    assert_eq!(healthy.result().await?.final_message, "done");
+
+    drop((agent, events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert_eq!(std::fs::read_to_string(workspace.join("marker.txt"))?, "x");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn latest_fork_during_streaming_inherits_the_active_prompt_delta() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);

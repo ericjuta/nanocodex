@@ -90,6 +90,29 @@ struct ModelSessionState {
     factory: ResponsesAttemptFactory,
     conversation: ConversationState,
     preserve_inherited_delta: bool,
+    replay_full_history_on_next_prompt: bool,
+}
+
+impl ModelSessionState {
+    fn prepare_prompt_delta(&mut self) {
+        if self.replay_full_history_on_next_prompt {
+            return;
+        }
+        if self.preserve_inherited_delta {
+            self.preserve_inherited_delta = false;
+        } else {
+            self.conversation.clear_delta();
+        }
+    }
+
+    fn record_model_outcome(&mut self, outcome: &Result<String>) {
+        if outcome.is_ok() {
+            self.replay_full_history_on_next_prompt = false;
+        } else {
+            self.conversation.reset_for_full_request();
+            self.replay_full_history_on_next_prompt = true;
+        }
+    }
 }
 
 struct ActiveToolCall {
@@ -255,6 +278,7 @@ impl<S> ModelRun<S> {
                 factory,
                 conversation: checkpoint.conversation,
                 preserve_inherited_delta: checkpoint.preserve_inherited_delta,
+                replay_full_history_on_next_prompt: false,
             }),
             active_tools: Some(active_tools),
             active_tool_call: None,
@@ -410,11 +434,7 @@ where
                 }
             }
             let user_content = prepare_user_input(&task.instruction).await;
-            if session.preserve_inherited_delta {
-                session.preserve_inherited_delta = false;
-            } else {
-                session.conversation.clear_delta();
-            }
+            session.prepare_prompt_delta();
             session.conversation.append([ResponseItem::message(
                 nanocodex_core::MessageRole::User,
                 user_content,
@@ -449,6 +469,7 @@ where
                 factory,
                 conversation,
                 preserve_inherited_delta: false,
+                replay_full_history_on_next_prompt: false,
             };
             Self::publish_fork_snapshot(&mut session, fork_snapshots);
             let warmup = {
@@ -484,6 +505,9 @@ where
                 outcome = &mut task => Some(outcome),
             }
         };
+        if let Some(outcome) = &outcome {
+            session.record_model_outcome(outcome);
+        }
         self.session = Some(session);
         match outcome {
             Some(outcome) => outcome.map(ModelTaskOutcome::Completed),
@@ -594,6 +618,7 @@ where
             if code_calls.is_empty() {
                 if end_turn == Some(false) {
                     session.conversation.clear_delta();
+                    Self::publish_fork_snapshot(session, fork_snapshots);
                     self.maybe_compact(
                         call_index,
                         &mut session.conversation,
@@ -631,6 +656,7 @@ where
                     .await?;
                 session.conversation.append(output);
             }
+            Self::publish_fork_snapshot(session, fork_snapshots);
             self.maybe_compact(
                 call_index,
                 &mut session.conversation,
