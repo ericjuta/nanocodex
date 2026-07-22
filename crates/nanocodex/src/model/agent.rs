@@ -46,6 +46,7 @@ pub(crate) struct ModelRun<S> {
     session: Option<ModelSessionState>,
     active_tools: Option<ToolRuntimeControl>,
     active_tool_call: Option<ActiveToolCall>,
+    pending_tool_response: Option<PendingToolResponse>,
     tool_call_indices: HashMap<Box<str>, u32>,
     tools: Tools,
     lineage_id: Arc<str>,
@@ -120,6 +121,55 @@ struct ActiveToolCall {
     name: String,
     kind: CodeCallKind,
     started_at: Instant,
+}
+
+struct PendingToolResponse {
+    output_items: Vec<ResponseItem>,
+    completed_call_ids: Vec<Box<str>>,
+    completed_outputs: Vec<ResponseItem>,
+}
+
+impl PendingToolResponse {
+    fn new(output_items: Vec<ResponseItem>) -> Self {
+        Self {
+            output_items,
+            completed_call_ids: Vec::new(),
+            completed_outputs: Vec::new(),
+        }
+    }
+
+    fn tool_history(&self, conversation: &ConversationState) -> Vec<ResponseItem> {
+        let mut history = conversation.flattened_history();
+        history.extend(self.output_items.iter().cloned());
+        history.extend(self.completed_outputs.iter().cloned());
+        history
+    }
+
+    fn record_completed(&mut self, call_id: String, output: Vec<ResponseItem>) {
+        self.completed_call_ids.push(call_id.into_boxed_str());
+        self.completed_outputs.extend(output);
+    }
+
+    fn commit(self, conversation: &mut ConversationState) {
+        conversation.append(self.output_items);
+        conversation.clear_delta();
+        conversation.append(self.completed_outputs);
+    }
+
+    fn into_safe_items(mut self, active_call_id: Option<&str>) -> Vec<ResponseItem> {
+        self.output_items.retain(|item| {
+            let Some(call_id) = response_item_call_id(item) else {
+                return true;
+            };
+            active_call_id == Some(call_id)
+                || self
+                    .completed_call_ids
+                    .iter()
+                    .any(|completed| completed.as_ref() == call_id)
+        });
+        self.output_items.extend(self.completed_outputs);
+        self.output_items
+    }
 }
 
 enum ModelTaskOutcome {
@@ -237,6 +287,7 @@ impl<S> ModelRun<S> {
             session: None,
             active_tools: None,
             active_tool_call: None,
+            pending_tool_response: None,
             tool_call_indices: HashMap::new(),
             tools,
             lineage_id,
@@ -282,6 +333,7 @@ impl<S> ModelRun<S> {
             }),
             active_tools: Some(active_tools),
             active_tool_call: None,
+            pending_tool_response: None,
             tool_call_indices: HashMap::new(),
             tools,
             lineage_id,
@@ -505,9 +557,7 @@ where
                 outcome = &mut task => Some(outcome),
             }
         };
-        if let Some(outcome) = &outcome {
-            session.record_model_outcome(outcome);
-        }
+        self.record_task_outcome(&mut session, outcome.as_ref(), fork_snapshots);
         self.session = Some(session);
         match outcome {
             Some(outcome) => outcome.map(ModelTaskOutcome::Completed),
@@ -531,7 +581,8 @@ where
     }
 
     fn commit_interrupted_checkpoint(&mut self) -> Result<ModelCheckpoint> {
-        let aborted_output = if let Some(call) = self.active_tool_call.take() {
+        let active_call = self.active_tool_call.take();
+        let aborted_output = if let Some(call) = &active_call {
             let duration_ns = elapsed_ns(call.started_at);
             let output = ToolOutputBody::Text(format!(
                 "Wall time: {:.3} seconds\naborted by user",
@@ -550,8 +601,8 @@ where
                 },
             )?;
             Some(match call.kind {
-                CodeCallKind::Custom => custom_tool_output(call.call_id, output),
-                CodeCallKind::Function => function_tool_output(call.call_id, output),
+                CodeCallKind::Custom => custom_tool_output(call.call_id.clone(), output),
+                CodeCallKind::Function => function_tool_output(call.call_id.clone(), output),
             })
         } else {
             None
@@ -562,6 +613,11 @@ where
             .ok_or(NanocodexError::InvalidAttemptState {
                 detail: "cancelled turn did not have a model session",
             })?;
+        if let Some(pending) = self.pending_tool_response.take() {
+            session.conversation.append(
+                pending.into_safe_items(active_call.as_ref().map(|call| call.call_id.as_str())),
+            );
+        }
         session.conversation.append(aborted_output);
         session.conversation.append([turn_aborted()]);
         session.conversation.commit_interrupted();
@@ -582,6 +638,35 @@ where
             conversation: session.conversation.clone(),
             preserve_inherited_delta: true,
         }));
+    }
+
+    fn record_task_outcome(
+        &mut self,
+        session: &mut ModelSessionState,
+        outcome: Option<&Result<String>>,
+        snapshots: &watch::Sender<Option<ModelCheckpoint>>,
+    ) {
+        let Some(outcome) = outcome else {
+            return;
+        };
+        if outcome.is_err() {
+            self.preserve_failed_tool_boundary(session, snapshots);
+        }
+        session.record_model_outcome(outcome);
+    }
+
+    fn preserve_failed_tool_boundary(
+        &mut self,
+        session: &mut ModelSessionState,
+        snapshots: &watch::Sender<Option<ModelCheckpoint>>,
+    ) {
+        self.active_tool_call = None;
+        let Some(pending) = self.pending_tool_response.take() else {
+            return;
+        };
+        session.conversation.append(pending.into_safe_items(None));
+        session.conversation.reset_for_full_request();
+        Self::publish_fork_snapshot(session, snapshots);
     }
 
     async fn drive_session(
@@ -610,12 +695,15 @@ where
             let end_turn = response.end_turn;
             let final_message = response.final_message;
             let code_calls = response.code_calls;
-            session
-                .conversation
-                .append(response.output_items.into_iter().map(strip_item_id));
+            let output_items = response
+                .output_items
+                .into_iter()
+                .map(strip_item_id)
+                .collect::<Vec<_>>();
             can_drain_steers = true;
 
             if code_calls.is_empty() {
+                session.conversation.append(output_items);
                 if end_turn == Some(false) {
                     session.conversation.clear_delta();
                     Self::publish_fork_snapshot(session, fork_snapshots);
@@ -647,15 +735,40 @@ where
                 });
             }
 
-            session.conversation.clear_delta();
+            if self.pending_tool_response.is_some() {
+                return Err(NanocodexError::InvalidAttemptState {
+                    detail: "model tool response overlapped an unfinished tool response",
+                });
+            }
+            self.pending_tool_response = Some(PendingToolResponse::new(output_items));
             for call in code_calls {
-                let history = (call.name == "exec")
-                    .then(|| Arc::new(session.conversation.flattened_history()));
+                let history = if call.name == "exec" {
+                    let pending = self.pending_tool_response.as_ref().ok_or(
+                        NanocodexError::InvalidAttemptState {
+                            detail: "model tool call did not have a pending response",
+                        },
+                    )?;
+                    Some(Arc::new(pending.tool_history(&session.conversation)))
+                } else {
+                    None
+                };
+                let call_id = call.call_id.clone();
                 let output = self
                     .execute_model_tool(&session.tools, call_index, call, history)
                     .await?;
-                session.conversation.append(output);
+                self.pending_tool_response
+                    .as_mut()
+                    .ok_or(NanocodexError::InvalidAttemptState {
+                        detail: "completed model tool call lost its pending response",
+                    })?
+                    .record_completed(call_id, output);
             }
+            self.pending_tool_response
+                .take()
+                .ok_or(NanocodexError::InvalidAttemptState {
+                    detail: "completed model tools lost their pending response",
+                })?
+                .commit(&mut session.conversation);
             Self::publish_fork_snapshot(session, fork_snapshots);
             self.maybe_compact(
                 call_index,
@@ -1383,6 +1496,14 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
 fn strip_item_id(mut item: ResponseItem) -> ResponseItem {
     item.strip_id();
     item
+}
+
+fn response_item_call_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::CustomToolCall { call_id, .. }
+        | ResponseItem::FunctionCall { call_id, .. } => Some(call_id),
+        _ => None,
+    }
 }
 
 fn request_profile(

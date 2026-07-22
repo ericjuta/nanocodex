@@ -592,6 +592,165 @@ async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> 
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn cancellation_during_second_tool_excludes_later_calls_from_snapshot_and_replay()
+-> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut first).await?);
+        send_warmup(&mut first, "resp-warmup").await?;
+
+        let generation = next_json(&mut first).await?;
+        assert_eq!(generation["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut first,
+            completed_response(
+                "resp-tools",
+                &[
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": "call-first",
+                        "name": "exec",
+                        "input": "const result = await tools.exec_command({cmd: \"printf 1 >> marker.txt\"}); text(\"first completed\");"
+                    }),
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": "call-second",
+                        "name": "exec",
+                        "input": "const result = await tools.exec_command({cmd: \"printf started > tool-two-started; sleep 30\"}); text(result.output);"
+                    }),
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": "call-never-started",
+                        "name": "exec",
+                        "input": "const result = await tools.exec_command({cmd: \"printf 3 >> marker.txt\"}); text(result.output);"
+                    }),
+                ],
+            ),
+        )
+        .await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut branch = accept_async(stream).await?;
+        let snapshot = next_json(&mut branch).await?;
+        assert_cancelled_multi_tool_boundary(&snapshot, "fork from the cancellation checkpoint")?;
+        send_final(&mut branch, "resp-branch").await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut replacement = accept_async(stream).await?;
+        let replay = next_json(&mut replacement).await?;
+        assert_cancelled_multi_tool_boundary(&replay, "continue after cancellation")?;
+        send_final(&mut replacement, "resp-follow-up").await
+    });
+
+    let workspace = temporary_workspace("cancel-second-tool")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let (agent, mut events) = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .session_id("model-test")
+        .build()?;
+
+    let interrupted = agent.prompt("run three tools").await?;
+    timeout(std::time::Duration::from_secs(5), async {
+        while !workspace.join("tool-two-started").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| eyre!("second tool process did not start"))?;
+
+    interrupted.cancel().await?;
+    assert!(matches!(
+        interrupted.result().await,
+        Err(NanocodexError::TurnCancelled)
+    ));
+
+    let (fork, fork_events) = agent.fork().await?;
+    assert_eq!(
+        fork.prompt("fork from the cancellation checkpoint")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+    assert_eq!(
+        agent
+            .prompt("continue after cancellation")
+            .await?
+            .result()
+            .await?
+            .final_message,
+        "done"
+    );
+
+    drop((agent, fork, fork_events));
+    let mut saw_cancelled_second_tool = false;
+    while let Some(event) = events.recv().await {
+        if event.kind == nanocodex_core::AgentEventKind::ToolResult {
+            let payload = event.decode_payload::<Value>()?;
+            saw_cancelled_second_tool |= payload["call_id"] == "call-second"
+                && payload["status"] == "cancelled"
+                && payload.to_string().contains("aborted by user");
+        }
+    }
+    assert!(saw_cancelled_second_tool);
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert_eq!(std::fs::read_to_string(workspace.join("marker.txt"))?, "1");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+fn assert_cancelled_multi_tool_boundary(request: &Value, next_prompt: &str) -> Result<()> {
+    assert!(request.get("previous_response_id").is_none());
+    let input = request["input"]
+        .as_array()
+        .ok_or_else(|| eyre!("authoritative replay input was not an array"))?;
+    assert_eq!(tool_item_count(input, "custom_tool_call", "call-first"), 1);
+    assert_eq!(tool_item_count(input, "custom_tool_call", "call-second"), 1);
+    assert_eq!(
+        tool_item_count(input, "custom_tool_call", "call-never-started"),
+        0
+    );
+    assert_eq!(
+        tool_item_count(input, "custom_tool_call_output", "call-first"),
+        1
+    );
+    assert_eq!(
+        tool_item_count(input, "custom_tool_call_output", "call-second"),
+        1
+    );
+    assert_eq!(
+        tool_item_count(input, "custom_tool_call_output", "call-never-started"),
+        0
+    );
+    assert!(request.to_string().contains("first completed"));
+    assert!(request.to_string().contains("aborted by user"));
+    assert!(request.to_string().contains("<turn_aborted>"));
+    assert_eq!(
+        input
+            .last()
+            .and_then(|item| item["content"][0]["text"].as_str()),
+        Some(next_prompt)
+    );
+    Ok(())
+}
+
+fn tool_item_count(input: &[Value], item_type: &str, call_id: &str) -> usize {
+    input
+        .iter()
+        .filter(|item| item["type"] == item_type && item["call_id"] == call_id)
+        .count()
+}
+
+#[tokio::test]
 async fn stored_response_local_code_mode_round_trip() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -1492,13 +1651,19 @@ async fn fork_during_compaction_inherits_completed_tool_boundary() -> Result<()>
                         "type": "custom_tool_call",
                         "call_id": "call-first",
                         "name": "exec",
-                        "input": "text(\"first tool completed\")"
+                        "input": "const result = await tools.exec_command({cmd: \"printf 1 >> marker.txt\"}); text(\"first tool completed\");"
                     }),
                     json!({
                         "type": "custom_tool_call",
                         "call_id": "call-second",
                         "name": "exec",
-                        "input": "text(\"second tool completed\")"
+                        "input": "throw new Error(\"second tool failed\")"
+                    }),
+                    json!({
+                        "type": "custom_tool_call",
+                        "call_id": "call-third",
+                        "name": "exec",
+                        "input": "const result = await tools.exec_command({cmd: \"printf 3 >> marker.txt\"}); text(\"third tool completed\");"
                     }),
                 ],
                 372_001,
@@ -1508,12 +1673,14 @@ async fn fork_during_compaction_inherits_completed_tool_boundary() -> Result<()>
 
         let compact = next_json(&mut root).await?;
         assert_eq!(compact["previous_response_id"], "resp-tool");
-        assert_eq!(compact["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(compact["input"].as_array().map(Vec::len), Some(4));
         assert_eq!(compact["input"][0]["type"], "custom_tool_call_output");
         assert_eq!(compact["input"][0]["call_id"], "call-first");
         assert_eq!(compact["input"][1]["type"], "custom_tool_call_output");
         assert_eq!(compact["input"][1]["call_id"], "call-second");
-        assert_eq!(compact["input"][2]["type"], "compaction_trigger");
+        assert_eq!(compact["input"][2]["type"], "custom_tool_call_output");
+        assert_eq!(compact["input"][2]["call_id"], "call-third");
+        assert_eq!(compact["input"][3]["type"], "compaction_trigger");
         compaction_started
             .send(())
             .map_err(|()| eyre!("compaction signal receiver dropped"))?;
@@ -1522,7 +1689,7 @@ async fn fork_during_compaction_inherits_completed_tool_boundary() -> Result<()>
         let mut branch = accept_async(stream).await?;
         let fork = next_json(&mut branch).await?;
         assert_eq!(fork["previous_response_id"], "resp-tool");
-        assert_eq!(fork["input"].as_array().map(Vec::len), Some(3));
+        assert_eq!(fork["input"].as_array().map(Vec::len), Some(4));
         assert_eq!(fork["input"][0]["type"], "custom_tool_call_output");
         assert_eq!(fork["input"][0]["call_id"], "call-first");
         assert!(
@@ -1532,15 +1699,45 @@ async fn fork_during_compaction_inherits_completed_tool_boundary() -> Result<()>
         );
         assert_eq!(fork["input"][1]["type"], "custom_tool_call_output");
         assert_eq!(fork["input"][1]["call_id"], "call-second");
+        assert!(fork["input"][1].to_string().contains("second tool failed"));
+        assert_eq!(fork["input"][2]["type"], "custom_tool_call_output");
+        assert_eq!(fork["input"][2]["call_id"], "call-third");
         assert!(
-            fork["input"][1]
+            fork["input"][2]
                 .to_string()
-                .contains("second tool completed")
+                .contains("third tool completed")
         );
         assert_eq!(
-            fork["input"][2]["content"][0]["text"],
+            fork["input"][3]["content"][0]["text"],
             "fork while tool compaction is blocked"
         );
+        send_json(
+            &mut branch,
+            json!({
+                "type": "error",
+                "error": {
+                    "code": "previous_response_not_found",
+                    "message": "checkpoint expired"
+                }
+            }),
+        )
+        .await?;
+        let replay = next_json(&mut branch).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        let replay_input = replay["input"]
+            .as_array()
+            .ok_or_else(|| eyre!("tool-boundary replay input was not an array"))?;
+        for call_id in ["call-first", "call-second", "call-third"] {
+            assert_eq!(
+                tool_item_count(replay_input, "custom_tool_call", call_id),
+                1
+            );
+            assert_eq!(
+                tool_item_count(replay_input, "custom_tool_call_output", call_id),
+                1
+            );
+        }
+        assert!(replay.to_string().contains("second tool failed"));
         send_final(&mut branch, "resp-branch").await?;
 
         release_compaction_rx
@@ -1592,6 +1789,7 @@ async fn fork_during_compaction_inherits_completed_tool_boundary() -> Result<()>
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert_eq!(std::fs::read_to_string(workspace.join("marker.txt"))?, "13");
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
