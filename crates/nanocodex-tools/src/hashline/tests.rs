@@ -153,6 +153,24 @@ fn split_patch_input_previews_applies_and_rejects_ambiguous_shapes() {
 }
 
 #[test]
+fn split_patch_input_explains_that_operations_are_one_dsl_string() {
+    let result = super::decode_patch_request(
+        &json!({
+            "header": "[notes.txt]#ad113ba9",
+            "operations": [{"type": "swap", "line": "2:f589", "text": "bravo"}]
+        })
+        .to_string(),
+    );
+    let Err(error) = result else {
+        panic!("structured operations should be rejected");
+    };
+    let message = error.to_string();
+    assert!(message.contains("`operations` must be a string"));
+    assert!(message.contains("not a JSON operation list"));
+    assert!(message.contains("SWAP 2:f589"));
+}
+
+#[test]
 fn block_anchor_round_trips_and_rejects_stale_evidence() {
     let root = workspace("block");
     fs::write(root.join("lib.rs"), "fn one() {\n    work();\n}\n").expect("fixture should write");
@@ -244,6 +262,8 @@ fn tool_schemas_explain_relative_paths_and_patch_grammar() {
         "patchHeader",
         "[path]#HASH",
         "SWAP",
+        "not a JSON array or object",
+        "SWAP 2:f589",
         "REM",
         "MV",
         "fully sectioned",

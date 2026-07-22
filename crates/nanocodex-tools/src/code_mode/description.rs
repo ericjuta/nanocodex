@@ -72,9 +72,10 @@ fn render_json_schema_to_typescript(schema: &Value) -> String {
             }
             for key in ["anyOf", "oneOf"] {
                 if let Some(variants) = map.get(key).and_then(Value::as_array) {
+                    let siblings = schema_siblings(map, key);
                     let rendered = variants
                         .iter()
-                        .map(render_json_schema_to_typescript)
+                        .map(|variant| render_schema_variant(&siblings, variant))
                         .collect::<Vec<_>>();
                     if !rendered.is_empty() {
                         return rendered.join(" | ");
@@ -118,6 +119,44 @@ fn render_json_schema_to_typescript(schema: &Value) -> String {
         }
         _ => "unknown".to_owned(),
     }
+}
+
+fn schema_siblings(
+    map: &serde_json::Map<String, Value>,
+    combinator: &str,
+) -> serde_json::Map<String, Value> {
+    map.iter()
+        .filter(|(key, _)| key.as_str() != combinator)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn render_schema_variant(siblings: &serde_json::Map<String, Value>, variant: &Value) -> String {
+    if siblings.is_empty() {
+        return render_json_schema_to_typescript(variant);
+    }
+    let mut combined = siblings.clone();
+    let Value::Object(variant) = variant else {
+        return render_json_schema_to_typescript(variant);
+    };
+    for (key, value) in variant {
+        if key == "required" {
+            let mut required = combined
+                .get("required")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for field in value.as_array().into_iter().flatten() {
+                if !required.contains(field) {
+                    required.push(field.clone());
+                }
+            }
+            combined.insert(key.clone(), Value::Array(required));
+        } else {
+            combined.insert(key.clone(), value.clone());
+        }
+    }
+    render_json_schema_to_typescript(&Value::Object(combined))
 }
 
 fn render_type(map: &serde_json::Map<String, Value>, schema_type: &str) -> String {
@@ -268,6 +307,27 @@ mod tests {
         assert_eq!(
             render_json_schema_to_typescript(&schema),
             "{\n  choice: \"one\" | \"two\";\n  // How many.\n  count?: number;\n}"
+        );
+    }
+
+    #[test]
+    fn renders_object_properties_into_one_of_variants() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "patch": {"type": "string"},
+                "header": {"type": "string"},
+                "operations": {"type": "string"}
+            },
+            "oneOf": [
+                {"required": ["patch"]},
+                {"required": ["header", "operations"]}
+            ],
+            "additionalProperties": false
+        });
+        assert_eq!(
+            render_json_schema_to_typescript(&schema),
+            "{ header?: string; operations?: string; patch: string; } | { header: string; operations: string; patch?: string; }"
         );
     }
 }

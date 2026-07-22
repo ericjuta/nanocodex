@@ -447,6 +447,21 @@ Hashline is exposed to the model through Code Mode as `tools.hashline__read`,
 `tools.hashline__find_block`, `tools.hashline__patch`, and
 `tools.hashline__transaction`.
 
+For a direct single-file edit, copy `patchHeader` and a line anchor from a recent
+read, then pass the operations as one Hashline DSL string—not as a JSON array:
+
+```javascript
+const observed = await tools.hashline__read({ path: "notes.txt" });
+await tools.hashline__patch({
+  header: observed.patchHeader,
+  operations: "SWAP 2:f589:\n+bravo",
+  dry_run: true,
+});
+```
+
+Here `2:f589` is copied from the read output. Reread and rebuild the patch after
+any stale-anchor or file-hash error.
+
 Code Mode prewarms one persistent Node host alongside the first model call and
 reuses it for the session. Cells receive one shared owned history snapshot;
 resumed waits do not copy history they cannot read. A nested shell request can

@@ -294,7 +294,13 @@ struct PatchRequest {
 }
 
 fn decode_patch_request(raw: &str) -> Result<PatchRequest, FunctionCallError> {
-    let request: PatchRequestWire = decode(raw)?;
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        FunctionCallError::RespondToModel(format!("invalid Hashline arguments: {error}"))
+    })?;
+    validate_patch_request_types(&value)?;
+    let request: PatchRequestWire = serde_json::from_value(value).map_err(|error| {
+        FunctionCallError::RespondToModel(format!("invalid Hashline arguments: {error}"))
+    })?;
     let patch = match (request.patch, request.header, request.operations) {
         (Some(patch), None, None) => patch,
         (None, Some(header), Some(operations)) => {
@@ -317,6 +323,49 @@ fn decode_patch_request(raw: &str) -> Result<PatchRequest, FunctionCallError> {
         patch,
         dry_run: request.dry_run,
     })
+}
+
+fn validate_patch_request_types(value: &Value) -> Result<(), FunctionCallError> {
+    let object = value.as_object().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "invalid Hashline arguments: expected a JSON object".to_owned(),
+        )
+    })?;
+    for field in ["patch", "header", "operations"] {
+        if let Some(value) = object.get(field)
+            && !value.is_string()
+        {
+            let guidance = if field == "operations" {
+                "; pass one Hashline DSL string such as \"SWAP 2:f589:\\n+bravo\", not a JSON operation list"
+            } else {
+                ""
+            };
+            return model_error(format!(
+                "`{field}` must be a string, not {}{guidance}",
+                json_kind(value)
+            ));
+        }
+    }
+    if let Some(value) = object.get("dry_run")
+        && !value.is_boolean()
+    {
+        return model_error(format!(
+            "`dry_run` must be a boolean, not {}",
+            json_kind(value)
+        ));
+    }
+    Ok(())
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1279,7 +1328,7 @@ fn block_definition() -> ToolDefinition {
 fn patch_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__patch",
-        "Apply a complete Hashline routine patch. For a direct single-file edit, pass hashline__read.patchHeader as header plus the operations separately. For multi-file edits, pass a fully sectioned patch program. Routine commits are not crash-atomic; use hashline__transaction for recoverable batches.",
+        "Apply a complete Hashline routine patch. For a direct single-file edit, pass hashline__read.patchHeader as header plus one operations DSL string, for example `SWAP 2:f589:\\n+bravo`. Do not pass operations as a JSON array or object. For multi-file edits, pass a fully sectioned patch program. Routine commits are not crash-atomic; use hashline__transaction for recoverable batches.",
         json!({
             "type": "object",
             "properties": {
@@ -1293,7 +1342,7 @@ fn patch_definition() -> ToolDefinition {
                 },
                 "operations": {
                     "type": "string",
-                    "description": "Single-file Hashline operations placed after header: SWAP, DEL, INS.PRE, INS.POST, INS.HEAD, INS.TAIL, block forms, REM, or MV."
+                    "description": "One string containing single-file Hashline DSL placed after header, not a JSON array or object. Copy anchors from a recent read/find result. Example: SWAP 2:f589:\\n+bravo. Supported operations: SWAP, DEL, INS.PRE, INS.POST, INS.HEAD, INS.TAIL, block forms, REM, or MV."
                 },
                 "dry_run": {
                     "type": "boolean",
