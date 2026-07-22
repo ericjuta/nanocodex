@@ -28,6 +28,8 @@ const INITIAL_YIELD: Duration = if cfg!(test) {
     Duration::from_secs(10)
 };
 const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
+const OBSERVER_YIELD_GRACE: Duration = Duration::from_secs(1);
+const MIN_YIELD_FOR_OBSERVER_GRACE: Duration = Duration::from_secs(10);
 const NESTED_YIELD_GRACE: Duration = Duration::from_secs(5);
 const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
@@ -312,6 +314,7 @@ impl CodeModeRuntime {
         let yield_after = source
             .yield_time_ms
             .map_or(INITIAL_YIELD, Duration::from_millis);
+        let yield_after = observer_yield_timeout(yield_after);
         let (execution, running) = observe_cell(
             &mut cell,
             started_at,
@@ -376,6 +379,7 @@ impl CodeModeRuntime {
                 .yield_time_ms
                 .unwrap_or(u64::try_from(DEFAULT_WAIT_YIELD.as_millis()).unwrap_or(u64::MAX)),
         );
+        let yield_time = observer_yield_timeout(yield_time);
         let output_token_budget = arguments
             .max_tokens
             .unwrap_or(continued_output_token_budget)
@@ -399,6 +403,14 @@ impl CodeModeRuntime {
             live_cell.join().await;
         }
         execution
+    }
+}
+
+fn observer_yield_timeout(yield_time: Duration) -> Duration {
+    if yield_time >= MIN_YIELD_FOR_OBSERVER_GRACE {
+        yield_time.saturating_add(OBSERVER_YIELD_GRACE)
+    } else {
+        yield_time
     }
 }
 

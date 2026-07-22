@@ -1,0 +1,15 @@
+{
+  "name": "nanocodex-node-example",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=../../.env index.mjs"
+  },
+  "dependencies": {
+    "nanocodex": "file:../../js/bindings"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

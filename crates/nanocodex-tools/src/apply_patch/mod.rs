@@ -4,7 +4,7 @@ use std::{
 };
 
 use nanocodex_core::ToolDefinition;
-use serde_json::json;
+use serde_json::Value;
 
 use super::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
 
@@ -38,7 +38,9 @@ impl Tool for ApplyPatchHandler {
         let workspace = self.workspace.clone();
         Ok(
             match tokio::task::spawn_blocking(move || apply(&input, &workspace)).await {
-                Ok(Ok(output)) => ToolExecution::text(output).with_code_mode_value(json!({})),
+                Ok(Ok(output)) => {
+                    ToolExecution::text(output.clone()).with_code_mode_value(Value::String(output))
+                }
                 Ok(Err(error)) => ToolExecution::error(error),
                 Err(error) => ToolExecution::error(format!("apply_patch task failed: {error}")),
             },

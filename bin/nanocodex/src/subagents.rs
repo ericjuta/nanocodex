@@ -357,7 +357,7 @@ impl ChildAgents {
         parent_session_id: String,
         agent: Nanocodex,
         event_task: JoinHandle<()>,
-    ) -> Result<(), (std::io::Error, ChildSession)> {
+    ) -> Result<(), Box<(std::io::Error, ChildSession)>> {
         let session = ChildSession {
             session_id,
             parent_session_id,
@@ -366,10 +366,10 @@ impl ChildAgents {
         };
         let mut state = match self.state() {
             Ok(state) => state,
-            Err(error) => return Err((error, session)),
+            Err(error) => return Err(Box::new((error, session))),
         };
         if !state.admitting {
-            return Err((registry_stopped(), session));
+            return Err(Box::new((registry_stopped(), session)));
         }
         state.agents.insert(id, session);
         Ok(())
@@ -1170,13 +1170,14 @@ impl Tool for ChildAgent {
         agents.pause_at_barrier(TestBarrierPoint::Creation).await;
         let child_session_id = events.request_id().to_owned();
         let event_task = drain_events(agent_id, role.clone(), self.kind.result_name(), events);
-        if let Err((error, session)) = agents.insert(
+        if let Err(error) = agents.insert(
             agent_id,
             child_session_id.clone(),
             context.session_id.to_owned(),
             child.clone(),
             event_task,
         ) {
+            let (error, session) = *error;
             drop(child);
             let cleanup = agents.drain_session(session, false).await;
             return preserve_tool_primary(Err::<ToolExecution, _>(error), cleanup);

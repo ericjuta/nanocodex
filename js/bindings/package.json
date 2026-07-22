@@ -1,0 +1,46 @@
+{
+  "name": "nanocodex",
+  "version": "0.1.0",
+  "description": "Viem-style Node and browser bindings for the Nanocodex WASM agent",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./index.d.mts",
+      "import": "./index.mjs"
+    },
+    "./node": {
+      "types": "./node/index.d.mts",
+      "import": "./node/index.mjs"
+    },
+    "./browser": {
+      "types": "./browser/index.d.mts",
+      "import": "./browser/index.mjs"
+    }
+  },
+  "files": [
+    "browser",
+    "node",
+    "pkg-node",
+    "pkg-web",
+    "runtime",
+    "index.d.mts",
+    "index.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gakonst/nanocodex.git",
+    "directory": "js/bindings"
+  }
+}

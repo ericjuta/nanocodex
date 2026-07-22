@@ -28,7 +28,7 @@ use super::{
     },
     resolve_workspace, terminal_payload,
 };
-use crate::{NanocodexError, Result};
+use crate::{NanocodexError, Result, prompt_cache::ModelPromptCache};
 use nanocodex_tools::{
     ImageGenerationConfig, NestedToolCall, OwnedToolContext, ToolContext, ToolOutputBody,
     ToolRuntime, ToolRuntimeControl, Tools, WebSearchConfig, prepare_output_images,
@@ -49,7 +49,7 @@ pub(crate) struct ModelRun<S> {
     pending_tool_response: Option<PendingToolResponse>,
     tool_call_indices: HashMap<Box<str>, u32>,
     tools: Tools,
-    lineage_id: Arc<str>,
+    prompt_cache: ModelPromptCache,
 }
 
 pub(crate) enum ModelTurnOutcome {
@@ -72,6 +72,16 @@ pub(crate) struct ModelCheckpoint {
 impl ModelCheckpoint {
     pub(crate) fn workspace(&self) -> &str {
         &self.workspace
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn history(&self) -> nanocodex_core::responses::ResponseHistory {
+        self.conversation.shared_history()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) const fn history_revision(&self) -> u64 {
+        self.conversation.history_revision
     }
 }
 
@@ -172,6 +182,14 @@ impl PendingToolResponse {
     }
 }
 
+struct WarmupExecution {
+    response_id: String,
+    attempt: u32,
+    connection_generation: u32,
+    usage: Option<Usage>,
+    server_reasoning_included: bool,
+}
+
 enum ModelTaskOutcome {
     Completed(String),
     Cancelled,
@@ -183,6 +201,7 @@ struct ConversationState {
     context: ContextManager,
     delta_start: usize,
     previous_response_id: Option<String>,
+    history_revision: u64,
 }
 
 impl ConversationState {
@@ -199,6 +218,7 @@ impl ConversationState {
             context: ContextManager::new(history),
             delta_start: 0,
             previous_response_id: None,
+            history_revision: 0,
         })
     }
 
@@ -243,6 +263,7 @@ impl ConversationState {
         self.context.replace_and_recompute(history, request_prefix);
         self.delta_start = 0;
         self.previous_response_id = None;
+        self.history_revision = self.history_revision.saturating_add(1);
     }
 
     fn reset_for_full_request(&mut self) {
@@ -274,7 +295,7 @@ impl<S> ModelRun<S> {
         client: ResponsesClient<S>,
         transport_stats: Arc<TransportStats>,
         tools: Tools,
-        lineage_id: Arc<str>,
+        prompt_cache: ModelPromptCache,
     ) -> Self {
         Self {
             events,
@@ -290,7 +311,7 @@ impl<S> ModelRun<S> {
             pending_tool_response: None,
             tool_call_indices: HashMap::new(),
             tools,
-            lineage_id,
+            prompt_cache,
         }
     }
 
@@ -300,20 +321,17 @@ impl<S> ModelRun<S> {
         client: ResponsesClient<S>,
         transport_stats: Arc<TransportStats>,
         tools: Tools,
-        lineage_id: Arc<str>,
+        prompt_cache: ModelPromptCache,
         checkpoint: ModelCheckpoint,
     ) -> Self {
         let runtime = tool_runtime(&checkpoint.workspace, &config, &tools);
         let active_tools = runtime.control();
-        let factory = ResponsesAttemptFactory::new(
-            request_profile(
-                events.request_id(),
-                &lineage_id,
-                runtime.model_specs(),
-                config.system_prompt(),
-            ),
-            events.clone(),
-            Arc::clone(&transport_stats),
+        let factory = attempt_factory(
+            &events,
+            &transport_stats,
+            prompt_cache.key(),
+            &runtime,
+            config.system_prompt(),
         );
         Self {
             events,
@@ -336,8 +354,18 @@ impl<S> ModelRun<S> {
             pending_tool_response: None,
             tool_call_indices: HashMap::new(),
             tools,
-            lineage_id,
+            prompt_cache,
         }
+    }
+
+    fn attempt_factory(&self, tools: &ToolRuntime) -> ResponsesAttemptFactory {
+        attempt_factory(
+            &self.events,
+            &self.transport_stats,
+            self.prompt_cache.key(),
+            tools,
+            self.config.system_prompt(),
+        )
     }
 }
 
@@ -359,6 +387,7 @@ where
             RunStarted {
                 mode: "openai_model",
                 model: MODEL,
+                reasoning_mode: self.config.reasoning_mode.as_str(),
                 effort: self.config.thinking.as_str(),
                 transport: TRANSPORT,
                 orchestration: ModelConfig::orchestration(),
@@ -399,6 +428,7 @@ where
             RunStarted {
                 mode: "openai_model",
                 model: MODEL,
+                reasoning_mode: self.config.reasoning_mode.as_str(),
                 effort: self.config.thinking.as_str(),
                 transport: TRANSPORT,
                 orchestration: ModelConfig::orchestration(),
@@ -497,16 +527,7 @@ where
             let project_instructions = load_project_instructions(Path::new(&workspace))?;
             let tools = tool_runtime(&workspace, &self.config, &self.tools);
             self.active_tools = Some(tools.control());
-            let factory = ResponsesAttemptFactory::new(
-                request_profile(
-                    self.events.request_id(),
-                    &self.lineage_id,
-                    tools.model_specs(),
-                    self.config.system_prompt(),
-                ),
-                self.events.clone(),
-                Arc::clone(&self.transport_stats),
-            );
+            let factory = self.attempt_factory(&tools);
             let user_content = prepare_user_input(&task.instruction).await;
             let history = task_input(
                 user_content,
@@ -538,7 +559,13 @@ where
                 return Ok(ModelTaskOutcome::Cancelled);
             };
             match warmup {
-                Ok(response_id) => session.conversation.previous_response_id = Some(response_id),
+                Ok(Some(response_id)) => {
+                    session.conversation.previous_response_id = Some(response_id);
+                }
+                Ok(None) => {
+                    session.conversation.reset_for_full_request();
+                    self.stats.last_response_id = None;
+                }
                 Err(error) if error.responses_error().is_some() => {
                     session.conversation.reset_for_full_request();
                     self.stats.last_response_id = None;
@@ -1111,7 +1138,10 @@ where
         Ok(())
     }
 
-    async fn perform_warmup(&mut self, factory: &ResponsesAttemptFactory) -> Result<String> {
+    async fn perform_warmup(
+        &mut self,
+        factory: &ResponsesAttemptFactory,
+    ) -> Result<Option<String>> {
         let started_at = Instant::now();
         self.events.emit(
             AgentEventKind::ModelWarmupStarted,
@@ -1127,29 +1157,92 @@ where
             otel.status_code = tracing::field::Empty,
             model = MODEL,
             system_prompt.bytes = self.config.system_prompt().len(),
+            warmup.source = tracing::field::Empty,
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
         if let Ok(content) = serde_json::to_string(factory.profile().prefix()) {
             record_span_content(&span, "model.input", &content);
         }
-        let success = match self
-            .client
-            .execute(factory.warmup())
-            .instrument(span.clone())
-            .await
-        {
-            Ok(success) => success,
+        let shared_prompt_cache = self.prompt_cache.shared().cloned();
+        let outcome = if let Some(cache) = shared_prompt_cache {
+            match cache.entry(factory.profile()).await {
+                Ok(entry) => {
+                    let mut execution = None;
+                    let initialized = entry
+                        .get_or_try_init(|| async {
+                            let completed = self.execute_warmup(factory, &span).await?;
+                            execution = Some(completed);
+                            Ok(())
+                        })
+                        .await;
+                    initialized.map(|()| execution)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            self.execute_warmup(factory, &span).await.map(Some)
+        };
+        let execution = match outcome {
+            Ok(outcome) => outcome,
             Err(error) => {
                 span.record("status", "failed");
                 span.record("otel.status_code", "ERROR");
                 span.record("duration_ns", elapsed_ns(started_at));
-                return self.warmup_failed(started_at, error.into());
+                return self.warmup_failed(started_at, error);
             }
         };
+        let duration_ns = elapsed_ns(started_at);
+        let (response_id, source, attempt, connection_generation, usage) =
+            if let Some(execution) = execution {
+                self.server_reasoning_included |= execution.server_reasoning_included;
+                if let Some(usage) = &execution.usage {
+                    self.stats.warmup_usage.add(usage);
+                }
+                (
+                    Some(execution.response_id),
+                    "response",
+                    Some(execution.attempt),
+                    Some(execution.connection_generation),
+                    execution.usage,
+                )
+            } else {
+                (None, "shared_prefix", None, None, None)
+            };
+        span.record("warmup.source", source);
+        span.record("status", "completed");
+        span.record("otel.status_code", "OK");
+        span.record("duration_ns", duration_ns);
+        self.stats.warmup_duration_ns += duration_ns;
+        self.stats.last_response_id.clone_from(&response_id);
+        self.events.emit(
+            AgentEventKind::ModelWarmupCompleted,
+            WarmupCompleted {
+                response_id: response_id.as_deref(),
+                source,
+                attempt,
+                connection_generation,
+                duration_ns,
+                usage: usage.as_ref(),
+            },
+        )?;
+        Ok(response_id)
+    }
+
+    async fn execute_warmup(
+        &mut self,
+        factory: &ResponsesAttemptFactory,
+        span: &tracing::Span,
+    ) -> Result<WarmupExecution> {
+        let success = self
+            .client
+            .execute(factory.warmup())
+            .instrument(span.clone())
+            .await
+            .map_err(Into::into)?;
         let attempt = success.attempt();
         let connection_generation = success.connection_generation();
-        self.server_reasoning_included |= success.server_reasoning_included();
+        let server_reasoning_included = success.server_reasoning_included();
         let ResponsesOutput::Warmup(response) = success.into_output() else {
             span.record("status", "failed");
             span.record("otel.status_code", "ERROR");
@@ -1157,26 +1250,13 @@ where
                 detail: "warmup returned a non-warmup response",
             });
         };
-        let duration_ns = elapsed_ns(started_at);
-        span.record("status", "completed");
-        span.record("otel.status_code", "OK");
-        span.record("duration_ns", duration_ns);
-        self.stats.warmup_duration_ns += duration_ns;
-        if let Some(usage) = &response.usage {
-            self.stats.warmup_usage.add(usage);
-        }
-        self.stats.last_response_id = Some(response.id.clone());
-        self.events.emit(
-            AgentEventKind::ModelWarmupCompleted,
-            WarmupCompleted {
-                response_id: &response.id,
-                attempt,
-                connection_generation,
-                duration_ns,
-                usage: response.usage.as_ref(),
-            },
-        )?;
-        Ok(response.id)
+        Ok(WarmupExecution {
+            response_id: response.id,
+            attempt,
+            connection_generation,
+            usage: response.usage,
+            server_reasoning_included,
+        })
     }
 
     fn warmup_failed<T>(&mut self, started_at: Instant, error: NanocodexError) -> Result<T> {
@@ -1207,6 +1287,7 @@ where
             ModelCallStarted {
                 call_index,
                 model: MODEL,
+                reasoning_mode: self.config.reasoning_mode.as_str(),
                 effort: self.config.thinking.as_str(),
                 previous_response_id,
             },
@@ -1221,6 +1302,8 @@ where
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = model_call_span(
             call_index,
+            self.config.reasoning_mode.as_str(),
+            self.config.thinking.as_str(),
             previous_response_id.is_some(),
             input_item_count,
             input_bytes,
@@ -1512,6 +1595,8 @@ fn record_indexed_span_content(
 
 fn model_call_span(
     call_index: u32,
+    reasoning_mode: &str,
+    reasoning_effort: &str,
     previous_response: bool,
     input_item_count: usize,
     input_bytes: usize,
@@ -1522,6 +1607,8 @@ fn model_call_span(
         otel.kind = "internal",
         otel.status_code = tracing::field::Empty,
         model = MODEL,
+        reasoning.mode = reasoning_mode,
+        reasoning.effort = reasoning_effort,
         model.call_index = call_index,
         previous_response,
         model.input.item_count = input_item_count,
@@ -1612,13 +1699,13 @@ fn response_item_call_id(item: &ResponseItem) -> Option<&str> {
 
 fn request_profile(
     session_id: &str,
-    lineage_id: &str,
+    prompt_cache_key: &str,
     tool_specs: Vec<ToolDefinition>,
     system_prompt: &str,
 ) -> RequestProfile {
     RequestProfile::new(
         session_id,
-        lineage_id,
+        prompt_cache_key,
         Arc::from([
             ResponseItem::additional_tools(tool_specs),
             ResponseItem::message(
@@ -1628,6 +1715,25 @@ fn request_profile(
                 }],
             ),
         ]),
+    )
+}
+
+fn attempt_factory(
+    events: &EventSink,
+    transport_stats: &Arc<TransportStats>,
+    prompt_cache_key: &str,
+    tools: &ToolRuntime,
+    system_prompt: &str,
+) -> ResponsesAttemptFactory {
+    ResponsesAttemptFactory::new(
+        request_profile(
+            events.request_id(),
+            prompt_cache_key,
+            tools.model_specs(),
+            system_prompt,
+        ),
+        events.clone(),
+        Arc::clone(transport_stats),
     )
 }
 

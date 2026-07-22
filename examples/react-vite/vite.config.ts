@@ -11,7 +11,7 @@ export default defineConfig({
   server: {
     fs: {
       // The example consumes the generated WASM package and browser host from
-      // bindings/wasm without copying either artifact into the application.
+      // js/bindings without copying either artifact into the application.
       allow: [repositoryRoot],
     },
   },

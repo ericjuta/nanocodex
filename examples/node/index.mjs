@@ -1,15 +1,13 @@
-import { createRequire } from "node:module";
+import { Agent } from "nanocodex/node";
 
-import { createNodeHost } from "../../bindings/wasm/node/host.mjs";
+const apiKey = process.env.OPENAI_API_KEY?.trim();
+if (!apiKey) {
+  throw new Error("Set OPENAI_API_KEY or put it in the repository's ignored .env file.");
+}
 
-const require = createRequire(import.meta.url);
-const { Nanocodex } = require("../../bindings/wasm/pkg-node/nanocodex.js");
-
-globalThis.nanocodexHost = createNodeHost({
-  onEvent: (eventJson) => {
-    const event = JSON.parse(eventJson);
-    if (event.type === "tool_call") console.error(`tool: ${event.payload.tool}`);
-  },
+const agent = await Agent.create({
+  apiKey,
+  thinking: "low",
   tools: {
     multiply: {
       description: "Multiply two numbers.",
@@ -23,19 +21,24 @@ globalThis.nanocodexHost = createNodeHost({
     },
   },
 });
+const unwatch = agent.events.watch((event) => {
+  if (event.type === "tool.call") console.error(`tool: ${event.payload.tool}`);
+});
+const turns = [];
 
-const agent = new Nanocodex(JSON.stringify({
-  api_key: process.env.OPENAI_API_KEY,
-  thinking: "low",
-}));
+try {
+  const first = agent.turn.prompt("Use multiply to calculate 6 × 7. Return only the number.");
+  turns.push(first);
+  console.log("first:", await first.result());
 
-const first = agent.prompt("Use multiply to calculate 6 × 7. Return only the number.");
-console.log("first:", await first.result());
-
-// Follow-on state, response IDs, and prompt-cache identity stay in the Rust agent.
-const second = agent.prompt("Add one to that result. Return only the number.");
-console.log("second:", await second.result());
-
-// Release the owned Rust session so its WebSocket and background driver close
-// before this short-lived example exits. Long-lived applications keep it.
-agent.free();
+  // Follow-on state, response IDs, and prompt-cache identity stay in the Rust agent.
+  const second = agent.turn.prompt("Add one to that result. Return only the number.");
+  turns.push(second);
+  console.log("second:", await second.result());
+} finally {
+  // Long-lived applications retain the agent; short-lived scripts close the
+  // Rust-owned WebSocket and driver explicitly.
+  for (const turn of turns) turn.dispose();
+  unwatch();
+  agent.dispose();
+}

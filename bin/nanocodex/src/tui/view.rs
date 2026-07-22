@@ -398,15 +398,20 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             (steers, queued) => format!(" · {steers} steers · {queued} queued"),
         }
     };
+    let escape_help = if steers == 0 {
+        "Esc Esc stop"
+    } else {
+        "Esc interrupt/send"
+    };
     let help = if app.btw.is_some() {
         format!(
-            "  Thinking: {} · BackTab switch · Ctrl+V image · /trace inspect · /close dismiss · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit",
-            app.thinking
+            "  Thinking: {} · BackTab switch · Ctrl+V image · /trace inspect · /close dismiss · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
+            app.thinking,
         )
     } else {
         format!(
-            "  Thinking: {} · /btw <question> side fork · Ctrl+V image · /trace inspect · Enter send/steer · Tab queue · Esc Esc stop · Ctrl+C quit",
-            app.thinking
+            "  Thinking: {} · /btw <question> side fork · Ctrl+V image · /trace inspect · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
+            app.thinking,
         )
     };
     frame.render_widget(

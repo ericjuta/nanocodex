@@ -35,7 +35,7 @@ use tokio::{
 use tracing::{Instrument, info_span};
 
 use self::{
-    app::{App, PaneId, SubmittedPrompt},
+    app::{App, EscapeAction, PaneId, SubmittedPrompt},
     notification::Notifier,
     scheduler::{RenderScheduler, STREAM_FRAME_INTERVAL},
     telemetry::{StreamTelemetry, ViewTelemetry},
@@ -69,6 +69,12 @@ enum WorkerCommand {
     },
     Cancel {
         target: PaneId,
+    },
+    InterruptForSteers {
+        target: PaneId,
+        prompt_id: u64,
+        steer_ids: Vec<u64>,
+        prompt: SubmittedPrompt,
     },
     OpenBtw {
         id: u64,
@@ -123,6 +129,15 @@ enum WorkerEvent {
     CancelFailed {
         target: PaneId,
         error: String,
+    },
+    InterruptedSteersResubmitted {
+        target: PaneId,
+        prompt_id: u64,
+        steer_ids: Vec<u64>,
+    },
+    InterruptedSteersKept {
+        target: PaneId,
+        prompt_id: u64,
     },
     BtwOpened {
         id: u64,
@@ -730,6 +745,14 @@ fn handle_worker_update(
         WorkerEvent::SteerFailed { target, id, error } => app.steer_failed(target, id, error),
         WorkerEvent::CancelAccepted { target } => app.cancel_accepted(target),
         WorkerEvent::CancelFailed { target, error } => app.cancel_failed(target, error),
+        WorkerEvent::InterruptedSteersResubmitted {
+            target,
+            prompt_id,
+            steer_ids,
+        } => app.interrupted_steers_resubmitted(target, prompt_id, &steer_ids),
+        WorkerEvent::InterruptedSteersKept { target, prompt_id } => {
+            app.interrupted_steers_kept(target, prompt_id);
+        }
         WorkerEvent::BtwOpened { id, request_id } => app.btw_opened(id, request_id),
         WorkerEvent::BtwOpenFailed { id, error } => app.btw_failed(id, error),
         WorkerEvent::BtwAgentEvent { id, event } => {
@@ -842,6 +865,15 @@ impl AgentWorker {
             } => self.prompt(target, prompt_id, prompt).await,
             WorkerCommand::Steer { target, id, prompt } => self.steer(target, id, prompt).await,
             WorkerCommand::Cancel { target } => self.cancel(target).await,
+            WorkerCommand::InterruptForSteers {
+                target,
+                prompt_id,
+                steer_ids,
+                prompt,
+            } => {
+                self.interrupt_for_steers(target, prompt_id, steer_ids, prompt)
+                    .await;
+            }
             WorkerCommand::OpenBtw {
                 id,
                 prompt_id,
@@ -993,7 +1025,68 @@ impl AgentWorker {
                     (Some(&branch.turns), branch.request_id.as_ref())
                 }),
         };
-        cancel_turn(turns, session_id, target, &self.updates).await;
+        let _ = cancel_turn(turns, session_id, target, &self.updates).await;
+    }
+
+    async fn interrupt_for_steers(
+        &mut self,
+        target: PaneId,
+        prompt_id: u64,
+        steer_ids: Vec<u64>,
+        prompt: SubmittedPrompt,
+    ) {
+        let already_running = match target {
+            PaneId::Main => self
+                .main
+                .turns
+                .iter()
+                .any(|turn| steer_ids.contains(&turn.prompt_id)),
+            PaneId::Btw(id) => self
+                .btw
+                .as_ref()
+                .filter(|branch| branch.id == id)
+                .is_some_and(|branch| {
+                    branch
+                        .turns
+                        .iter()
+                        .any(|turn| steer_ids.contains(&turn.prompt_id))
+                }),
+        };
+        if already_running {
+            drop(
+                self.updates
+                    .send(WorkerEvent::InterruptedSteersKept { target, prompt_id }),
+            );
+            return;
+        }
+
+        let (turns, session_id) = match target {
+            PaneId::Main => (Some(&self.main.turns), self.main.request_id.as_ref()),
+            PaneId::Btw(id) => self
+                .btw
+                .as_ref()
+                .filter(|branch| branch.id == id)
+                .map_or((None, ""), |branch| {
+                    (Some(&branch.turns), branch.request_id.as_ref())
+                }),
+        };
+        if !cancel_turn(turns, session_id, target, &self.updates).await {
+            drop(
+                self.updates
+                    .send(WorkerEvent::InterruptedSteersKept { target, prompt_id }),
+            );
+            return;
+        }
+
+        drop(
+            self.updates
+                .send(WorkerEvent::InterruptedSteersResubmitted {
+                    target,
+                    prompt_id,
+                    steer_ids,
+                }),
+        );
+        self.prompt(target, prompt_id, prompt).await;
     }
 
     async fn open_btw(&mut self, id: u64, prompt_id: Option<u64>, prompt: Option<SubmittedPrompt>) {
@@ -1208,7 +1301,7 @@ impl AgentWorker {
         drop(self.updates.send(WorkerEvent::TurnFinished {
             target: finished.target,
             main_branch_id,
-            error: None,
+            error: finished.error,
         }));
     }
 }
@@ -1251,13 +1344,22 @@ async fn start_turn(
             *next_turn_id = next_turn_id.saturating_add(1);
             let control = turn.control();
             let finished = finished.clone();
+            let agent = agent.clone();
             let task_span = span.clone();
             tokio::spawn(
                 async move {
-                    let (result, status, otel_status) = match turn.result().await {
-                        Ok(result) => (Some(result), "completed", "OK"),
-                        Err(NanocodexError::TurnCancelled) => (None, "cancelled", "ERROR"),
-                        Err(_) => (None, "failed", "ERROR"),
+                    let turn_result = turn.result().await;
+                    let rollout_result = agent.flush_rollout().await;
+                    let (result, error, status, otel_status) = match (turn_result, rollout_result) {
+                        (Ok(result), Ok(())) => (Some(result), None, "completed", "OK"),
+                        (Err(NanocodexError::TurnCancelled), Ok(())) => {
+                            (None, None, "cancelled", "ERROR")
+                        }
+                        (Ok(result), Err(error)) => {
+                            (Some(result), Some(error.to_string()), "failed", "ERROR")
+                        }
+                        (Err(_), Ok(())) => (None, None, "failed", "ERROR"),
+                        (Err(_), Err(error)) => (None, Some(error.to_string()), "failed", "ERROR"),
                     };
                     task_span.record("status", status);
                     task_span.record("otel.status_code", otel_status);
@@ -1271,6 +1373,7 @@ async fn start_turn(
                         main_branch_id: target.main_branch_id,
                         prompt_id,
                         result,
+                        error,
                     }));
                 }
                 .instrument(span.clone()),
@@ -1386,7 +1489,7 @@ async fn cancel_turn(
     session_id: &str,
     target: PaneId,
     updates: &mpsc::UnboundedSender<WorkerEvent>,
-) {
+) -> bool {
     let mut outcome = Err(NanocodexError::TurnNotCancellable);
     for turn in turns.into_iter().flatten() {
         let started_at = Instant::now();
@@ -1423,6 +1526,7 @@ async fn cancel_turn(
             }
         }
     }
+    let accepted = outcome.is_ok();
     let event = match outcome {
         Ok(()) => WorkerEvent::CancelAccepted { target },
         Err(error) => WorkerEvent::CancelFailed {
@@ -1431,6 +1535,7 @@ async fn cancel_turn(
         },
     };
     drop(updates.send(event));
+    accepted
 }
 
 struct FinishedTurn {
@@ -1439,6 +1544,7 @@ struct FinishedTurn {
     main_branch_id: Option<u64>,
     prompt_id: u64,
     result: Option<TurnResult>,
+    error: Option<String>,
 }
 
 fn remove_finished(turns: &mut VecDeque<TrackedTurn>, id: u64) {
@@ -1646,12 +1752,7 @@ fn handle_key(
         KeyCode::PageUp => app.scroll_up(12),
         KeyCode::PageDown => app.scroll_down(12),
         KeyCode::Esc if key.kind == KeyEventKind::Repeat => {}
-        KeyCode::Esc => {
-            if let Some(target) = app.handle_escape(Instant::now()) {
-                app.cancel_pending(target);
-                send_command(commands, WorkerCommand::Cancel { target })?;
-            }
-        }
+        KeyCode::Esc => handle_escape_key(app, commands)?,
         KeyCode::Tab if app.has_input() => {
             return submit(app, root_session_id, commands, SubmitIntent::Queue);
         }
@@ -1670,6 +1771,33 @@ fn handle_key(
         | KeyCode::Modifier(_) => {}
     }
     Ok(TerminalAction::Redraw)
+}
+
+fn handle_escape_key(app: &mut App, commands: &mpsc::UnboundedSender<WorkerCommand>) -> Result<()> {
+    match app.handle_escape(Instant::now()) {
+        Some(EscapeAction::Cancel(target)) => {
+            app.cancel_pending(target);
+            send_command(commands, WorkerCommand::Cancel { target })?;
+        }
+        Some(EscapeAction::InterruptForSteers {
+            target,
+            prompt_id,
+            steer_ids,
+            prompt,
+        }) => {
+            send_command(
+                commands,
+                WorkerCommand::InterruptForSteers {
+                    target,
+                    prompt_id,
+                    steer_ids,
+                    prompt,
+                },
+            )?;
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 fn paste_clipboard_image(
@@ -1900,7 +2028,7 @@ fn submit(
         Submission::Prompt(prompt) => {
             let target = app.focus;
             if matches!(intent, SubmitIntent::Immediate) && app.is_running(target) {
-                if let Some(id) = app.queue_steer(target, prompt.display().to_owned()) {
+                if let Some(id) = app.queue_steer(target, prompt.clone()) {
                     send_command(commands, WorkerCommand::Steer { target, id, prompt })?;
                 }
             } else if let Some(prompt_id) = app.queue_prompt(target, prompt.display().to_owned()) {
@@ -2713,6 +2841,45 @@ mod tests {
             })
         ));
         assert_eq!(app.input, "preserved draft");
+    }
+
+    #[test]
+    fn first_escape_interrupts_and_resubmits_pending_steers() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into(), nanocodex::Thinking::Medium);
+        app.main.running = true;
+        app.input = "preserved draft".to_owned();
+        app.cursor = app.input.len();
+        let first = app
+            .queue_steer(PaneId::Main, "first correction".to_owned())
+            .unwrap();
+        let second = app
+            .queue_steer(PaneId::Main, "second correction".to_owned())
+            .unwrap();
+
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::InterruptForSteers {
+                target: PaneId::Main,
+                steer_ids,
+                prompt,
+                ..
+            }) if steer_ids == vec![first, second]
+                && prompt.display() == "first correction\nsecond correction"
+        ));
+        assert_eq!(app.input, "preserved draft");
+        assert!(worker.try_recv().is_err());
     }
 
     #[test]

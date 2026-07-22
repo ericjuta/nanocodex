@@ -2650,14 +2650,14 @@ async fn per_agent_tool_factory_binds_recursive_forks_to_the_invoking_driver() -
 }
 
 #[tokio::test]
-async fn clean_spawn_reuses_private_configuration_without_history_or_lineage() -> Result<()> {
+async fn clean_spawn_reuses_an_explicit_cache_key_without_history_or_lineage() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut root = accept_async(stream).await?;
         let root_warmup = next_json(&mut root).await?;
-        assert_eq!(root_warmup["prompt_cache_key"], "root-lineage");
+        assert_eq!(root_warmup["prompt_cache_key"], "shared-private-prefix");
         assert!(
             root_warmup
                 .to_string()
@@ -2676,7 +2676,7 @@ async fn clean_spawn_reuses_private_configuration_without_history_or_lineage() -
             .as_str()
             .ok_or_else(|| eyre!("clean child warmup omitted its session id"))?;
         assert_ne!(child_session, "root-lineage");
-        assert_eq!(child_warmup["prompt_cache_key"], child_session);
+        assert_eq!(child_warmup["prompt_cache_key"], "shared-private-prefix");
         assert!(child_warmup.get("previous_response_id").is_none());
         assert!(
             child_warmup
@@ -2699,6 +2699,7 @@ async fn clean_spawn_reuses_private_configuration_without_history_or_lineage() -
         .thinking(Thinking::Low)
         .responses(responses)
         .session_id("root-lineage")
+        .prompt_cache_key("shared-private-prefix")
         .workspace(&workspace)
         .tools_factory(move |handle| {
             drop(handles.send(handle));
@@ -2719,6 +2720,77 @@ async fn clean_spawn_reuses_private_configuration_without_history_or_lineage() -
     child.prompt("clean child turn").await?.result().await?;
 
     drop((root, child, root_events, child_events));
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cloned_builders_singleflight_one_shared_prefix_warmup() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first = accept_async(stream).await?;
+        let warmup = next_json(&mut first).await?;
+        assert_eq!(warmup["prompt_cache_key"], "shared-prefix");
+        let first_session = warmup["client_metadata"]["session_id"]
+            .as_str()
+            .ok_or_else(|| eyre!("first warmup omitted its session id"))?
+            .to_owned();
+        send_warmup(&mut first, "resp-shared-warmup").await?;
+        let first_turn = next_json(&mut first).await?;
+        assert_eq!(first_turn["previous_response_id"], "resp-shared-warmup");
+        send_final(&mut first, "resp-first").await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut second = accept_async(stream).await?;
+        let second_turn = next_json(&mut second).await?;
+        assert_eq!(second_turn["prompt_cache_key"], "shared-prefix");
+        assert!(second_turn.get("previous_response_id").is_none());
+        assert_ne!(second_turn["client_metadata"]["session_id"], first_session);
+        assert_eq!(second_turn["input"].as_array().map(Vec::len), Some(4));
+        assert!(second_turn.get("generate").is_none());
+        send_final(&mut second, "resp-second").await
+    });
+
+    let workspace = temporary_workspace("shared-warmup")?;
+    let responses = Responses::builder().websocket_url(endpoint).build();
+    let builder = Nanocodex::builder("test-key")
+        .thinking(Thinking::Low)
+        .workspace(&workspace)
+        .responses(responses)
+        .prompt_cache_key("shared-prefix")
+        .shared_prompt_cache();
+
+    let (first, mut first_events) = builder.clone().build()?;
+    let first_session = first.session_id().to_owned();
+    first.prompt("first turn").await?.result().await?;
+    drop(first);
+    let mut first_warmup_source = None;
+    while let Some(event) = first_events.recv().await {
+        if event.kind == nanocodex_core::AgentEventKind::ModelWarmupCompleted {
+            first_warmup_source = Some(event.decode_payload::<Value>()?["source"].clone());
+        }
+    }
+
+    let (second, mut second_events) = builder.build()?;
+    assert_ne!(second.session_id(), first_session);
+    second.prompt("second turn").await?.result().await?;
+    drop(second);
+    let mut second_warmup_source = None;
+    while let Some(event) = second_events.recv().await {
+        if event.kind == nanocodex_core::AgentEventKind::ModelWarmupCompleted {
+            let payload = event.decode_payload::<Value>()?;
+            assert!(payload.get("response_id").is_none());
+            second_warmup_source = Some(payload["source"].clone());
+        }
+    }
+
+    assert_eq!(first_warmup_source, Some(json!("response")));
+    assert_eq!(second_warmup_source, Some(json!("shared_prefix")));
     timeout(std::time::Duration::from_secs(5), server)
         .await
         .map_err(|_| eyre!("mock Responses server did not finish"))???;

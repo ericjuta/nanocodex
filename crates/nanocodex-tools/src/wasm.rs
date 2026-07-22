@@ -16,6 +16,7 @@ const EXEC_GRAMMAR: &str = r"start: /[\s\S]+/";
 const EXEC_DESCRIPTION: &str = r"Run JavaScript in the embedded host.
 - `tools` contains the application-defined async tools listed below.
 - `text(value)` and `image(value)` append output for the model.
+- `generatedImage(result)` appends an image-generation result for the model.
 - `store(key, value)` and `load(key)` retain serializable values across calls.
 - JavaScript runs inside the Node or browser host supplied by the embedding application.";
 
@@ -163,7 +164,9 @@ impl Tools {
     }
 }
 
-pub struct ToolRuntime;
+pub struct ToolRuntime {
+    working_directory: Arc<str>,
+}
 
 #[doc(hidden)]
 #[derive(Clone, Copy)]
@@ -171,11 +174,25 @@ pub struct ToolRuntimeControl;
 
 impl ToolRuntime {
     pub fn new(
-        _workspace: impl Into<PathBuf>,
+        workspace: impl Into<PathBuf>,
         _web_search: Option<WebSearchConfig>,
         _image_generation: Option<ImageGenerationConfig>,
     ) -> Self {
-        Self
+        let workspace = workspace.into();
+        Self {
+            working_directory: Arc::from(workspace.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// Builds the browser runtime from the complete declarative tool selection.
+    #[must_use]
+    pub fn new_with_tools(
+        workspace: impl Into<PathBuf>,
+        web_search: Option<WebSearchConfig>,
+        image_generation: Option<ImageGenerationConfig>,
+        tools: &Tools,
+    ) -> Self {
+        Self::new(workspace, web_search, image_generation).with_tools(tools)
     }
 
     #[must_use]
@@ -186,6 +203,11 @@ impl ToolRuntime {
     #[must_use]
     pub const fn default_shell_name(&self) -> &'static str {
         "javascript"
+    }
+
+    #[must_use]
+    pub fn working_directory(&self) -> &str {
+        &self.working_directory
     }
 
     #[doc(hidden)]
@@ -268,6 +290,10 @@ impl ToolRuntime {
 
 impl ToolRuntimeControl {
     #[doc(hidden)]
+    #[expect(
+        clippy::unused_async,
+        reason = "matches the native tool-runtime control contract"
+    )]
     pub async fn cancel(&self) {}
 }
 

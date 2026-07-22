@@ -5,7 +5,9 @@ use std::{
 
 use clap::{ArgAction, Args, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
-use nanocodex::{AgentEvents, Nanocodex, OpenAiAuth, Responses, Thinking, Tools};
+use nanocodex::{
+    AgentEvents, Nanocodex, OpenAiAuth, ReasoningMode, Responses, RolloutConfig, Thinking, Tools,
+};
 
 use crate::mcp::McpArgs;
 use crate::subagents::{self, ChildAgents};
@@ -35,7 +37,7 @@ pub(crate) struct AgentArgs {
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
 
-    /// Reasoning effort used by the model.
+    /// Reasoning effort: none, low, medium, high, xhigh, or max.
     #[arg(long, env = "OPENAI_REASONING_EFFORT", default_value_t)]
     thinking: Thinking,
 
@@ -46,6 +48,10 @@ pub(crate) struct AgentArgs {
         value_parser = NonEmptyStringValueParser::new()
     )]
     service_tier: Option<String>,
+
+    /// Reasoning execution mode: standard or pro.
+    #[arg(long, env = "OPENAI_REASONING_MODE", default_value_t)]
+    reasoning_mode: ReasoningMode,
 
     /// Replace the standard system/developer instructions.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
@@ -78,6 +84,15 @@ pub(crate) struct AgentArgs {
     )]
     subagents: bool,
 
+    /// Write Codex-compatible resumable threads beneath `CODEX_HOME`.
+    #[arg(
+        long,
+        env = "NANOCODEX_ROLLOUTS",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    rollouts: bool,
+
     /// Responses API WebSocket endpoint.
     #[arg(long, env = "OPENAI_RESPONSES_WEBSOCKET_URL")]
     websocket_url: Option<String>,
@@ -97,6 +112,7 @@ impl AgentArgs {
 
     pub(crate) fn build(self) -> Result<ConfiguredAgent> {
         let thinking = self.thinking;
+        let rollout = self.rollouts.then(default_codex_home).transpose()?;
         let auth = select_auth(self.api_key, self.auth_file, environment_api_key()?)?;
         let mut responses = Responses::builder();
         if let Some(websocket_url) = self.websocket_url {
@@ -115,11 +131,17 @@ impl AgentArgs {
         let tools = tools.build()?;
         let child_agents = self.subagents.then(|| Arc::new(ChildAgents::default()));
         let builder = Nanocodex::builder(auth)
+            .reasoning_mode(self.reasoning_mode)
             .thinking(thinking)
             .workspace(self.cwd)
             .responses(responses);
         let builder = if let Some(service_tier) = self.service_tier {
             builder.service_tier(service_tier)
+        } else {
+            builder
+        };
+        let builder = if let Some(codex_home) = rollout {
+            builder.rollout(RolloutConfig::new(codex_home))
         } else {
             builder
         };
@@ -199,6 +221,18 @@ pub(crate) fn default_auth_file() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".codex/auth.json"))
 }
 
+pub(crate) fn default_codex_home() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            eyre!("home directory is unavailable; set CODEX_HOME or pass --rollouts false")
+        })?;
+    Ok(PathBuf::from(home).join(".codex"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -233,6 +267,17 @@ mod tests {
             .expect("the CLI should expose the subagents argument");
 
         assert_eq!(subagents.get_default_values(), ["false"]);
+    }
+
+    #[test]
+    fn rollouts_are_enabled_by_default() {
+        let command = crate::Cli::command();
+        let rollouts = command
+            .get_arguments()
+            .find(|argument| argument.get_id() == "rollouts")
+            .expect("the CLI should expose the rollouts argument");
+
+        assert_eq!(rollouts.get_default_values(), ["true"]);
     }
 
     #[test]

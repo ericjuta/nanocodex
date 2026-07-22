@@ -6,8 +6,11 @@ mod agent;
 mod auth;
 mod error;
 mod model;
+mod prompt_cache;
 #[cfg(not(target_family = "wasm"))]
 mod responses;
+#[cfg(not(target_family = "wasm"))]
+mod rollout;
 #[cfg(target_family = "wasm")]
 mod wasm;
 
@@ -28,7 +31,7 @@ pub use nanocodex_core::{
     InternalMessageMetadata, ItemStatus, JsonSchema, JsonValue, LocalShellAction,
     LocalShellExecAction, LocalShellStatus, MODEL, MessagePhase, MessageRole, OpenAiAuth,
     OpenAiAuthError, OpenAiAuthMode, OutputTextAnnotation, OutputTextLogprob, OutputTextTopLogprob,
-    Prompt, PromptInput, ReasoningContent, ReasoningSummary, ResponseItem, Thinking,
+    Prompt, PromptInput, ReasoningContent, ReasoningMode, ReasoningSummary, ResponseItem, Thinking,
     TimedAgentEvent, ToolCaller, ToolDefinition, Usage, UserInput, WebSearchAction,
     monotonic_now_ns,
 };
@@ -51,6 +54,8 @@ pub use nanocodex_tools::{
 pub use responses::{FactoryResponses, LayeredResponses, StandardResponses};
 #[cfg(not(target_family = "wasm"))]
 pub use responses::{Responses, ResponsesBuilder};
+#[cfg(not(target_family = "wasm"))]
+pub use rollout::{RolloutConfig, RolloutInfo};
 #[cfg(not(target_family = "wasm"))]
 pub use schemars::JsonSchema as ToolSchema;
 #[cfg(target_family = "wasm")]
