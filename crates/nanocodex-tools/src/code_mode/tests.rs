@@ -716,6 +716,57 @@ text("done");
 }
 
 #[tokio::test]
+async fn hashline_workspace_tools_are_callable_from_code_mode() -> Result<()> {
+    let workspace = temporary_workspace("hashline-workspace-tools")?;
+    std::fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"
+const read = await tools.hashline__read({ path: "notes.txt" });
+await tools.hashline__find_block({ path: "notes.txt", anchor: "1:93c8" });
+await tools.hashline__patch({
+  header: read.patchHeader,
+  operations: "SWAP 2:f589:\n+bravo",
+  dry_run: true,
+});
+await tools.hashline__transaction({
+  action: { type: "preview" },
+  mutations: [{ type: "create", path: "new.txt", contents: "new\n" }],
+});
+text("done");
+"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(emitted_text(&execution)?, "done");
+    assert_eq!(
+        execution
+            .nested_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "hashline__read",
+            "hashline__find_block",
+            "hashline__patch",
+            "hashline__transaction",
+        ]
+    );
+    assert!(execution.nested_calls.iter().all(|call| call.success));
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("notes.txt"))?,
+        "alpha\nbeta\n"
+    );
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
     let workspace = temporary_workspace("code-output-limits")?;
     let tools = test_tools(&workspace);
