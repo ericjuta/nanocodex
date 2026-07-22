@@ -11,6 +11,7 @@ mod view;
 
 use std::{
     collections::VecDeque,
+    future::Future,
     process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
@@ -331,103 +332,175 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     let configured = config.build()?;
     let thinking = configured.thinking;
     let agent = configured.handle;
-    let mut agent_events = configured.events;
+    let agent_events = configured.events;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
     let child_agents = configured.child_agents;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
-    let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+    let (update_tx, update_rx) = mpsc::unbounded_channel();
     spawn_agent_worker(agent, Arc::clone(&root_session_id), worker_rx, update_tx);
 
-    let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
-    let mut input_events = EventStream::new();
-    let mut ticker = ui_ticker();
-    let mut ui = UiModel::new(App::new(cwd, thinking), Arc::clone(&root_session_id));
-    let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
-    let mut stream_telemetry = StreamTelemetry::default();
-    let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
+    let mut ui_loop = UiLoop::new(
+        cwd,
+        thinking,
+        root_session_id,
+        worker_tx,
+        update_rx,
+        agent_events,
+    )?;
+    let result = ui_loop.run(initial_prompt).await;
+    restore_before_shutdown(
+        result,
+        || drop(ui_loop),
+        || async {
+            if let Some(child_agents) = child_agents {
+                child_agents.shutdown().await;
+            }
+        },
+    )
+    .await
+}
 
-    let result = async {
-        submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
-        loop {
-        view_telemetry.observe(&ui.app);
-        render_due_frame(
-            &mut ui,
-            &mut terminal,
-            &mut scheduler,
-            &mut stream_telemetry,
+struct UiLoop {
+    terminal: TerminalSession,
+    input_events: EventStream,
+    ticker: tokio::time::Interval,
+    ui: UiModel,
+    scheduler: RenderScheduler,
+    stream_telemetry: StreamTelemetry,
+    view_telemetry: ViewTelemetry,
+    root_session_id: Arc<str>,
+    worker_tx: mpsc::UnboundedSender<WorkerCommand>,
+    update_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+    agent_events: AgentEvents,
+}
+
+impl UiLoop {
+    fn new(
+        cwd: std::path::PathBuf,
+        thinking: nanocodex::Thinking,
+        root_session_id: Arc<str>,
+        worker_tx: mpsc::UnboundedSender<WorkerCommand>,
+        update_rx: mpsc::UnboundedReceiver<WorkerEvent>,
+        agent_events: AgentEvents,
+    ) -> Result<Self> {
+        Ok(Self {
+            terminal: TerminalSession::enter().wrap_err("failed to initialize the terminal")?,
+            input_events: EventStream::new(),
+            ticker: ui_ticker(),
+            ui: UiModel::new(App::new(cwd, thinking), Arc::clone(&root_session_id)),
+            scheduler: RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now()),
+            stream_telemetry: StreamTelemetry::default(),
+            view_telemetry: ViewTelemetry::new(Arc::clone(&root_session_id)),
+            root_session_id,
+            worker_tx,
+            update_rx,
+            agent_events,
+        })
+    }
+
+    async fn run(&mut self, initial_prompt: Option<String>) -> Result<()> {
+        submit_initial_prompt(
+            &mut self.ui.app,
+            &self.root_session_id,
+            &self.worker_tx,
+            initial_prompt,
         )?;
+        loop {
+            self.view_telemetry.observe(&self.ui.app);
+            render_due_frame(
+                &mut self.ui,
+                &mut self.terminal,
+                &mut self.scheduler,
+                &mut self.stream_telemetry,
+            )?;
 
-        let render_deadline = scheduler.deadline();
-        tokio::select! {
-            () = async {
-                if let Some(deadline) = render_deadline {
-                    sleep_until(deadline.into()).await;
+            let render_deadline = self.scheduler.deadline();
+            tokio::select! {
+                () = async {
+                    if let Some(deadline) = render_deadline {
+                        sleep_until(deadline.into()).await;
+                    }
+                }, if render_deadline.is_some() => {}
+                event = self.input_events.next() => {
+                    let event = event.transpose()?.ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "terminal input closed")
+                    })?;
+                    let update = self.ui.update(UiAction::Terminal(event), &self.worker_tx)?;
+                    if update == UiUpdate::ExternalEditor {
+                        self.input_events = run_external_editor(
+                            std::mem::replace(&mut self.input_events, EventStream::new()),
+                            &mut self.terminal,
+                            &mut self.ui.app,
+                        ).await?;
+                        self.scheduler.request_immediate(Instant::now());
+                    } else if apply_update(update, &mut self.scheduler) {
+                        return Ok(());
+                    }
                 }
-            }, if render_deadline.is_some() => {}
-            event = input_events.next() => {
-                let event = event.transpose()?.ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "terminal input closed")
-                })?;
-                let update = ui.update(UiAction::Terminal(event), &worker_tx)?;
-                if update == UiUpdate::ExternalEditor {
-                    input_events = run_external_editor(input_events, &mut terminal, &mut ui.app).await?;
-                    scheduler.request_immediate(Instant::now());
-                } else if apply_update(update, &mut scheduler) {
-                    return Ok(());
+                event = self.agent_events.recv_timed(), if self.ui.agent_events_open => {
+                    let received = event
+                        .as_ref()
+                        .map(|event| self.stream_telemetry.event_received(PaneId::Main, event));
+                    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
+                        UiAction::Agent(event.event)
+                    });
+                    let update = self.ui.update(action, &self.worker_tx)?;
+                    if let Some(received) = received {
+                        self.stream_telemetry.event_applied(
+                            received,
+                            matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
+                        );
+                    }
+                    if apply_update(update, &mut self.scheduler) {
+                        return Ok(());
+                    }
                 }
-            }
-            event = agent_events.recv_timed(), if ui.agent_events_open => {
-                let received = event
-                    .as_ref()
-                    .map(|event| stream_telemetry.event_received(PaneId::Main, event));
-                let action = event.map_or(UiAction::AgentStreamClosed, |event| {
-                    UiAction::Agent(event.event)
-                });
-                let update = ui.update(action, &worker_tx)?;
-                if let Some(received) = received {
-                    stream_telemetry.event_applied(
-                        received,
-                        matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-                    );
+                update = self.update_rx.recv(), if self.ui.worker_updates_open => {
+                    if update.as_ref().is_some_and(|update| {
+                        handle_worker_telemetry(update, &mut self.stream_telemetry)
+                    }) {
+                        continue;
+                    }
+                    let received = update
+                        .as_ref()
+                        .and_then(|update| worker_event_received(update, &self.stream_telemetry));
+                    let action = update.map_or(UiAction::WorkerStopped, UiAction::Worker);
+                    let update = self.ui.update(action, &self.worker_tx)?;
+                    if let Some(received) = received {
+                        self.stream_telemetry.event_applied(
+                            received,
+                            matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
+                        );
+                    }
+                    if apply_update(update, &mut self.scheduler) {
+                        return Ok(());
+                    }
                 }
-                if apply_update(update, &mut scheduler) {
-                    return Ok(());
-                }
-            }
-            update = update_rx.recv(), if ui.worker_updates_open => {
-                if update.as_ref().is_some_and(|update| {
-                    handle_worker_telemetry(update, &mut stream_telemetry)
-                }) {
-                    continue;
-                }
-                let received = update
-                    .as_ref()
-                    .and_then(|update| worker_event_received(update, &stream_telemetry));
-                let action = update.map_or(UiAction::WorkerStopped, UiAction::Worker);
-                let update = ui.update(action, &worker_tx)?;
-                if let Some(received) = received {
-                    stream_telemetry.event_applied(
-                        received,
-                        matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-                    );
-                }
-                if apply_update(update, &mut scheduler) {
-                    return Ok(());
-                }
-            }
-            _ = ticker.tick(), if ui.app.main.running || ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running) => {
-                if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
-                    return Ok(());
+                _ = self.ticker.tick(), if self.ui.app.main.running || self.ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running) => {
+                    if apply_update(
+                        self.ui.update(UiAction::Tick, &self.worker_tx)?,
+                        &mut self.scheduler,
+                    ) {
+                        return Ok(());
+                    }
                 }
             }
         }
     }
-    }
-    .await;
-    drop(terminal);
-    if let Some(child_agents) = child_agents {
-        child_agents.shutdown().await;
-    }
+}
+
+async fn restore_before_shutdown<T, E, R, S, F>(
+    result: std::result::Result<T, E>,
+    restore: R,
+    shutdown: S,
+) -> std::result::Result<T, E>
+where
+    R: FnOnce(),
+    S: FnOnce() -> F,
+    F: Future<Output = ()>,
+{
+    restore();
+    shutdown().await;
     result
 }
 
@@ -1884,22 +1957,65 @@ fn browser_command(url: &str) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
 
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use futures_util::{SinkExt, StreamExt};
     use nanocodex::{Nanocodex, Responses, Thinking};
     use serde_json::{Value, json};
-    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, oneshot},
+        time::timeout,
+    };
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
 
     use super::{
         BTW_BOUNDARY, PaneId, RedrawPriority, Submission, TerminalAction, UiAction, UiModel,
         UiUpdate, WorkerCommand, WorkerEvent, active_session_id, classify_submission, handle_key,
-        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, session_trace_url,
-        spawn_agent_worker,
+        handle_worker_update, paste_clipboard_image, prepare_btw_prompt, restore_before_shutdown,
+        session_trace_url, spawn_agent_worker,
     };
     use crate::tui::app::App;
+
+    #[tokio::test]
+    async fn tui_restores_terminal_before_awaiting_child_shutdown() -> eyre::Result<()> {
+        for expected in [Ok("completed"), Err("failed")] {
+            let restored = Arc::new(AtomicBool::new(false));
+            let restore_flag = Arc::clone(&restored);
+            let shutdown_flag = Arc::clone(&restored);
+            let (polled, polled_rx) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let lifecycle = tokio::spawn(restore_before_shutdown(
+                expected,
+                move || restore_flag.store(true, Ordering::SeqCst),
+                move || async move {
+                    assert!(
+                        shutdown_flag.load(Ordering::SeqCst),
+                        "shutdown was polled before terminal restoration"
+                    );
+                    let _ = polled.send(());
+                    drop(release_rx.await);
+                },
+            ));
+
+            timeout(Duration::from_secs(1), polled_rx)
+                .await
+                .map_err(|_| eyre::eyre!("shutdown future was not polled"))??;
+            assert!(restored.load(Ordering::SeqCst));
+            assert!(!lifecycle.is_finished(), "shutdown future did not block");
+            let _ = release.send(());
+            assert_eq!(lifecycle.await?, expected);
+        }
+        Ok(())
+    }
 
     #[test]
     fn parses_tui_commands_without_capturing_similar_prompts() {
