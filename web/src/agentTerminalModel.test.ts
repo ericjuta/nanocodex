@@ -82,8 +82,8 @@ test("generated image content remains attached to its Code Mode row", () => {
 test("a final assistant message seals the streaming tail", () => {
   const state = applyAgentEvents(initialTerminalState(), [
     event(1, "run.started", {}),
-    event(2, "assistant.delta", { text: "hel" }),
-    event(3, "assistant.delta", { text: "lo" }),
+    event(2, "assistant.delta", { text: "he" }),
+    event(3, "assistant.delta", { text: "llo" }),
     event(4, "assistant.message", { text: "hello" }),
     event(5, "run.completed", {}),
   ]);
