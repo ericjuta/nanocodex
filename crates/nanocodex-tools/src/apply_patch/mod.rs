@@ -3,19 +3,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use nanocodex_core::{CustomToolFormat, ToolDefinition};
+use nanocodex_core::ToolDefinition;
 use serde_json::json;
 
-use super::{Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
+use super::{StandardTool, Tool, ToolContext, ToolExecution, ToolInput, ToolResult};
 
 mod parser;
 mod seek_sequence;
 mod streaming_parser;
 
 use parser::{Hunk, UpdateFileChunk, parse_patch};
-
-const GRAMMAR: &str = include_str!("apply_patch.lark");
-
 pub(super) struct ApplyPatchHandler {
     workspace: PathBuf,
 }
@@ -33,11 +30,7 @@ impl Tool for ApplyPatchHandler {
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::custom(
-            self.name(),
-            "Fallback patch editor. Prefer `hashline__read` plus `hashline__patch` for ordinary UTF-8 workspace edits; use this tool when Hashline does not fit or the caller supplied apply_patch syntax. This is a FREEFORM tool, so do not wrap the patch in JSON.",
-            CustomToolFormat::grammar("lark", GRAMMAR),
-        )
+        StandardTool::ApplyPatch.definition()
     }
 
     async fn execute(&self, input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
