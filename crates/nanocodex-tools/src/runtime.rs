@@ -11,6 +11,7 @@ use tracing::{Instrument, info, info_span};
 use crate::{
     apply_patch,
     code_mode::{self, CodeModeExecution},
+    hashline::{HashlineHandler, HashlineToolKind},
     image_generation, plan,
     shell::{self, ShellSessions},
     view_image, web_search,
@@ -454,7 +455,7 @@ impl ToolsBuilder {
         self
     }
 
-    /// Enables or disables the standard command, patch, plan, and file tools.
+    /// Enables or disables the standard command, patch, Hashline, plan, and file tools.
     #[must_use]
     pub fn workspace(mut self, enabled: bool) -> Self {
         self.tools.workspace = enabled;
@@ -525,7 +526,15 @@ fn built_in_name(tools: &Tools, name: &str) -> bool {
     (tools.workspace
         && matches!(
             name,
-            "exec_command" | "write_stdin" | "update_plan" | "apply_patch" | "view_image"
+            "exec_command"
+                | "write_stdin"
+                | "update_plan"
+                | "apply_patch"
+                | "hashline__read"
+                | "hashline__find_block"
+                | "hashline__patch"
+                | "hashline__transaction"
+                | "view_image"
         ))
         || (tools.web_search && name == "web__run")
         || (tools.image_generation && name == "image_gen__imagegen")
@@ -590,6 +599,22 @@ impl ToolRuntime {
                 )) as Arc<dyn Tool>,
                 Arc::new(shell::WriteStdinHandler::new(Arc::clone(&sessions))),
                 Arc::new(plan::PlanHandler::new()),
+                Arc::new(HashlineHandler::new(
+                    workspace.clone(),
+                    HashlineToolKind::Read,
+                )),
+                Arc::new(HashlineHandler::new(
+                    workspace.clone(),
+                    HashlineToolKind::FindBlock,
+                )),
+                Arc::new(HashlineHandler::new(
+                    workspace.clone(),
+                    HashlineToolKind::Patch,
+                )),
+                Arc::new(HashlineHandler::new(
+                    workspace.clone(),
+                    HashlineToolKind::Transaction,
+                )),
                 Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
                 Arc::new(view_image::ViewImageHandler::new(workspace.clone())),
             ]);
@@ -1149,6 +1174,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_selection_controls_hashline_tools() {
+        let defaults = Tools::builder().build().unwrap();
+        let enabled = ToolRuntime::new_with_tools(".", None, None, &defaults);
+        let enabled_names = enabled
+            .registry
+            .entries()
+            .map(|(handler, _)| handler.name())
+            .collect::<Vec<_>>();
+        assert!(enabled_names.contains(&"hashline__read"));
+        assert!(enabled_names.contains(&"hashline__find_block"));
+        assert!(enabled_names.contains(&"hashline__patch"));
+        assert!(enabled_names.contains(&"hashline__transaction"));
+
+        let without_defaults = Tools::builder().without_defaults().build().unwrap();
+        let disabled = ToolRuntime::new_with_tools(".", None, None, &without_defaults);
+        assert!(
+            disabled
+                .registry
+                .entries()
+                .all(|(handler, _)| !handler.name().starts_with("hashline__"))
+        );
+    }
     #[test]
     fn without_defaults_allows_replacing_a_standard_workspace_tool() {
         assert!(Tools::builder().tool(ReplacementExec).build().is_err());

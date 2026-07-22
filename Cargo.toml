@@ -55,6 +55,7 @@ reqwest = { version = "0.12.24", default-features = false, features = ["json", "
 rquickjs = "0.12.1"
 rmcp = { version = "1.8.0", default-features = false, features = ["client", "reqwest-tls-no-provider", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 schemars = "0.8.22"
 self-replace = "1.5.0"
 semver = "1.0.27"
@@ -69,6 +70,7 @@ sonic-rs = "0.5.8"
 syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
+xxhash-rust = { version = "0.8.15", features = ["xxh3", "xxh32"] }
 tokio = "1.48.0"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tower = { version = "0.5.2", features = ["limit", "load-shed", "retry", "timeout", "util"] }

@@ -439,6 +439,14 @@ schema. `Tools::builder()` accepts generated or manual `Tool` implementations;
 normally sees only Code Mode and its wait operation, then composes nested tools
 with generated JavaScript, including loops, conditionals, and `Promise.all`.
 
+Hashline is part of the standard workspace tool bundle, which is enabled by
+default. An explicit tool selection can enable it with
+`Tools::builder().workspace(true).build()?`; `without_defaults()` or
+`.workspace(false)` removes Hashline together with the other workspace tools.
+Hashline is exposed to the model through Code Mode as `tools.hashline__read`,
+`tools.hashline__find_block`, `tools.hashline__patch`, and
+`tools.hashline__transaction`.
+
 Code Mode prewarms one persistent Node host alongside the first model call and
 reuses it for the session. Cells receive one shared owned history snapshot;
 resumed waits do not copy history they cannot read. A nested shell request can
