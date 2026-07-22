@@ -1242,6 +1242,56 @@ async fn reconnect_drops_previous_response_id_and_replays_full_history() -> Resu
 }
 
 #[tokio::test]
+async fn stream_incomplete_retries_without_previous_response_id() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("ws://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut first = accept_async(stream).await?;
+        assert_warmup(&next_json(&mut first).await?);
+        send_warmup(&mut first, "resp-warmup").await?;
+
+        let initial = next_json(&mut first).await?;
+        assert_eq!(initial["previous_response_id"], "resp-warmup");
+        send_json(
+            &mut first,
+            json!({
+                "type": "response.failed",
+                "response": {
+                    "id": "ws-incomplete",
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "code": "stream_incomplete",
+                        "message": "upstream websocket closed before response.completed"
+                    }
+                }
+            }),
+        )
+        .await?;
+
+        let (stream, _) = listener.accept().await?;
+        let mut second = accept_async(stream).await?;
+        let replay = next_json(&mut second).await?;
+        assert!(replay.get("previous_response_id").is_none());
+        assert_eq!(replay["store"], true);
+        assert!(replay.to_string().contains("recover incomplete stream"));
+        send_final(&mut second, "resp-final").await
+    });
+
+    let workspace = temporary_workspace("stream-incomplete")?;
+    let output = run_model(&endpoint, &workspace, "recover incomplete stream").await?;
+    timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .map_err(|_| eyre!("mock Responses server did not finish"))???;
+    assert!(output.contains("\"model.attempt.retrying\""));
+    assert!(output.contains("\"error_class\":\"api_server\""));
+    assert!(output.contains("\"replay_mode\":\"full_history\""));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn receive_reset_reconnects_without_replaying_completed_tools() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -1542,10 +1592,15 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
         send_json(
             &mut branch,
             json!({
-                "type": "error",
-                "error": {
-                    "code": "previous_response_not_found",
-                    "message": "checkpoint expired"
+                "type": "response.failed",
+                "response": {
+                    "id": "ws-stale-checkpoint",
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "code": "codex_previous_response_stale",
+                        "message": "retry without previous_response_id"
+                    }
                 }
             }),
         )

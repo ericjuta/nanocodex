@@ -48,6 +48,7 @@ impl ResponsesError {
             Self::Receive(_) => "receive_transport",
             Self::IdleTimeout { .. } => "event_idle_timeout",
             Self::UnexpectedEnd | Self::Closed { .. } => "premature_close",
+            Self::Api { event } if api_error_has_code(event, "stream_incomplete") => "api_server",
             _ => return None,
         };
         Some(RetryAdvice {
@@ -70,9 +71,7 @@ impl ResponsesError {
             Self::EncodeRequest(_) => "encode_request",
             Self::InvalidPayload { .. } => "invalid_payload",
             Self::Closed { .. } => "closed",
-            Self::Api { event } if api_error_has_code(event, "previous_response_not_found") => {
-                "checkpoint_missing"
-            }
+            Self::Api { event } if is_checkpoint_missing_api_error(event) => "checkpoint_missing",
             Self::Api { .. } => "api",
             Self::InvalidImageRequest { .. } => "invalid_image_request",
         }
@@ -80,7 +79,7 @@ impl ResponsesError {
 
     #[must_use]
     pub fn is_checkpoint_missing(&self) -> bool {
-        matches!(self, Self::Api { event } if api_error_has_code(event, "previous_response_not_found"))
+        matches!(self, Self::Api { event } if is_checkpoint_missing_api_error(event))
     }
 }
 
@@ -105,6 +104,11 @@ fn api_error_has_code(event: &str, expected: &str) -> bool {
         })
         .and_then(|error| error.code.as_deref());
     code == Some(expected)
+}
+
+fn is_checkpoint_missing_api_error(event: &str) -> bool {
+    api_error_has_code(event, "previous_response_not_found")
+        || api_error_has_code(event, "codex_previous_response_stale")
 }
 
 #[derive(serde::Deserialize)]
