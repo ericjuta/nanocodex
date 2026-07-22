@@ -1,7 +1,7 @@
 # Make multi-agent orchestration cancellation-safe and deadlock-free
 
-- Branch: `multi-agent-reliability` (proposed; spec authored on `master`)
-- Status: Draft
+- Branch: `multi-agent-reliability`
+- Status: Completed
 - Owner(s): Eric Juta / implementing agent
 - Created: 2026-07-22
 - Last Updated: 2026-07-22
@@ -60,17 +60,20 @@ Success means:
   examples, shutdown paths, and existing tests.
 - [x] (2026-07-22 11:23Z) Record the initial implementation and validation
   approach in this ExecPlan.
-- [ ] Add deterministic failing tests for child cancellation, wait cycles,
-  shutdown, compaction-time forks, and failed-turn recovery.
-- [ ] Implement cancellation-safe child invocation ownership and wait-cycle
+- [x] (2026-07-22 13:25Z) Add deterministic regressions for child
+  cancellation, wait cycles, shutdown aborts/panics, compaction-time forks,
+  failed-turn replay, and dual cleanup failures.
+- [x] (2026-07-22 13:25Z) Implement cancellation-safe invocation ownership,
+  independently owned shutdown, exact cleanup joining, and wait-cycle
   rejection in the CLI adapter.
-- [ ] Repair safe-boundary publication around compaction and failed-turn replay
-  in the core model lifecycle.
-- [ ] Correct the read-only wording and make the public subagent example capable
-  of its advertised repository investigation.
-- [ ] Run focused and workspace validation, then record exact evidence and
-  residual risks.
-- [ ] Update the PR and this spec with the final outcome.
+- [x] (2026-07-22 13:25Z) Repair safe-boundary publication, failed-turn full
+  replay, and atomic multi-tool history in the core lifecycle.
+- [x] (2026-07-22 13:25Z) Correct read-only wording and enable the public
+  subagent example's advertised repository inspection.
+- [x] (2026-07-22 13:25Z) Run focused, workspace, benchmark, observability,
+  and live-native validation; record exact evidence and residual limits.
+- [x] (2026-07-22 13:25Z) Update changelogs and this spec with the final
+  outcome.
 
 ## Surprises & Discoveries
 
@@ -117,6 +120,36 @@ Success means:
   Evidence: `examples/subagents.rs` uses `.without_defaults()` and registers
   only the three child-agent tools.
 
+- Observation: The first live local child harness exposed a child-handle
+  ownership deadlock that the original unit baseline could not represent.
+  Evidence: moving invocation/session ownership into the registry before the
+  first await made the recursive cancellation harness complete deterministically.
+
+- Observation: Cancellation review found that transferring a removed session
+  only after a caller-owned await, and letting the first caller own shutdown,
+  still allowed caller aborts to detach cleanup or wedge every later shutdown.
+  Evidence: deterministic barriers now abort callers at creation, prompt,
+  control cancellation, invocation cleanup, session drain, and worker join.
+
+- Observation: Final review found two deeper failure paths after the first fix:
+  a dead cleanup worker could fail its pre-join barrier before its handle was
+  joined, and dual primary/cleanup failures discarded one error.
+  Evidence: shutdown now aggregates phase failures while always taking and
+  awaiting worker/fallback handles, and adapters preserve both failures.
+- Observation: Combining a dead cleanup worker with paused creation or an active
+  invocation exposed a publication-before-fallback-registration race.
+  Evidence: shutdown now waits synchronous ownership counters and invocation
+  state, while failed cleanup sends install tracked, joined fallbacks atomically.
+
+- Observation: The native credential path was present, but the local Responses
+  WebSocket proxy reset every connection before a model response.
+  Evidence: the smoke made six connection attempts and five reconnects, emitted
+  one `run.failed` at sequence 41, and executed zero model-decided tools.
+
+- Observation: One Hashline durability test was transiently dirty during the
+  first final `just check` run.
+  Evidence: its isolated rerun passed, and the subsequent complete `just check`
+  passed all Rust and 37 Harbor-adapter tests without source changes.
 ## Decision Log
 
 - Decision: Keep child orchestration in `bin/nanocodex`; do not promote a
@@ -159,15 +192,51 @@ Success means:
   dynamic tool, not merely remove patch handlers. That is a separate security
   design; this branch should make no false guarantee.
   Date/Author: 2026-07-22 / Codex
+- Decision: Move every removed `ChildSession` into one tracked cleanup owner
+  before any caller-visible await; callers receive only completion receipts.
+  Rationale: dropping a receipt must not detach the agent or event-drain task.
+  A tracked fallback owns the session if the primary cleanup channel is closed.
+  Date/Author: 2026-07-22 / Codex
+
+- Decision: Close admission once and launch one supervised shutdown operation
+  whose cached result is shared by all callers.
+  Rationale: caller cancellation, shutdown-worker panic, cleanup-worker panic,
+  barrier failure, and poisoned task ownership must all terminate waiters
+  deterministically while joining each owned task exactly once.
+  Date/Author: 2026-07-22 / Codex
+
+- Decision: Reserve creation and session-handoff ownership synchronously in
+  registry state and include both counts in shutdown's completion predicate.
+  Rationale: admission closure must not race a child creation or removed-session
+  handoff that has not yet become visible to the cleanup worker.
+  Date/Author: 2026-07-22 / Codex
+
+- Decision: Commit a model response containing multiple tool calls only after
+  every started call has a paired terminal output; exclude unstarted siblings.
+  Rationale: replay and fork snapshots must never expose unmatched calls or
+  duplicate side effects after cancellation.
+  Date/Author: 2026-07-22 / Codex
 
 ## Outcomes & Retrospective
 
-- Outcome: The audit and remediation design are complete; implementation has
-  not started.
-  Evidence: The current automated baseline is 60 passing library tests, 118
-  passing CLI unit tests, one passing MCP CLI integration test, and successful
-  compilation of all public example binaries.
-  Remaining: All implementation milestones and acceptance gates below.
+- Outcome: The core and CLI reliability slice is implemented end to end.
+  Child invocations have synchronous registry ownership, cycle-safe waits,
+  recursive cancellation, independently owned/cached shutdown, exact worker
+  joining, and deterministic dual-error retention. Core forks publish safe
+  boundaries before compaction; failed continuations replay authoritative
+  history; multi-tool history remains paired and atomic.
+- Evidence: 25 focused subagent tests plus focused headless/TUI dual-error
+  tests pass; the full CLI suite reports 145 unit tests and one MCP integration
+  test passing. Core reports 64 tests passing, public examples compile,
+  workspace Clippy/tests and `just check` pass, and the attached-subagent
+  Jaeger gate validates overlapping child turns under one parent trace.
+- Residual: The native happy-path/TUI live gate could not reach a model because
+  the configured local WebSocket proxy reset all six connection attempts.
+  Deterministic process-level tests remain the cleanup acceptance authority.
+  A true read-only capability sandbox and application budgets remain out of
+  scope. The full Harbor eval was not run because this was not classified as a
+  milestone/release gate and the default suite does not exercise opt-in child
+  tools.
 
 ## Context and Orientation
 
@@ -604,41 +673,48 @@ Expected evidence:
 
 ## Validation and Acceptance
 
-Automated validation:
+Automated validation completed on `multi-agent-reliability`:
 
-- `cargo test -p nanocodex-bin subagents -- --nocapture`: all focused adapter
-  lifecycle, cycle, and shutdown regressions pass.
-- `cargo test -p nanocodex --lib -- --test-threads=1`: all core tests pass,
-  including compaction-time fork and failed-continuation recovery.
-- `cargo test -p nanocodex-bin --tests`: CLI/TUI/MCP regressions pass; the
-  expected ignored OTLP tests are reported separately.
+- `cargo test -p nanocodex-bin subagents::tests:: -- --test-threads=1`:
+  25 focused lifecycle tests passed. Separate headless dual-error and TUI
+  restoration/dual-error tests also passed.
+- `cargo test -p nanocodex --lib -- --test-threads=1`: 64 core tests passed,
+  including compaction-time forks, failed-continuation replay, and atomic
+  cancellation during multiple tool calls.
+- `cargo test -p nanocodex-bin --tests`: 145 CLI unit tests and one MCP
+  integration test passed; two manual OTLP stress tests remained ignored.
+- `cargo test --workspace`: all configured crate, integration, example, and
+  documentation tests passed.
 - `cargo check -p nanocodex-examples --bins`: every public Rust example
-  compiles.
+  compiled; the subagent contract test passed.
 - `cargo fmt --all -- --check` and
-  `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
-  no formatting or lint failures.
-- `just check`: full configured repository gate passes without modifying eval
-  tasks or verifiers.
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+  completed without findings.
+- `just check` passed the Rust workspace gate, 37 Python Harbor-adapter tests,
+  Python bytecode compilation, and both Harbor configuration checks.
+- `cargo bench -p nanocodex-core --bench fork_history --
+  active_boundary_snapshot_then_append` measured immutable-boundary medians of
+  about 372 ns (100 items), 331 ns (1,000), and 334 ns (10,000); the 10,000
+  case remained below the specified two-times-100-item regression gate.
 
-Manual or runtime validation:
+Runtime and observability validation:
 
-- Start the headless happy-path command under `Concrete Steps` with normal
-  credentials and observe concurrent clean/fork reports plus a reusable
-  follow-up.
-- Separately start the interactive TUI from the repository root:
-
-      cargo run --quiet --manifest-path bin/nanocodex/Cargo.toml -- \
-        --thinking low --subagents true \
-        --prompt "Start a child that performs a long read-only inspection and report when it finishes."
-
-- While the child is active, use the TUI's cancel action for the root turn, then
-  exit normally.
-- Observe terminal restoration, terminal cancellation evidence, and no later
-  child model/tool activity. Stdout remains flushed root JSONL only in headless
-  mode; diagnostics and optional child lifecycle JSONL remain on stderr.
-- If live credentials are unavailable, record that D5 was not run. The
-  deterministic process-level recursive cancellation test remains mandatory and
-  is the acceptance authority for cleanup.
+- `just otel-subagent-stress` passed. Jaeger trace
+  `d16e15e396003832bca532f7b8399a37` contained 28 spans, including one root
+  and two overlapping child `agent.turn` spans plus four model calls.
+- The native headless smoke reached the configured local Responses WebSocket
+  proxy but every connection reset without a closing handshake. It made six
+  connection attempts, five reconnects, and four response retries, then
+  emitted exactly one `run.failed` terminal event at sequence 41 with zero
+  tool calls. This records the external live-gate limitation without claiming
+  a happy path.
+- The interactive TUI cancel smoke was not run because the same transport
+  failure prevents an active child turn. The deterministic process-level
+  recursive cancellation and terminal-restoration tests are acceptance
+  authority for cleanup.
+- The full configured Harbor eval was not run: maintainers did not classify
+  this branch as a milestone/release gate, and the default eval does not
+  exercise opt-in subagent tools.
 
 Regression checks:
 
@@ -752,6 +828,16 @@ The workspace was clean after the audit. The vendored source template is
 `../perps-iii/specs/_template.md` with SHA-256
 `cd521472930ac4eee3f7f5449e761ea8e6391fb6c336e4191c0119a89cc7bb17`.
 
+Final implementation evidence from 2026-07-22:
+
+    focused CLI lifecycle: 25 passed
+    full CLI: 145 unit + 1 MCP integration passed; 2 manual OTLP tests ignored
+    core library: 64 passed
+    workspace tests and warnings-denied Clippy: passed
+    just check: passed, including 37 Harbor-adapter tests
+    attached-subagent Jaeger topology gate: passed
+    native live smoke: external WebSocket reset; one terminal run.failed
+
 ## Revision Notes
 
 - 2026-07-22: Created from the vendored critical-change template using the
@@ -762,3 +848,7 @@ The workspace was clean after the audit. The vendored source template is
   tool-free-compaction regressions, specifying the history benchmark gate,
   making example validation executable, and separating TUI cancellation from
   the headless happy-path smoke.
+- 2026-07-22: Completed the implementation after adversarial cancellation
+  review. Recorded synchronous cleanup ownership, supervised cached shutdown,
+  multi-tool atomicity, dual-error preservation, benchmark/Jaeger evidence,
+  the native transport limitation, and final repository validation.
