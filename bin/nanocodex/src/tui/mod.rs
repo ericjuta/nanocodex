@@ -1012,7 +1012,7 @@ impl AgentWorker {
         drop(self.updates.send(WorkerEvent::TurnFinished {
             target: finished.target,
             main_branch_id,
-            error: finished.error,
+            error: None,
         }));
     }
 }
@@ -1058,10 +1058,10 @@ async fn start_turn(
             let task_span = span.clone();
             tokio::spawn(
                 async move {
-                    let (result, error, status, otel_status) = match turn.result().await {
-                        Ok(result) => (Some(result), None, "completed", "OK"),
-                        Err(NanocodexError::TurnCancelled) => (None, None, "cancelled", "ERROR"),
-                        Err(error) => (None, Some(error.to_string()), "failed", "ERROR"),
+                    let (result, status, otel_status) = match turn.result().await {
+                        Ok(result) => (Some(result), "completed", "OK"),
+                        Err(NanocodexError::TurnCancelled) => (None, "cancelled", "ERROR"),
+                        Err(_) => (None, "failed", "ERROR"),
                     };
                     task_span.record("status", status);
                     task_span.record("otel.status_code", otel_status);
@@ -1075,7 +1075,6 @@ async fn start_turn(
                         main_branch_id: target.main_branch_id,
                         prompt_id,
                         result,
-                        error,
                     }));
                 }
                 .instrument(span.clone()),
@@ -1244,7 +1243,6 @@ struct FinishedTurn {
     main_branch_id: Option<u64>,
     prompt_id: u64,
     result: Option<TurnResult>,
-    error: Option<String>,
 }
 
 fn remove_finished(turns: &mut VecDeque<TrackedTurn>, id: u64) {
@@ -2339,6 +2337,82 @@ mod tests {
             .await
             .map_err(|_| eyre::eyre!("mock Responses server did not finish"))???;
         event_drain.abort();
+        std::fs::remove_dir_all(workspace)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_accepted_turn_does_not_repeat_the_run_error_on_completion() -> eyre::Result<()>
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            let warmup = next_ws_json(&mut socket).await?;
+            assert_eq!(warmup["generate"], false);
+            send_ws_json(
+                &mut socket,
+                json!({
+                    "type": "response.completed",
+                    "response": { "id": "resp-warmup", "usage": null }
+                }),
+            )
+            .await?;
+
+            let _generation = next_ws_json(&mut socket).await?;
+            send_ws_json(
+                &mut socket,
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp-failed",
+                        "status": "failed",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "cyber_policy",
+                            "message": "request rejected"
+                        }
+                    }
+                }),
+            )
+            .await
+        });
+
+        let workspace = temporary_workspace("tui-failed-turn")?;
+        let responses = Responses::builder().websocket_url(endpoint).build();
+        let (agent, mut events) = Nanocodex::builder("test-key")
+            .thinking(Thinking::Low)
+            .workspace(&workspace)
+            .responses(responses)
+            .session_id("tui-failed-turn-test")
+            .build()?;
+        let event_drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+        let (commands, worker_rx) = mpsc::unbounded_channel();
+        let (updates, mut update_rx) = mpsc::unbounded_channel();
+        spawn_agent_worker(agent, Arc::from("tui-failed-turn-test"), worker_rx, updates);
+
+        commands.send(WorkerCommand::Prompt {
+            target: PaneId::Main,
+            prompt_id: 1,
+            prompt: "fail once".into(),
+        })?;
+        let completion_error = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(WorkerEvent::TurnFinished { error, .. }) = update_rx.recv().await {
+                    break error;
+                }
+            }
+        })
+        .await
+        .map_err(|_| eyre::eyre!("failed turn did not finish"))?;
+
+        assert!(completion_error.is_none());
+        drop(commands);
+        timeout(Duration::from_secs(5), server)
+            .await
+            .map_err(|_| eyre::eyre!("mock Responses server did not finish"))???;
+        event_drain.await?;
         std::fs::remove_dir_all(workspace)?;
         Ok(())
     }
