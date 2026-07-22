@@ -1,9 +1,10 @@
-import init, { Nanocodex } from "../../../bindings/wasm/pkg-web/nanocodex.js";
-import { createBrowserHost } from "../../../bindings/wasm/browser/host.mjs";
+import { Agent, type ReasoningMode, type Thinking } from "nanocodex";
+import { browser } from "nanocodex/browser";
 
 type StartMessage = {
   type: "start";
-  thinking: "low" | "medium" | "high" | "xhigh";
+  thinking: Thinking;
+  reasoningMode?: ReasoningMode;
 };
 
 type PromptMessage = {
@@ -16,8 +17,9 @@ type IncomingMessage = StartMessage | PromptMessage;
 
 const worker = self as DedicatedWorkerGlobalScope;
 
-const hostGlobal = globalThis as typeof globalThis & { nanocodexHost: unknown };
-hostGlobal.nanocodexHost = createBrowserHost({
+const engine = browser({
+  apiKey: "worker-managed",
+  websocketUrl: workerEndpoint(),
   // Browser WebSockets cannot attach an Authorization header. The URL must be
   // authorized by the embedding application, for example through a short-lived
   // signed URL or same-site session cookie.
@@ -26,8 +28,8 @@ hostGlobal.nanocodexHost = createBrowserHost({
     url.searchParams.set("session_id", sessionId);
     return new WebSocket(url);
   },
-  onEvent: (eventJson: string) => {
-    worker.postMessage({ type: "event", event: JSON.parse(eventJson) });
+  onEvent: (event) => {
+    worker.postMessage({ type: "event", event });
   },
   tools: {
     browserInfo: {
@@ -42,19 +44,20 @@ hostGlobal.nanocodexHost = createBrowserHost({
   },
 });
 
-await init();
-
-let agent: Nanocodex | undefined;
+let agent: Agent.Client | undefined;
 
 worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
+  void handleMessage(data);
+};
+
+async function handleMessage(data: IncomingMessage): Promise<void> {
   if (data.type === "start") {
-    agent?.free();
-    agent = new Nanocodex(JSON.stringify({
-      api_key: "worker-managed",
-      websocket_url: workerEndpoint(),
+    agent?.dispose();
+    agent = await Agent.create({
+      engine,
       thinking: data.thinking,
-      workspace: "/browser",
-    }));
+      reasoningMode: data.reasoningMode,
+    });
     worker.postMessage({ type: "ready" });
     return;
   }
@@ -67,7 +70,7 @@ worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
 
   // Each prompt gets an independent Turn, while the owned agent serializes
   // them onto the same session and preserves all follow-on context.
-  const turn = current.prompt(data.prompt);
+  const turn = current.turn.prompt({ input: data.prompt });
   void turn.result().then(
     (message) => worker.postMessage({ type: "result", id: data.id, message }),
     (error) => worker.postMessage({
@@ -76,7 +79,7 @@ worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
       message: error instanceof Error ? error.message : String(error),
     }),
   );
-};
+}
 
 function workerEndpoint(): string {
   const protocol = self.location.protocol === "https:" ? "wss:" : "ws:";

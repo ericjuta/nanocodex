@@ -19,7 +19,7 @@ eval_concurrency := env_var_or_default("HARBOR_EVAL_CONCURRENCY", "6")
 # the local Docker concurrency, since Daytona account quotas vary.
 hosted_eval_concurrency := env_var_or_default("HARBOR_HOSTED_EVAL_CONCURRENCY", "32")
 canonical_verifier := "harbor.verifier.verifier:Verifier"
-python_binding_venv := "bindings/python/.venv"
+python_binding_venv := "py/bindings/.venv"
 python_binding_bin := python_binding_venv + "/bin/python"
 python_binding_maturin := python_binding_venv + "/bin/maturin"
 wasm_target := "wasm32-unknown-unknown"
@@ -36,17 +36,18 @@ bootstrap-bindings:
     uv venv "{{python_binding_venv}}"
     uv pip install --python "{{python_binding_bin}}" "maturin>=1.9,<2"
     rustup target add "{{wasm_target}}"
-    npm ci --prefix bindings/wasm
+    npm ci --prefix js/bindings
+    npm ci --prefix examples/node
     npm ci --prefix examples/react-vite
 
 # Compile and install the PyO3 extension into its isolated development environment.
 build-python:
     @test -x "{{python_binding_maturin}}" || { echo "run 'just bootstrap-bindings' first" >&2; exit 2; }
-    VIRTUAL_ENV="{{justfile_directory()}}/{{python_binding_venv}}" "{{python_binding_maturin}}" develop --manifest-path bindings/python/Cargo.toml
+    VIRTUAL_ENV="{{justfile_directory()}}/{{python_binding_venv}}" "{{python_binding_maturin}}" develop --manifest-path py/bindings/Cargo.toml
 
 # Run boundary tests. The live follow-on test activates when OPENAI_API_KEY is set.
 test-python: build-python
-    "{{python_binding_bin}}" -m unittest discover -s bindings/python/tests -v
+    "{{python_binding_bin}}" -m unittest discover -s py/bindings/tests -v
 
 # Run the persistent Python follow-on example against the live Responses API.
 smoke-python: build-python
@@ -56,17 +57,19 @@ smoke-python: build-python
 build-wasm:
     @command -v wasm-bindgen >/dev/null || { echo "install wasm-bindgen-cli matching Cargo.lock" >&2; exit 2; }
     cargo build --locked -p nanocodex-wasm --target "{{wasm_target}}" --profile wasm
-    wasm-bindgen target/{{wasm_target}}/wasm/nanocodex_wasm.wasm --target nodejs --out-dir bindings/wasm/pkg-node --out-name nanocodex
-    wasm-bindgen target/{{wasm_target}}/wasm/nanocodex_wasm.wasm --target web --out-dir bindings/wasm/pkg-web --out-name nanocodex
-    node bindings/wasm/js/write-package-types.mjs
+    wasm-bindgen target/{{wasm_target}}/wasm/nanocodex_wasm.wasm --target nodejs --out-dir js/bindings/pkg-node --out-name nanocodex
+    wasm-bindgen target/{{wasm_target}}/wasm/nanocodex_wasm.wasm --target web --out-dir js/bindings/pkg-web --out-name nanocodex
+    node js/bindings/scripts/write-package-types.mjs
 
 # Exercise the real WASM model loop under Node and the browser host contract.
 test-wasm: build-wasm
-    npm test --prefix bindings/wasm
+    npm test --prefix js/bindings
+    npm test --prefix js/react
 
 # Run custom JavaScript tooling and a follow-on through Node-hosted WASM.
 smoke-wasm-node: build-wasm
-    node examples/node/index.mjs
+    npm ci --prefix examples/node
+    npm start --prefix examples/node
 
 # Type-check and bundle the React Worker example against the generated web WASM package.
 build-react-example: build-wasm

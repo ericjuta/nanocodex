@@ -1,0 +1,39 @@
+{
+  "name": "nanocodex-react",
+  "version": "0.1.0",
+  "description": "React state management for browser-embedded Nanocodex agents",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./index.d.mts",
+      "import": "./index.mjs"
+    },
+    "./config": {
+      "types": "./config.d.mts",
+      "import": "./config.mjs"
+    }
+  },
+  "files": [
+    "config.d.mts",
+    "config.mjs",
+    "index.d.mts",
+    "index.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gakonst/nanocodex.git",
+    "directory": "js/react"
+  }
+}

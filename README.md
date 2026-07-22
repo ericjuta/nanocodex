@@ -159,6 +159,19 @@ let (historical, _events) = agent.fork_from(&checkpoint).await?;
 `prompt().await` means accepted, not completed. The agent retains conversation
 history, tools, cache identity, response chain, and its WebSocket automatically.
 
+GPT-5.6 Pro is selected independently from reasoning effort; it does not use a
+different model slug. All six effort levels are available in either mode:
+
+```rust
+let (agent, _events) = Nanocodex::builder(api_key)
+    .reasoning_mode(ReasoningMode::Pro)
+    .thinking(Thinking::Xhigh) // None, Low, Medium, High, Xhigh, or Max
+    .build()?;
+```
+
+The CLI equivalents are `--reasoning-mode pro --thinking xhigh`, with matching
+`OPENAI_REASONING_MODE` and `OPENAI_REASONING_EFFORT` environment variables.
+
 Independent agents that use the same immutable instructions and tool definitions
 may deliberately share only their provider-side prompt cache while retaining
 separate conversations, response chains, tools, and workspaces:
@@ -555,8 +568,9 @@ thousands of records. Use `just bench-stream` for the focused event-delivery,
 transcript-update, and steady-frame regression gate. See
 [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the full trace contract.
 
-The workspace also contains thin [Python](bindings/python),
-[Node](examples/node), and [browser Worker](examples/react-vite) consumers.
+The workspace also contains publishable [JavaScript](js) and [Python](py)
+libraries plus thin [Node](examples/node), [browser Worker](examples/react-vite),
+and [website](web) consumers.
 Architecture and current work are tracked in [`PLAN.md`](PLAN.md); benchmark
 runner research lives in [`docs/HARBOR_RS_LOG.md`](docs/HARBOR_RS_LOG.md).
 

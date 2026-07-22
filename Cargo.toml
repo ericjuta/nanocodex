@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/nanocodex", "bindings/python", "bindings/wasm", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "examples"]
+members = ["bin/nanocodex", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "examples", "js/bindings", "py/bindings"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 

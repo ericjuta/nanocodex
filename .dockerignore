@@ -3,6 +3,14 @@
 .harness
 .nanocodex
 .venv
+**/.venv
+**/node_modules
+**/dist
+js/bindings/pkg-node
+js/bindings/pkg-web
+py/bindings/python/nanocodex/*.so
+py/bindings/python/nanocodex/*.dylib
+py/bindings/python/nanocodex/*.pyd
 jobs
 target
 trials
