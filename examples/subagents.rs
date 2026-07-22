@@ -9,7 +9,7 @@ use std::{
 use eyre::{Result, WrapErr};
 use nanocodex::{
     AgentEventKind, AgentEvents, AgentHandle, Nanocodex, Thinking, Tool, ToolContext,
-    ToolDefinition, ToolExecution, ToolInput, ToolResult, Tools, async_trait,
+    ToolDefinition, ToolExecution, ToolInput, ToolResult, Tools, ToolsBuildError, async_trait,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -45,8 +45,9 @@ struct FollowUpResult {
 const ORCHESTRATION_BRIEF: &str = r"We are choosing Nanocodex's next orchestration slice.
 
 Decision context:
-- The primary user experience is one long-running root agent with 3-8 short-lived, mostly
-  read-only specialist branches.
+- The primary user experience is one long-running root agent with 3-8 short-lived specialist
+  branches instructed to operate read-only. This instruction-based policy is not a sandbox or
+  capability boundary.
 - Fast live branching matters more than provider-side prompt privacy.
 - We must remain a headless, library-first SDK: no app server and no generic core scheduler.
 - `/btw` currently provides one ephemeral fork of the latest safe root boundary.
@@ -125,9 +126,10 @@ impl ChildKind {
         match self {
             Self::Spawn => format!(
                 "Act as an independent research subagent with no inherited conversation. Complete \
-                 only this delegated task. You may inspect the workspace with read-only Code Mode \
-                 commands, but must not modify files or run destructive commands. Return a compact \
-                 evidence-backed report.\n\nDelegated task:\n{task}"
+                 only this delegated task. You may inspect the workspace with Code Mode commands. \
+                 You are instructed to operate read-only: do not modify files or run destructive \
+                 commands. This is an instruction-based policy, not a sandbox or capability \
+                 boundary. Return a compact evidence-backed report.\n\nDelegated task:\n{task}"
             ),
             Self::Fork => task,
         }
@@ -277,6 +279,21 @@ impl Tool for PromptAgent {
     }
 }
 
+fn subagent_tools(
+    agent: AgentHandle,
+    agents: Weak<ChildAgents>,
+) -> std::result::Result<Tools, ToolsBuildError> {
+    Tools::builder()
+        .tool(ChildAgent::new(
+            agent.clone(),
+            agents.clone(),
+            ChildKind::Spawn,
+        ))
+        .tool(ChildAgent::new(agent, agents.clone(), ChildKind::Fork))
+        .tool(PromptAgent { agents })
+        .build()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -289,24 +306,7 @@ async fn main() -> Result<()> {
             "You are the lead engineering orchestrator. Code Mode exposes spawn_agent for a reusable clean child, fork_agent for a reusable child with the invoking agent's latest safe context, and prompt_agent for follow-up turns using a returned agent_id. Decide your own decomposition, concurrency, sequencing, follow-ups, and synthesis. Treat worker outputs as attributed evidence rather than fabricating them.",
         )
         .thinking(Thinking::Low)
-        .tools_factory(move |agent| {
-            Tools::builder()
-                .without_defaults()
-                .tool(ChildAgent::new(
-                    agent.clone(),
-                    tools_agents.clone(),
-                    ChildKind::Spawn,
-                ))
-                .tool(ChildAgent::new(
-                    agent,
-                    tools_agents.clone(),
-                    ChildKind::Fork,
-                ))
-                .tool(PromptAgent {
-                    agents: tools_agents.clone(),
-                })
-                .build()
-        })
+        .tools_factory(move |agent| subagent_tools(agent, tools_agents.clone()))
         .workspace(workspace)
         .build()?;
     drop(events);
@@ -330,4 +330,120 @@ async fn main() -> Result<()> {
         .await?;
     println!("{}", result.final_message);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::Value;
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message};
+
+    use super::*;
+    use nanocodex::Responses;
+
+    #[tokio::test]
+    async fn subagent_example_exposes_workspace_and_agent_tools() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = accept_async(stream).await?;
+            let warmup = next_json(&mut socket).await?;
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "response.completed",
+                    "response": { "id": "resp-warmup", "usage": null }
+                }),
+            )
+            .await?;
+
+            let _generation = next_json(&mut socket).await?;
+            send_json(
+                &mut socket,
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp-final",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "done" }]
+                        }],
+                        "usage": null
+                    }
+                }),
+            )
+            .await?;
+            Ok::<_, eyre::Report>(warmup)
+        });
+
+        let child_agents = Arc::new(ChildAgents::default());
+        let tools_agents = Arc::downgrade(&child_agents);
+        let responses = Responses::builder().websocket_url(endpoint).build();
+        let workspace = std::env::current_dir().wrap_err("failed to resolve the workspace")?;
+        let (agent, events) = Nanocodex::builder("test-key")
+            .instructions("Inspect the available tools.")
+            .thinking(Thinking::Low)
+            .tools_factory(move |agent| subagent_tools(agent, tools_agents.clone()))
+            .workspace(workspace)
+            .responses(responses)
+            .session_id("subagent-example-tools-test")
+            .build()?;
+        drop(events);
+
+        agent
+            .prompt("List the available tools.")
+            .await?
+            .result()
+            .await?;
+        drop(agent);
+        let warmup = timeout(Duration::from_secs(5), server)
+            .await
+            .wrap_err("mock Responses server did not finish")???;
+        let description = warmup["input"][0]["tools"][0]["description"]
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("warmup request omitted the Code Mode description"))?;
+
+        for name in [
+            "exec_command",
+            "hashline__read",
+            "spawn_agent",
+            "fork_agent",
+            "prompt_agent",
+        ] {
+            assert!(
+                description.contains(&format!("### `{name}`")),
+                "Code Mode description omitted {name}"
+            );
+        }
+        Ok(())
+    }
+
+    async fn next_json<S>(socket: &mut WebSocketStream<S>) -> Result<Value>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        loop {
+            let message = socket
+                .next()
+                .await
+                .ok_or_else(|| eyre::eyre!("client closed before sending a request"))??;
+            if let Message::Text(text) = message {
+                return Ok(serde_json::from_str(text.as_str())?);
+            }
+        }
+    }
+
+    async fn send_json<S>(socket: &mut WebSocketStream<S>, value: Value) -> Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        socket.send(Message::Text(value.to_string().into())).await?;
+        Ok(())
+    }
 }

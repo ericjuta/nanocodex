@@ -39,6 +39,24 @@ agent-relative handlers with a weak `AgentHandle` for every driver. Its
 `spawn()` method reuses private builder configuration without inheriting
 conversation history, while `fork()` targets the agent that actually invoked
 the tool.
+
+The example leaves the normal workspace tools enabled so the root and its
+children can inspect the repository. Those tools also include mutation-capable
+handlers. Clean children are instructed to operate read-only by not modifying
+files or running destructive commands, but that is instruction-based policy
+only; it is not a sandbox, security boundary, or capability boundary. An
+embedder that needs enforced isolation must constrain the registered tools and
+execution environment.
+
+The production lifecycle contract for this application-owned pattern is
+stronger than retaining child handles: register every accepted child invocation
+before awaiting it, propagate parent cancellation through active descendants,
+reject self-waits and multi-child wait cycles, and drain accepted child work
+during shutdown. The compact example demonstrates the public composition and
+per-driver rebinding; embedders remain responsible for enforcing that lifecycle
+in their adapter. Depth, concurrent-child, token, deadline, rollout, and
+residency budgets likewise remain application policy.
+
 The example prints only the final root answer by default. Set
 `NANOCODEX_SUBAGENT_JSONL=1` to emit each child's lifecycle JSONL to stderr;
 the records retain their native request IDs and sequence numbers without a

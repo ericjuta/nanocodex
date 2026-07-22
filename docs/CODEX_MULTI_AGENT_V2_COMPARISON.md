@@ -43,9 +43,39 @@ projection, and TUI integration.
 | Prompt cache | Contextual forks share explicit cache lineage | The V2 tree shares its root session ID, which is also the default cache key |
 | Code Mode | Child tools can be nested tools inside generated JavaScript | Collaboration tools are intentionally unavailable inside `functions.exec` |
 | Communication | Application-defined tool result flow | Mailboxes, `send_message`, `followup_task`, and `wait_agent` |
-| Lifecycle | Caller-owned handles and drop semantics | Status registry, interruption, residency, unload, reload, and durable resume |
-| Limits | Currently application-defined | Built-in execution, residency, thread, and rollout budgets |
+| Lifecycle | The application adapter owns accepted child invocations, propagates cancellation through descendants, rejects wait cycles, and drains shutdown; no durable registry | Status registry, interruption, residency, unload, reload, and durable resume |
+| Limits | Depth, concurrent-child, token, deadline, rollout, and residency budgets remain application-defined | Built-in execution, residency, thread, and rollout budgets |
 | Durability | In-memory typed history with API-checkpoint replay fallback | Durable thread, rollout, and agent-graph stores |
+
+## Reliability and policy boundary
+
+The bundled Nanocodex application adapter registers a child invocation before
+awaiting its first turn and retains control of every accepted active or queued
+turn. Cancelling a parent invocation cancels its active descendants, including
+recursively started work. A follow-up that would wait on its own session or
+close a multi-child wait cycle fails before the impossible prompt is queued.
+Shutdown stops new insertions, cancels accepted work, and drains child turns,
+cleanup work, command handles, and event tasks. These are in-process lifecycle
+guarantees, not durable scheduling or restart recovery.
+
+At the conversation boundary, a fork observes the latest complete
+response/tool-output pair even when compaction is still running and never
+inherits partial output or an unmatched call. After a terminal continuation
+failure, the first later prompt performs one complete replay from authoritative
+typed history without a previous response ID; healthy turns then return to
+incremental deltas.
+
+The public example enables the normal repository tools for useful inspection.
+Those tools include mutation-capable handlers. Children are instructed to
+operate read-only by not modifying files or running destructive commands, but
+that instruction-based policy is not a sandbox, security boundary, or
+capability boundary. Applications needing enforcement must restrict both
+registered tools and their execution environment.
+
+Lifecycle correctness does not choose resource policy. Maximum depth,
+concurrent children, token spend, deadlines, rollout count, and child residency
+remain explicit embedding-application budgets. Child event streams also remain
+independent and optional rather than becoming a merged scheduler event bus.
 
 ## Fork mechanics
 
@@ -93,15 +123,16 @@ event-lifecycle machinery.
 ## Direction for Nanocodex
 
 Keep `AgentHandle` and checkpoint forks as the core primitive. Do not introduce
-a central workflow graph solely to imitate Codex. The useful production
-invariants to evaluate independently are:
+a central workflow graph solely to imitate Codex. The lifecycle and recovery
+rules above are the reliability baseline for the application adapter and owned
+session. The remaining production policies to evaluate independently are:
 
-1. Depth, concurrent-child, token, deadline, and rollout budgets.
-2. Explicit cancellation propagation and subprocess cleanup.
-3. A small typed child-task handle if a real consumer needs detached execution.
-4. Separating conversation lineage from cache affinity so clean children may
+1. Concrete depth, concurrent-child, token, deadline, rollout, and residency
+   budgets for each embedding application.
+2. A small typed child-task handle if a real consumer needs detached execution.
+3. Separating conversation lineage from cache affinity so clean children may
    optionally reuse a byte-stable shared prefix without inheriting history.
-5. Caller-owned checkpoint persistence if process durability becomes a concrete
+4. Caller-owned checkpoint persistence if process durability becomes a concrete
    library requirement.
 
 Messaging, durable task paths, status registries, and unload/resume machinery
