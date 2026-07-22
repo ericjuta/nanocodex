@@ -33,9 +33,13 @@ pub(super) struct WarmupStarted<'a> {
 
 #[derive(Serialize)]
 pub(super) struct WarmupCompleted<'a> {
-    pub(super) response_id: &'a str,
-    pub(super) attempt: u32,
-    pub(super) connection_generation: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) response_id: Option<&'a str>,
+    pub(super) source: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) connection_generation: Option<u32>,
     pub(super) duration_ns: u64,
     pub(super) usage: Option<&'a Usage>,
 }

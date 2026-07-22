@@ -1167,13 +1167,21 @@ async fn start_turn(
             *next_turn_id = next_turn_id.saturating_add(1);
             let control = turn.control();
             let finished = finished.clone();
+            let agent = agent.clone();
             let task_span = span.clone();
             tokio::spawn(
                 async move {
-                    let (result, error, status, otel_status) = match turn.result().await {
-                        Ok(result) => (Some(result), None, "completed", "OK"),
-                        Err(NanocodexError::TurnCancelled) => (None, None, "cancelled", "ERROR"),
-                        Err(error) => (None, Some(error.to_string()), "failed", "ERROR"),
+                    let turn_result = turn.result().await;
+                    let rollout_result = agent.flush_rollout().await;
+                    let (result, error, status, otel_status) = match (turn_result, rollout_result) {
+                        (Ok(result), Ok(())) => (Some(result), None, "completed", "OK"),
+                        (Err(NanocodexError::TurnCancelled), Ok(())) => {
+                            (None, None, "cancelled", "ERROR")
+                        }
+                        (Ok(result), Err(error)) => {
+                            (Some(result), Some(error.to_string()), "failed", "ERROR")
+                        }
+                        (Err(error), _) => (None, Some(error.to_string()), "failed", "ERROR"),
                     };
                     task_span.record("status", status);
                     task_span.record("otel.status_code", otel_status);

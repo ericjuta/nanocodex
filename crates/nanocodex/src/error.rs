@@ -38,6 +38,9 @@ pub enum NanocodexError {
     #[error("invalid Responses attempt state: {detail}")]
     InvalidAttemptState { detail: &'static str },
 
+    #[error("failed to fingerprint the immutable prompt prefix: {0}")]
+    SerializePromptPrefix(#[source] serde_json::Error),
+
     #[error("the agent stopped before accepting the command")]
     AgentStopped,
 
@@ -64,6 +67,20 @@ pub enum NanocodexError {
 
     #[error("building an agent requires an active Tokio runtime")]
     TokioRuntimeUnavailable,
+
+    #[error("failed to initialize a Codex rollout under {codex_home}: {source}")]
+    InitializeRollout {
+        codex_home: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to persist Codex rollout at {path}: {source}")]
+    PersistRollout {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
     #[error(transparent)]
     Event(#[from] nanocodex_core::EventError),

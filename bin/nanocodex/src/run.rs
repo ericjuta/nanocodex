@@ -26,6 +26,7 @@ impl Run {
                 let turn = handle.prompt(self.prompt.clone()).await?;
                 events.write_turn_jsonl(io::stdout()).await?;
                 turn.result().await?;
+                handle.flush_rollout().await?;
             }
             Ok(())
         }
