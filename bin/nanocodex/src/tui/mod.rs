@@ -333,7 +333,7 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     let agent = configured.handle;
     let mut agent_events = configured.events;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
-    let _child_agents = configured.child_agents;
+    let child_agents = configured.child_agents;
     let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
     spawn_agent_worker(agent, Arc::clone(&root_session_id), worker_rx, update_tx);
@@ -346,9 +346,9 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
 
-    submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
-
-    loop {
+    let result = async {
+        submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
+        loop {
         view_telemetry.observe(&ui.app);
         render_due_frame(
             &mut ui,
@@ -422,6 +422,13 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
             }
         }
     }
+    }
+    .await;
+    drop(terminal);
+    if let Some(child_agents) = child_agents {
+        child_agents.shutdown().await;
+    }
+    result
 }
 
 fn render_due_frame(
