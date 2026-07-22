@@ -33,6 +33,17 @@ Install the daily-driver CLI on macOS or Linux:
 curl -fsSL https://nanocodex.paradigm.xyz | bash
 ```
 
+The installer tracks stable releases. Switch an installed CLI to the rolling
+nightly channel with:
+
+```sh
+nanocodex update --nightly
+```
+
+Multi-architecture Linux images are published to GHCR as
+`ghcr.io/gakonst/nanocodex:latest` and `ghcr.io/gakonst/nanocodex:nightly`.
+Immutable version, commit, and `nightly-<commit>` tags are also available.
+
 Add the library to a Rust project:
 
 ```sh
@@ -425,12 +436,8 @@ ordering rules.
 `#[tool]` turns an async Rust function into a typed tool and derives its input
 schema. `Tools::builder()` accepts generated or manual `Tool` implementations;
 `Mcp::builder()` adds deferred Streamable HTTP or stdio MCP providers. The model
-sees Code Mode, its wait operation, and the native Hashline read/edit family by
-default. `Tools::builder().hashline(false)` keeps Hashline available to Code Mode
-while removing its standalone function declarations; `without_defaults()`
-removes the standalone family with the other default selections. Code Mode
-continues to compose nested tools with generated JavaScript, including loops,
-conditionals, and `Promise.all`.
+normally sees only Code Mode and its wait operation, then composes nested tools
+with generated JavaScript, including loops, conditionals, and `Promise.all`.
 
 Code Mode prewarms one persistent Node host alongside the first model call and
 reuses it for the session. Cells receive one shared owned history snapshot;

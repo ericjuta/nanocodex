@@ -1,6 +1,10 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::VecDeque,
+    mem,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use ratatui::{
@@ -10,6 +14,8 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::composer::ComposerLayout;
 
@@ -22,6 +28,7 @@ pub(super) struct InlineEdit<'a> {
 
 pub(super) enum TranscriptItem {
     User(String),
+    Reasoning(String),
     Assistant(String),
     Tool {
         call_id: String,
@@ -91,10 +98,27 @@ impl Transcript {
         appended
     }
 
+    pub(super) fn append_reasoning_delta(&mut self, delta: &str) -> bool {
+        let appended = self
+            .entries
+            .last_mut()
+            .is_some_and(|entry| Arc::make_mut(entry).append_reasoning_delta(delta));
+        if appended {
+            self.invalidate_total_height();
+        }
+        appended
+    }
+
     pub(super) fn tail_is_assistant(&self) -> bool {
         self.entries
             .last()
             .is_some_and(|entry| matches!(entry.kind, EntryKind::Assistant))
+    }
+
+    pub(super) fn tail_is_reasoning(&self) -> bool {
+        self.entries
+            .last()
+            .is_some_and(|entry| matches!(entry.kind, EntryKind::Reasoning))
     }
 
     pub(super) fn tail_height(&self, width: u16) -> Option<usize> {
@@ -535,13 +559,19 @@ fn render_entries(
                 area.width,
                 saturating_u16(visible_height),
             );
-            let mut paragraph = rendered_paragraph(entry, index, area.width, inline_edit);
-            if selected == Some(index) && inline_edit.is_none_or(|edit| edit.index != index) {
-                paragraph = paragraph.style(Style::default().add_modifier(Modifier::REVERSED));
+            if let Some(edit) = inline_edit.filter(|edit| edit.index == index) {
+                rendered_edit_paragraph(edit, area.width)
+                    .scroll((saturating_u16(local_scroll), 0))
+                    .render(entry_area, buffer);
+            } else {
+                entry.render(
+                    entry_area,
+                    buffer,
+                    local_scroll,
+                    entry_height,
+                    selected == Some(index),
+                );
             }
-            paragraph
-                .scroll((saturating_u16(local_scroll), 0))
-                .render(entry_area, buffer);
             screen_y = screen_y.saturating_add(visible_height);
         }
         local_scroll = 0;
@@ -564,25 +594,15 @@ fn rendered_height(
     )
 }
 
-fn rendered_paragraph(
-    entry: &TranscriptEntry,
-    index: usize,
-    width: u16,
-    inline_edit: Option<InlineEdit<'_>>,
-) -> Paragraph<'static> {
-    inline_edit.filter(|edit| edit.index == index).map_or_else(
-        || entry.paragraph(),
-        |edit| {
-            Paragraph::new(inline_edit_text(edit.input, width))
-                .block(
-                    Block::default()
-                        .title(" Edit message · Esc cancel ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)),
-                )
-                .wrap(Wrap { trim: false })
-        },
-    )
+fn rendered_edit_paragraph(edit: InlineEdit<'_>, width: u16) -> Paragraph<'static> {
+    Paragraph::new(inline_edit_text(edit.input, width))
+        .block(
+            Block::default()
+                .title(" Edit message · Esc cancel ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false })
 }
 
 fn inline_edit_text(input: &str, width: u16) -> Text<'static> {
@@ -603,6 +623,7 @@ fn inline_edit_layout(input: &str, width: u16) -> ComposerLayout {
 #[derive(Clone)]
 enum EntryKind {
     User,
+    Reasoning,
     Assistant,
     Tool { call_id: String },
     Error,
@@ -612,8 +633,57 @@ struct TranscriptEntry {
     kind: EntryKind,
     user_message: Option<String>,
     prompt_id: Option<u64>,
-    text: Text<'static>,
+    content: EntryContent,
     cached_height: AtomicU64,
+}
+
+#[derive(Clone)]
+enum EntryContent {
+    Static(Text<'static>),
+    Streaming(StreamingText),
+}
+
+struct StreamingText {
+    lines: Vec<StreamingLine>,
+    body_style: Style,
+    continuation_prefix: &'static str,
+}
+
+struct StreamingLine {
+    content: String,
+    style: Style,
+    cached_layout: Mutex<Option<StreamingLineLayout>>,
+}
+
+#[derive(Clone)]
+struct StreamingLineLayout {
+    width: u16,
+    rows: Vec<String>,
+}
+
+impl Clone for StreamingText {
+    fn clone(&self) -> Self {
+        Self {
+            lines: self.lines.clone(),
+            body_style: self.body_style,
+            continuation_prefix: self.continuation_prefix,
+        }
+    }
+}
+
+impl Clone for StreamingLine {
+    fn clone(&self) -> Self {
+        Self {
+            content: self.content.clone(),
+            style: self.style,
+            cached_layout: Mutex::new(
+                self.cached_layout
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
+        }
+    }
 }
 
 impl Clone for TranscriptEntry {
@@ -622,7 +692,7 @@ impl Clone for TranscriptEntry {
             kind: self.kind.clone(),
             user_message: self.user_message.clone(),
             prompt_id: self.prompt_id,
-            text: self.text.clone(),
+            content: self.content.clone(),
             cached_height: AtomicU64::new(self.cached_height.load(Ordering::Relaxed)),
         }
     }
@@ -630,7 +700,7 @@ impl Clone for TranscriptEntry {
 
 impl TranscriptEntry {
     fn new(item: TranscriptItem) -> Self {
-        let (kind, user_message, text) = match item {
+        let (kind, user_message, content) = match item {
             TranscriptItem::User(message) => {
                 let text = message_text(
                     "› You",
@@ -639,18 +709,17 @@ impl TranscriptEntry {
                         .add_modifier(Modifier::BOLD),
                     &message,
                 );
-                (EntryKind::User, Some(message), text)
+                (EntryKind::User, Some(message), EntryContent::Static(text))
             }
             TranscriptItem::Assistant(message) => (
                 EntryKind::Assistant,
                 None,
-                message_text(
-                    "● Nanocodex",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                    &message,
-                ),
+                EntryContent::Streaming(StreamingText::assistant(&message)),
+            ),
+            TranscriptItem::Reasoning(message) => (
+                EntryKind::Reasoning,
+                None,
+                EntryContent::Streaming(StreamingText::reasoning(&message)),
             ),
             TranscriptItem::Tool {
                 call_id,
@@ -662,7 +731,7 @@ impl TranscriptEntry {
                 (
                     EntryKind::Tool { call_id },
                     None,
-                    Text::from(vec![
+                    EntryContent::Static(Text::from(vec![
                         Line::from(vec![
                             Span::styled(format!("{icon} {name}"), Style::default().fg(color)),
                             Span::styled(
@@ -671,29 +740,34 @@ impl TranscriptEntry {
                             ),
                         ]),
                         Line::raw(""),
-                    ]),
+                    ])),
                 )
             }
             TranscriptItem::Error(message) => (
                 EntryKind::Error,
                 None,
-                Text::from(vec![
+                EntryContent::Static(Text::from(vec![
                     Line::styled(format!("✗ {message}"), Style::default().fg(Color::Red)),
                     Line::raw(""),
-                ]),
+                ])),
             ),
         };
         Self {
             kind,
             user_message,
             prompt_id: None,
-            text,
+            content,
             cached_height: AtomicU64::new(0),
         }
     }
 
+    #[cfg(test)]
     fn paragraph(&self) -> Paragraph<'static> {
-        Paragraph::new(self.text.clone()).wrap(Wrap { trim: false })
+        Paragraph::new(match &self.content {
+            EntryContent::Static(text) => text.clone(),
+            EntryContent::Streaming(streaming) => streaming.materialized_text(),
+        })
+        .wrap(Wrap { trim: false })
     }
 
     fn user_message(&self) -> Option<&str> {
@@ -705,7 +779,12 @@ impl TranscriptEntry {
         if cached != 0 && cached >> 48 == u64::from(width) {
             return usize::try_from(cached & ((1_u64 << 48) - 1)).unwrap_or(usize::MAX);
         }
-        let height = self.paragraph().line_count(width);
+        let height = match &self.content {
+            EntryContent::Static(text) => Paragraph::new(text.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width),
+            EntryContent::Streaming(streaming) => streaming.height(width),
+        };
         let encoded = (u64::from(width) << 48)
             | u64::try_from(height)
                 .unwrap_or((1_u64 << 48) - 1)
@@ -714,28 +793,78 @@ impl TranscriptEntry {
         height
     }
 
+    fn render(
+        &self,
+        area: Rect,
+        buffer: &mut Buffer,
+        scroll: usize,
+        total_height: usize,
+        selected: bool,
+    ) {
+        match &self.content {
+            EntryContent::Static(text) => {
+                let mut paragraph = Paragraph::new(text.clone()).wrap(Wrap { trim: false });
+                if selected {
+                    paragraph = paragraph.style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+                paragraph
+                    .scroll((saturating_u16(scroll), 0))
+                    .render(area, buffer);
+            }
+            EntryContent::Streaming(streaming) => {
+                streaming.render(area, buffer, scroll, total_height, selected);
+            }
+        }
+    }
+
     fn append_assistant_delta(&mut self, delta: &str) -> bool {
         if !matches!(self.kind, EntryKind::Assistant) {
             return false;
         }
 
-        drop(self.text.lines.pop());
-        let mut parts = delta.split('\n');
-        if let Some(first) = parts.next()
-            && let Some(body) = self.text.lines.last_mut()
-            && let Some(span) = body.spans.last_mut()
-        {
-            span.content.to_mut().push_str(first);
-        }
-        for part in parts {
-            self.text.lines.push(Line::styled(
-                format!("  {part}"),
-                Style::default().fg(Color::White),
-            ));
-        }
-        self.text.lines.push(Line::raw(""));
-        self.cached_height.store(0, Ordering::Relaxed);
+        let EntryContent::Streaming(streaming) = &mut self.content else {
+            return false;
+        };
+        let cached = self.cached_height.load(Ordering::Relaxed);
+        let cached_width = (cached != 0).then_some((cached >> 48) as u16);
+        let replacement = streaming.append(delta, cached_width);
+        self.update_streaming_height(cached, cached_width, replacement);
         true
+    }
+
+    fn append_reasoning_delta(&mut self, delta: &str) -> bool {
+        if !matches!(self.kind, EntryKind::Reasoning) {
+            return false;
+        }
+
+        let EntryContent::Streaming(streaming) = &mut self.content else {
+            return false;
+        };
+        let cached = self.cached_height.load(Ordering::Relaxed);
+        let cached_width = (cached != 0).then_some((cached >> 48) as u16);
+        let replacement = streaming.append(delta, cached_width);
+        self.update_streaming_height(cached, cached_width, replacement);
+        true
+    }
+
+    fn update_streaming_height(
+        &self,
+        cached: u64,
+        cached_width: Option<u16>,
+        replacement: Option<(usize, usize)>,
+    ) {
+        if let Some((old_height, new_height)) = replacement {
+            let total = usize::try_from(cached & ((1_u64 << 48) - 1)).unwrap_or(usize::MAX);
+            self.cached_height.store(
+                encode_height(
+                    cached_width.unwrap_or_default(),
+                    total.saturating_sub(old_height).saturating_add(new_height),
+                ),
+                Ordering::Relaxed,
+            );
+        } else {
+            self.cached_height.store(0, Ordering::Relaxed);
+        }
     }
 
     fn set_tool_status(&mut self, status: ToolStatus) {
@@ -743,8 +872,10 @@ impl TranscriptEntry {
             return;
         };
         let (icon, color) = tool_style(status);
-        if let Some(span) = self
-            .text
+        let EntryContent::Static(text) = &mut self.content else {
+            return;
+        };
+        if let Some(span) = text
             .lines
             .first_mut()
             .and_then(|line| line.spans.first_mut())
@@ -756,6 +887,348 @@ impl TranscriptEntry {
         }
         self.cached_height.store(0, Ordering::Relaxed);
     }
+}
+
+impl StreamingText {
+    fn assistant(message: &str) -> Self {
+        let title_style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        let body_style = Style::default().fg(Color::White);
+        let mut lines = Vec::with_capacity(message.lines().count().saturating_add(2));
+        lines.push(StreamingLine::new("● Nanocodex".to_owned(), title_style));
+        lines.extend(
+            message
+                .split('\n')
+                .map(|line| StreamingLine::new(format!("  {line}"), body_style)),
+        );
+        lines.push(StreamingLine::new(String::new(), Style::default()));
+        Self {
+            lines,
+            body_style,
+            continuation_prefix: "  ",
+        }
+    }
+
+    fn reasoning(message: &str) -> Self {
+        let body_style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
+        let mut parts = message.split('\n');
+        let mut lines = Vec::with_capacity(message.lines().count().saturating_add(1));
+        lines.push(StreamingLine::new(
+            format!("• {}", parts.next().unwrap_or_default()),
+            body_style,
+        ));
+        lines.extend(parts.map(|line| StreamingLine::new(format!("  {line}"), body_style)));
+        lines.push(StreamingLine::new(String::new(), Style::default()));
+        Self {
+            lines,
+            body_style,
+            continuation_prefix: "  ",
+        }
+    }
+
+    fn height(&self, width: u16) -> usize {
+        self.lines.iter().map(|line| line.height(width)).sum()
+    }
+
+    fn append(&mut self, delta: &str, cached_width: Option<u16>) -> Option<(usize, usize)> {
+        let old_height = cached_width.map(|width| {
+            self.lines
+                .iter()
+                .rev()
+                .take(2)
+                .map(|line| line.height(width))
+                .sum()
+        });
+
+        drop(self.lines.pop());
+        let mut parts = delta.split('\n');
+        if let Some(first) = parts.next()
+            && !first.is_empty()
+            && let Some(body) = self.lines.last_mut()
+        {
+            body.content.push_str(first);
+            *body
+                .cached_layout
+                .get_mut()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+        }
+        let body_style = self.body_style;
+        let continuation_prefix = self.continuation_prefix;
+        self.lines
+            .extend(parts.map(|part| {
+                StreamingLine::new(format!("{continuation_prefix}{part}"), body_style)
+            }));
+        self.lines
+            .push(StreamingLine::new(String::new(), Style::default()));
+
+        let width = cached_width?;
+        let added_lines = delta.bytes().filter(|byte| *byte == b'\n').count();
+        let new_height = self
+            .lines
+            .iter()
+            .rev()
+            .take(added_lines.saturating_add(2))
+            .map(|line| line.height(width))
+            .sum();
+        Some((old_height.unwrap_or_default(), new_height))
+    }
+
+    fn render(
+        &self,
+        area: Rect,
+        buffer: &mut Buffer,
+        scroll: usize,
+        total_height: usize,
+        selected: bool,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        let width = area.width;
+        let Some((first, mut line_top)) = self.line_at_visual_row(width, scroll, total_height)
+        else {
+            return;
+        };
+        let viewport_bottom = scroll.saturating_add(usize::from(area.height));
+        for line in self.lines.iter().skip(first) {
+            let line_height = line.height(width);
+            let line_bottom = line_top.saturating_add(line_height);
+            if line_top >= viewport_bottom {
+                break;
+            }
+            let visible_top = line_top.max(scroll);
+            let visible_bottom = line_bottom.min(viewport_bottom);
+            if visible_top < visible_bottom {
+                let line_area = Rect::new(
+                    area.x,
+                    area.y.saturating_add(saturating_u16(visible_top - scroll)),
+                    area.width,
+                    saturating_u16(visible_bottom - visible_top),
+                );
+                line.render_rows(
+                    line_area,
+                    buffer,
+                    visible_top.saturating_sub(line_top),
+                    selected,
+                );
+            }
+            line_top = line_bottom;
+        }
+    }
+
+    fn line_at_visual_row(
+        &self,
+        width: u16,
+        row: usize,
+        total_height: usize,
+    ) -> Option<(usize, usize)> {
+        if row >= total_height {
+            return None;
+        }
+        if row <= total_height / 2 {
+            let mut top = 0_usize;
+            for (index, line) in self.lines.iter().enumerate() {
+                let bottom = top.saturating_add(line.height(width));
+                if row < bottom {
+                    return Some((index, top));
+                }
+                top = bottom;
+            }
+            return None;
+        }
+
+        let mut bottom = total_height;
+        for (index, line) in self.lines.iter().enumerate().rev() {
+            let top = bottom.saturating_sub(line.height(width));
+            if row >= top {
+                return Some((index, top));
+            }
+            bottom = top;
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn materialized_text(&self) -> Text<'static> {
+        Text::from(
+            self.lines
+                .iter()
+                .map(|line| Line::styled(line.content.clone(), line.style))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+impl StreamingLine {
+    fn new(content: String, style: Style) -> Self {
+        Self {
+            content,
+            style,
+            cached_layout: Mutex::new(None),
+        }
+    }
+
+    fn height(&self, width: u16) -> usize {
+        self.with_layout(width, |layout| layout.rows.len())
+    }
+
+    fn render_rows(&self, area: Rect, buffer: &mut Buffer, first_row: usize, selected: bool) {
+        let style = if selected {
+            self.style.add_modifier(Modifier::REVERSED)
+        } else {
+            self.style
+        };
+        self.with_layout(area.width, |layout| {
+            for (screen_row, row) in layout
+                .rows
+                .iter()
+                .skip(first_row)
+                .take(usize::from(area.height))
+                .enumerate()
+            {
+                let row_area = Rect::new(
+                    area.x,
+                    area.y.saturating_add(saturating_u16(screen_row)),
+                    area.width,
+                    1,
+                );
+                for column in 0..area.width {
+                    buffer[(area.x.saturating_add(column), row_area.y)].reset();
+                }
+                let mut column = 0_u16;
+                for grapheme in UnicodeSegmentation::graphemes(row.as_str(), true) {
+                    if column >= area.width {
+                        break;
+                    }
+                    let symbol_width = saturating_u16(UnicodeWidthStr::width(grapheme));
+                    if symbol_width == 0 {
+                        continue;
+                    }
+                    buffer[(area.x.saturating_add(column), row_area.y)]
+                        .set_symbol(grapheme)
+                        .set_style(style);
+                    column = column.saturating_add(symbol_width);
+                }
+            }
+        });
+    }
+
+    fn with_layout<R>(&self, width: u16, read: impl FnOnce(&StreamingLineLayout) -> R) -> R {
+        let mut cached = self
+            .cached_layout
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if cached.as_ref().is_none_or(|layout| layout.width != width) {
+            *cached = None;
+        }
+        let layout = cached.get_or_insert_with(|| StreamingLineLayout {
+            width,
+            rows: wrap_line(&self.content, width),
+        });
+        read(layout)
+    }
+}
+
+/// Cacheable single-style equivalent of Ratatui 0.29's `WordWrapper` with `trim: false`.
+///
+/// Ratatui's wrapper is private and `Paragraph::scroll` replays the full logical line before
+/// reaching a tail viewport. Keeping the wrapped rows lets streaming frames touch only visible
+/// rows; the parity test below protects whitespace, grapheme, and wide-symbol behavior.
+fn wrap_line(content: &str, width: u16) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let max_width = usize::from(width);
+    let mut wrapped = Vec::<Vec<&str>>::new();
+    let mut pending_line = Vec::<&str>::new();
+    let mut pending_word = Vec::<&str>::new();
+    let mut pending_whitespace = VecDeque::<&str>::new();
+    let mut line_width = 0_usize;
+    let mut word_width = 0_usize;
+    let mut whitespace_width = 0_usize;
+    let mut non_whitespace_previous = false;
+
+    for grapheme in UnicodeSegmentation::graphemes(content, true) {
+        let is_whitespace = grapheme == "\u{200b}"
+            || (grapheme.chars().all(char::is_whitespace) && grapheme != "\u{00a0}");
+        let symbol_width = UnicodeWidthStr::width(grapheme);
+        if symbol_width > max_width {
+            continue;
+        }
+
+        let word_found = non_whitespace_previous && is_whitespace;
+        let untrimmed_overflow = pending_line.is_empty()
+            && word_width
+                .saturating_add(whitespace_width)
+                .saturating_add(symbol_width)
+                > max_width;
+        if word_found || untrimmed_overflow {
+            pending_line.extend(pending_whitespace.drain(..));
+            line_width = line_width.saturating_add(whitespace_width);
+            pending_line.append(&mut pending_word);
+            line_width = line_width.saturating_add(word_width);
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= max_width;
+        let pending_word_overflow = symbol_width > 0
+            && line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                >= max_width;
+        if line_full || pending_word_overflow {
+            let mut remaining_width = max_width.saturating_sub(line_width);
+            wrapped.push(mem::take(&mut pending_line));
+            line_width = 0;
+
+            while let Some(whitespace) = pending_whitespace.front() {
+                let whitespace_symbol_width = UnicodeWidthStr::width(*whitespace);
+                if whitespace_symbol_width > remaining_width {
+                    break;
+                }
+                whitespace_width = whitespace_width.saturating_sub(whitespace_symbol_width);
+                remaining_width = remaining_width.saturating_sub(whitespace_symbol_width);
+                let _ = pending_whitespace.pop_front();
+            }
+            if is_whitespace && pending_whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width = whitespace_width.saturating_add(symbol_width);
+            pending_whitespace.push_back(grapheme);
+        } else {
+            word_width = word_width.saturating_add(symbol_width);
+            pending_word.push(grapheme);
+        }
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    if pending_line.is_empty() && pending_word.is_empty() && !pending_whitespace.is_empty() {
+        wrapped.push(Vec::new());
+    }
+    pending_line.extend(pending_whitespace.drain(..));
+    pending_line.append(&mut pending_word);
+    if !pending_line.is_empty() {
+        wrapped.push(pending_line);
+    }
+    if wrapped.is_empty() {
+        wrapped.push(Vec::new());
+    }
+    wrapped
+        .into_iter()
+        .map(|line| line.concat())
+        .collect::<Vec<_>>()
+}
+
+fn encode_height(width: u16, height: usize) -> u64 {
+    (u64::from(width) << 48)
+        | u64::try_from(height)
+            .unwrap_or((1_u64 << 48) - 1)
+            .min((1_u64 << 48) - 1)
 }
 
 fn message_text(title: &'static str, title_style: Style, message: &str) -> Text<'static> {
@@ -787,10 +1260,19 @@ fn saturating_u16(value: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use ratatui::{
-        Terminal, backend::TestBackend, buffer::Buffer, layout::Rect, style::Color, widgets::Widget,
+        Terminal,
+        backend::TestBackend,
+        buffer::Buffer,
+        layout::Rect,
+        style::{Color, Style},
+        text::Line,
+        widgets::{Paragraph, Widget, Wrap},
     };
 
-    use super::{InlineEdit, ToolStatus, Transcript, TranscriptItem, saturating_u16, tool_style};
+    use super::{
+        InlineEdit, StreamingLine, ToolStatus, Transcript, TranscriptItem, saturating_u16,
+        tool_style,
+    };
 
     #[test]
     fn cancelled_tools_have_a_distinct_neutral_terminal_style() {
@@ -820,6 +1302,66 @@ mod tests {
                 "\"                    \"\n",
             )
         );
+    }
+
+    #[test]
+    fn reasoning_deltas_stream_as_a_dim_inline_block() {
+        let mut transcript = Transcript::default();
+        transcript.push(TranscriptItem::Reasoning("Inspecting".to_owned()));
+        assert!(transcript.append_reasoning_delta(" the request\nand tools"));
+
+        let area = Rect::new(0, 0, 30, 4);
+        let mut buffer = Buffer::empty(area);
+        transcript
+            .widget(0, None, None, "empty")
+            .render(area, &mut buffer);
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "•");
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), " ");
+        assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), "a");
+        assert!(
+            buffer
+                .cell((0, 0))
+                .unwrap()
+                .modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        assert!(
+            buffer
+                .cell((2, 0))
+                .unwrap()
+                .modifier
+                .contains(ratatui::style::Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn cached_assistant_line_wrapping_matches_ratatui() {
+        let cases = [
+            "",
+            "a long unbroken_identifier_that_wraps",
+            "words   with mixed\twhitespace",
+            "界🦀 unicode graphemes e\u{301}",
+            "zero\u{200b}width and non\u{00a0}breaking",
+        ];
+        for content in cases {
+            for width in [1, 3, 8, 20] {
+                let line =
+                    StreamingLine::new(content.to_owned(), Style::default().fg(Color::White));
+                let height = saturating_u16(line.height(width));
+                let area = Rect::new(0, 0, width, height);
+                let mut actual = Buffer::empty(area);
+                line.render_rows(area, &mut actual, 0, false);
+                let mut expected = Buffer::empty(area);
+                Paragraph::new(Line::styled(content, Style::default().fg(Color::White)))
+                    .wrap(Wrap { trim: false })
+                    .render(area, &mut expected);
+                assert_eq!(
+                    actual, expected,
+                    "wrapping differs for {content:?} at {width}"
+                );
+            }
+        }
     }
 
     #[test]

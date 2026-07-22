@@ -449,6 +449,10 @@ struct ClientMetadata<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{ContentItem, MessageRole, Thinking};
+    use serde_json::json;
+
     #[test]
     fn prompt_cache_key_is_stable_across_the_session() {
         let config = ModelConfig {

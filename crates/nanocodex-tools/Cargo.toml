@@ -33,16 +33,12 @@ reqwest.workspace = true
 rquickjs.workspace = true
 schemars.workspace = true
 sha1.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
-xxhash-rust.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-rustix.workspace = true
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 js-sys.workspace = true
 wasm-bindgen.workspace = true

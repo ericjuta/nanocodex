@@ -684,47 +684,14 @@ text("done");
 }
 
 #[tokio::test]
-async fn hashline_family_round_trips_through_code_mode() -> Result<()> {
-    let workspace = temporary_workspace("hashline-family")?;
-    std::fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")?;
-    std::fs::write(workspace.join("delete.txt"), "delete me\n")?;
-    std::fs::write(workspace.join("move.txt"), "move me\n")?;
+async fn freeform_apply_patch_accepts_a_string() -> Result<()> {
+    let workspace = temporary_workspace("freeform-apply-patch")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
         .execute_code(
             r#"
-const initial = await tools.hashline__read({path: "notes.txt"});
-const betaHash = initial.content.split("\n")[1].split(":")[1].split("|")[0];
-await tools.hashline__patch({
-  header: initial.patchHeader,
-  operations: `SWAP 2:${betaHash}:\n+bravo`
-});
-const observed = await tools.hashline__read({path: "notes.txt"});
-const deleted = await tools.hashline__read({path: "delete.txt"});
-const moved = await tools.hashline__read({path: "move.txt"});
-const mutations = [
-  {
-    type: "update",
-    path: "notes.txt",
-    expected: {exactDigest: observed.exactDigest},
-    edits: [{type: "replaceAll", contents: "final\n"}]
-  },
-  {type: "create", path: "created.txt", contents: "created\n"},
-  {type: "delete", path: "delete.txt", expected: {exactDigest: deleted.exactDigest}},
-  {
-    type: "move",
-    source: "move.txt",
-    destination: "moved.txt",
-    expected: {exactDigest: moved.exactDigest},
-    edits: [{type: "replaceAll", contents: "moved\n"}]
-  }
-];
-const preview = await tools.hashline__transaction({action: {type: "preview"}, mutations});
-await tools.hashline__transaction({
-  action: {type: "commitPreviewed", expectedPlanDigest: preview.planDigest},
-  mutations
-});
+await tools.apply_patch("*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch");
 text("done");
 "#,
             test_context(&history),
@@ -732,53 +699,22 @@ text("done");
         .await;
 
     assert!(execution.success, "{}", execution_output(&execution));
-    assert_eq!(execution.nested_calls.len(), 7);
+    assert_eq!(execution.nested_calls.len(), 1);
     assert_eq!(
-        execution
-            .nested_calls
-            .iter()
-            .map(|call| call.name.as_str())
-            .collect::<Vec<_>>(),
-        vec![
-            "hashline__read",
-            "hashline__patch",
-            "hashline__read",
-            "hashline__read",
-            "hashline__read",
-            "hashline__transaction",
-            "hashline__transaction"
-        ]
-    );
-    assert_eq!(
-        std::fs::read_to_string(workspace.join("notes.txt"))?,
-        "final\n"
+        execution.nested_calls[0].input,
+        Value::String(
+            "*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch"
+                .to_owned()
+        )
     );
     assert_eq!(
         std::fs::read_to_string(workspace.join("created.txt"))?,
-        "created\n"
-    );
-    assert!(!workspace.join("delete.txt").exists());
-    assert!(!workspace.join("move.txt").exists());
-    assert_eq!(
-        std::fs::read_to_string(workspace.join("moved.txt"))?,
-        "moved\n"
-    );
-    let receipts = std::fs::read_dir(workspace.join(".nanocodex/hashline-transactions"))?
-        .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(receipts.len(), 2);
-    assert!(
-        receipts
-            .iter()
-            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-    );
-    assert!(
-        receipts
-            .iter()
-            .any(|entry| entry.path().extension().is_some_and(|ext| ext == "reserve"))
+        "created by patch\n"
     );
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
+
 #[tokio::test]
 async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
     let workspace = temporary_workspace("code-output-limits")?;
@@ -954,24 +890,7 @@ fn model_description_uses_codex_style_declarations() {
         .expect("exec should have a description");
     assert!(description.contains("// @exec:"));
     assert!(description.contains("must be a base64-encoded `data:` URL"));
-    assert!(description.contains("hashline__read(args: {"));
-    assert!(description.contains("hashline__find_block(args: {"));
-    assert!(description.contains("hashline__patch(args: {"));
-    assert!(description.contains("hashline__transaction(args: {"));
-    for required in [
-        "workspace-relative",
-        "patchHeader",
-        "header",
-        "operations",
-        "identical mutations",
-        "expectedPlanDigest",
-    ] {
-        assert!(
-            description.contains(required),
-            "model-visible declaration should preserve {required}"
-        );
-    }
-    assert!(!description.contains("apply_patch"));
+    assert!(description.contains("apply_patch(input: string): Promise<unknown>"));
     assert!(description.contains("exec_command(args: {"));
     assert!(!description.contains("Input schema:"));
     assert_eq!(

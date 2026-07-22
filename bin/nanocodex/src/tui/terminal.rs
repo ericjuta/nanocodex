@@ -15,7 +15,7 @@ use crossterm::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
-    execute,
+    execute, queue,
     terminal::{
         BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
         disable_raw_mode, enable_raw_mode,
@@ -36,14 +36,14 @@ pub(super) struct DrawMetrics {
     pub output_bytes: u64,
 }
 
-struct ByteCountingWriter<W> {
-    inner: W,
-    bytes: Rc<CounterCell<u64>>,
+pub(super) struct ByteCountingWriter<W> {
+    pub(super) inner: W,
+    pub(super) bytes: Rc<CounterCell<u64>>,
 }
 
-struct MeasuredBackend<B> {
-    inner: B,
-    changed_cells: u64,
+pub(super) struct MeasuredBackend<B> {
+    pub(super) inner: B,
+    pub(super) changed_cells: u64,
 }
 
 pub(super) struct TerminalSession {
@@ -87,11 +87,13 @@ impl<B: Backend> Backend for MeasuredBackend<B> {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        let content = content.collect::<Vec<_>>();
-        self.changed_cells = self
-            .changed_cells
-            .saturating_add(content.len().try_into().unwrap_or(u64::MAX));
-        self.inner.draw(content.into_iter())
+        let mut changed_cells = 0_u64;
+        let content = content.inspect(|_| {
+            changed_cells = changed_cells.saturating_add(1);
+        });
+        let result = self.inner.draw(content);
+        self.changed_cells = self.changed_cells.saturating_add(changed_cells);
+        result
     }
 
     fn append_lines(&mut self, n: u16) -> io::Result<()> {
@@ -259,7 +261,7 @@ fn activate_commands(output: &mut impl io::Write) -> io::Result<()> {
 }
 
 fn begin_synchronized_update(output: &mut impl Write) -> io::Result<()> {
-    execute!(output, BeginSynchronizedUpdate)
+    queue!(output, BeginSynchronizedUpdate)
 }
 
 fn end_synchronized_update(output: &mut impl Write) -> io::Result<()> {

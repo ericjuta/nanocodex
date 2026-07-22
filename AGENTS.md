@@ -35,15 +35,6 @@
 - Preserve unrelated work. Never commit `.env`, caches, retained jobs, build
   output, or another user's untracked files.
 
-## File editing
-
-- For every manual file edit, use `hashline__read`, copy the 8-character file
-  hash directly from its `header` field, construct the `hashline__patch`, and
-  run it with `dry_run: true` before applying the identical patch.
-- Never attempt `apply_patch`, shell redirection, or another editor first.
-- After applying the patch, re-read the changed range or inspect the Git diff
-  before testing and committing.
-
 ## Codex reference
 
 - Use the local checkout at `../codex/codex-rs` before making an
