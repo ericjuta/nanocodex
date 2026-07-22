@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tower::Service;
 use tracing::{Instrument, error, info, info_span};
 
+use crate::prompt_cache::{ModelPromptCache, SharedPromptCache};
 use crate::{
     NanocodexError, Result,
     model::agent::{CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome},
@@ -283,8 +284,9 @@ impl Nanocodex {
             tools: ToolsConfiguration::Shared(Tools::default()),
             workspace: None,
             session_id: None,
-            responses: Responses::default(),
+            prompt_cache: PromptCacheConfig::default(),
             rollout: None,
+            responses: Responses::default(),
         }
     }
 
@@ -440,8 +442,15 @@ pub struct NanocodexBuilder<S = StandardResponses> {
     tools: ToolsConfiguration,
     workspace: Option<PathBuf>,
     session_id: Option<String>,
-    responses: Responses<S>,
+    prompt_cache: PromptCacheConfig,
     rollout: Option<RolloutConfig>,
+    responses: Responses<S>,
+}
+
+#[derive(Clone, Default)]
+struct PromptCacheConfig {
+    key: Option<String>,
+    shared: Option<SharedPromptCache>,
 }
 
 impl<S> NanocodexBuilder<S> {
@@ -488,10 +497,36 @@ impl<S> NanocodexBuilder<S> {
         self
     }
 
-    /// Sets the root session ID and stable prompt-cache lineage inherited by forks.
+    /// Sets the root session ID and checkpoint lineage inherited by forks.
     #[must_use]
     pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Sets a stable cache identity for the immutable request prefix.
+    ///
+    /// Independent agents may share this key without sharing their session,
+    /// conversation, response chain, tools, or workspace. When omitted, each
+    /// clean agent uses its own session lineage as before; forks inherit their
+    /// parent's cache identity.
+    #[must_use]
+    pub fn prompt_cache_key(mut self, prompt_cache_key: impl Into<String>) -> Self {
+        self.prompt_cache.key = Some(prompt_cache_key.into());
+        self
+    }
+
+    /// Shares completed immutable-prefix warmups among builders cloned from
+    /// this recipe.
+    ///
+    /// The first agent primes the provider cache. Other agents skip the
+    /// redundant warmup and send their first complete generation with the same
+    /// prefix cache key. Every clean agent still owns an independent session,
+    /// conversation, response chain, service stack, tool runtime, event stream,
+    /// and workspace. Entries are fingerprinted from the exact prefix and key.
+    #[must_use]
+    pub fn shared_prompt_cache(mut self) -> Self {
+        self.prompt_cache.shared = Some(SharedPromptCache::default());
         self
     }
 
@@ -510,8 +545,9 @@ impl<S> NanocodexBuilder<S> {
             tools: self.tools,
             workspace: self.workspace,
             session_id: self.session_id,
-            responses,
+            prompt_cache: self.prompt_cache,
             rollout: self.rollout,
+            responses,
         }
     }
 }
@@ -529,6 +565,7 @@ impl NanocodexBuilder<StandardResponses> {
         validate(
             &self.config,
             self.session_id.as_deref(),
+            self.prompt_cache.key.as_deref(),
             self.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
@@ -541,6 +578,7 @@ impl NanocodexBuilder<StandardResponses> {
             self.tools,
             self.workspace,
             self.session_id,
+            self.prompt_cache,
             self.rollout,
             service_factory,
         )
@@ -567,6 +605,7 @@ where
         validate(
             &self.config,
             self.session_id.as_deref(),
+            self.prompt_cache.key.as_deref(),
             self.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
@@ -584,6 +623,7 @@ where
             self.tools,
             self.workspace,
             self.session_id,
+            self.prompt_cache,
             self.rollout,
             service_factory,
         )
@@ -610,6 +650,7 @@ where
         validate(
             &self.config,
             self.session_id.as_deref(),
+            self.prompt_cache.key.as_deref(),
             self.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
@@ -619,6 +660,7 @@ where
             self.tools,
             self.workspace,
             self.session_id,
+            self.prompt_cache,
             self.rollout,
             service_factory,
         )
@@ -643,9 +685,11 @@ struct BranchSpawner<S> {
     config: Arc<ModelConfig>,
     tools: ToolsConfiguration,
     lineage_id: Arc<str>,
+    prompt_cache_key: Option<Arc<str>>,
+    shared_prompt_cache: Option<SharedPromptCache>,
     depth: u32,
-    service_factory: ServiceFactory<S>,
     rollout: Option<RolloutConfig>,
+    service_factory: ServiceFactory<S>,
 }
 
 #[derive(Clone)]
@@ -661,9 +705,11 @@ impl<S> Clone for BranchSpawner<S> {
             config: Arc::clone(&self.config),
             tools: self.tools.clone(),
             lineage_id: Arc::clone(&self.lineage_id),
+            prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
+            shared_prompt_cache: self.shared_prompt_cache.clone(),
             depth: self.depth,
-            service_factory: Arc::clone(&self.service_factory),
             rollout: self.rollout.clone(),
+            service_factory: Arc::clone(&self.service_factory),
         }
     }
 }
@@ -691,6 +737,13 @@ where
                 model: checkpoint.clone(),
             })
         });
+        let prompt_cache_key = self
+            .spawner
+            .prompt_cache_key
+            .as_ref()
+            .map_or_else(|| Arc::clone(&self.spawner.lineage_id), Arc::clone);
+        let prompt_cache =
+            ModelPromptCache::new(prompt_cache_key, self.spawner.shared_prompt_cache.clone());
         let mut model = if let Some(checkpoint) = self.initial_checkpoint.take() {
             ModelRun::from_checkpoint(
                 self.events.clone(),
@@ -698,7 +751,7 @@ where
                 self.client,
                 Arc::clone(&self.transport_stats),
                 self.tools.clone(),
-                Arc::clone(&self.spawner.lineage_id),
+                prompt_cache.clone(),
                 checkpoint,
             )
         } else {
@@ -708,7 +761,7 @@ where
                 self.client,
                 Arc::clone(&self.transport_stats),
                 self.tools.clone(),
-                Arc::clone(&self.spawner.lineage_id),
+                prompt_cache.clone(),
             )
         };
         let mut turn_index = 0_u64;
@@ -956,7 +1009,7 @@ where
                         ResponsesClient::new((self.spawner.service_factory)()),
                         Arc::clone(&self.transport_stats),
                         self.tools.clone(),
-                        Arc::clone(&self.spawner.lineage_id),
+                        prompt_cache.clone(),
                         checkpoint.model.clone(),
                     );
                     (Err(NanocodexError::TurnCancelled), true)
@@ -1148,9 +1201,11 @@ where
             config: Arc::clone(&self.config),
             tools: self.tools.clone(),
             lineage_id: Arc::from(session_id.as_str()),
+            prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
+            shared_prompt_cache: self.shared_prompt_cache.clone(),
             depth,
-            service_factory: Arc::clone(&self.service_factory),
             rollout: self.rollout.clone(),
+            service_factory: Arc::clone(&self.service_factory),
         };
         let service = (self.service_factory)();
         spawn_agent_driver(
@@ -1173,6 +1228,7 @@ fn build_agent<S>(
     tools: ToolsConfiguration,
     workspace: Option<PathBuf>,
     session_id: Option<String>,
+    prompt_cache: PromptCacheConfig,
     rollout: Option<RolloutConfig>,
     service_factory: ServiceFactory<S>,
 ) -> Result<(Nanocodex, AgentEvents)>
@@ -1183,6 +1239,7 @@ where
 {
     let session_id = session_id.unwrap_or_else(new_session_id);
     let lineage_id = Arc::<str>::from(session_id.as_str());
+    let PromptCacheConfig { key, shared } = prompt_cache;
     let workspace = workspace
         .map(|path| {
             path.into_os_string()
@@ -1199,9 +1256,11 @@ where
             config,
             tools,
             lineage_id,
+            prompt_cache_key: key.map(Arc::from),
+            shared_prompt_cache: shared,
             depth: 0,
-            service_factory,
             rollout,
+            service_factory,
         },
         session_id,
         workspace,
@@ -1308,6 +1367,7 @@ fn configure<S>(config: &mut ModelConfig, responses: &Responses<S>) {
 fn validate(
     config: &ModelConfig,
     session_id: Option<&str>,
+    prompt_cache_key: Option<&str>,
     rollout: Option<&RolloutConfig>,
 ) -> Result<()> {
     config
@@ -1327,6 +1387,11 @@ fn validate(
     if session_id.is_some_and(|session_id| session_id.trim().is_empty()) {
         return Err(NanocodexError::InvalidRequest(
             "session_id must not be empty".to_owned(),
+        ));
+    }
+    if prompt_cache_key.is_some_and(|prompt_cache_key| prompt_cache_key.trim().is_empty()) {
+        return Err(NanocodexError::InvalidRequest(
+            "prompt_cache_key must not be empty".to_owned(),
         ));
     }
     if rollout.is_some()
@@ -1512,6 +1577,20 @@ mod tests {
             panic!("non-UUID rollout session unexpectedly built");
         };
         assert!(error.to_string().contains("must be a UUID"));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_empty_prompt_cache_key() {
+        let responses = Responses::builder().service(|| NeverCalled).build();
+        let outcome = Nanocodex::builder("test")
+            .prompt_cache_key("  ")
+            .responses(responses)
+            .build();
+
+        let Err(error) = outcome else {
+            panic!("empty prompt cache key unexpectedly built");
+        };
+        assert!(error.to_string().contains("prompt_cache_key"));
     }
 
     #[tokio::test]

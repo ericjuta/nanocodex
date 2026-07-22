@@ -38,6 +38,9 @@ pub enum NanocodexError {
     #[error("invalid Responses attempt state: {detail}")]
     InvalidAttemptState { detail: &'static str },
 
+    #[error("failed to fingerprint the immutable prompt prefix: {0}")]
+    SerializePromptPrefix(#[source] serde_json::Error),
+
     #[error("the agent stopped before accepting the command")]
     AgentStopped,
 

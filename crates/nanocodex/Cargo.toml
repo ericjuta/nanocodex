@@ -23,6 +23,7 @@ nanocodex-service.workspace = true
 nanocodex-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "sync"] }
 tower.workspace = true
@@ -40,7 +41,6 @@ nanocodex-macros.workspace = true
 nanocodex-mcp.workspace = true
 schemars.workspace = true
 sha1.workspace = true
-sha2.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 url.workspace = true

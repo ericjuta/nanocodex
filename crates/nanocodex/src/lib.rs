@@ -6,6 +6,7 @@ mod agent;
 mod auth;
 mod error;
 mod model;
+mod prompt_cache;
 #[cfg(not(target_family = "wasm"))]
 mod responses;
 #[cfg(not(target_family = "wasm"))]
