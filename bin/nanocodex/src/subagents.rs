@@ -435,6 +435,9 @@ impl ChildAgents {
             state: Arc::clone(&self.state),
             cleanup_tx: self.cleanup_tx.clone(),
             cleanup_progress: Arc::clone(&self.cleanup_progress),
+            cleanup_failures: Arc::clone(&self.cleanup_failures),
+            #[cfg(test)]
+            test_barriers: Arc::clone(&self.test_barriers),
         })
     }
 
@@ -455,7 +458,11 @@ impl ChildAgents {
                     ));
                 };
                 let failures = Arc::clone(&self.cleanup_failures);
+                #[cfg(test)]
+                let barriers = Arc::clone(&self.test_barriers);
                 let task = tokio::spawn(async move {
+                    #[cfg(test)]
+                    pause_test_barrier(&barriers, TestBarrierPoint::SessionDrain).await;
                     let result = session.drain_owned().await;
                     publish_drain_receipt(result, complete, &failures);
                 });
@@ -569,21 +576,28 @@ impl ChildAgents {
     }
 
     async fn wait_for_owned_work(&self) -> Result<(), io::Error> {
+        let mut worker_alive = true;
+        let mut barrier_error = None;
         loop {
-            self.cleanup_barrier().await?;
+            if worker_alive && let Err(error) = self.cleanup_barrier().await {
+                worker_alive = false;
+                barrier_error = Some(error);
+            }
             let progress = self.cleanup_progress.notified();
             let empty = {
                 let state = self.state()?;
-                state.invocations.is_empty()
-                    && state.pending_creations == 0
+                state.pending_creations == 0
                     && state.pending_session_handoffs == 0
+                    && state.invocations.is_empty()
             };
             if empty {
-                break;
+                return match barrier_error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                };
             }
             progress.await;
         }
-        Ok(())
     }
 
     async fn drain_shutdown_sessions(
@@ -592,6 +606,7 @@ impl ChildAgents {
     ) -> Result<(), io::Error> {
         let sessions = {
             let mut state = self.state()?;
+            state.invocations.clear();
             state.waits.clear();
             std::mem::take(&mut state.agents)
         };
@@ -883,6 +898,9 @@ struct InvocationGuard {
     state: Arc<Mutex<RegistryState>>,
     cleanup_tx: tokio::sync::mpsc::UnboundedSender<CleanupRequest>,
     cleanup_progress: Arc<tokio::sync::Notify>,
+    cleanup_failures: Arc<Mutex<Vec<StoredIoError>>>,
+    #[cfg(test)]
+    test_barriers: Arc<TestBarriers>,
 }
 
 struct CreationGuard {
@@ -976,8 +994,38 @@ impl InvocationGuard {
 
 impl Drop for InvocationGuard {
     fn drop(&mut self) {
-        if let Some(request) = self.request.take() {
-            drop(self.cleanup_tx.send(CleanupRequest::Invocation(request)));
+        let Some(request) = self.request.take() else {
+            return;
+        };
+        let Err(error) = self.cleanup_tx.send(CleanupRequest::Invocation(request)) else {
+            return;
+        };
+        let CleanupRequest::Invocation(request) = error.0 else {
+            return;
+        };
+        let cleanup_state = Arc::clone(&self.state);
+        let cleanup_failures = Arc::clone(&self.cleanup_failures);
+        let cleanup_progress = Arc::clone(&self.cleanup_progress);
+        #[cfg(test)]
+        let test_barriers = Arc::clone(&self.test_barriers);
+        match lock_registry(&self.state) {
+            Ok(mut state) => {
+                state.pending_session_handoffs += 1;
+                let task = tokio::spawn(async move {
+                    #[cfg(test)]
+                    pause_test_barrier(&test_barriers, TestBarrierPoint::CleanupInvocation).await;
+                    let failures = cleanup_dropped_invocation(&cleanup_state, request).await;
+                    record_cleanup_failures(&cleanup_failures, failures);
+                    cleanup_progress.notify_waiters();
+                });
+                state.fallback_session_drains.push(task);
+                state.pending_session_handoffs = state.pending_session_handoffs.saturating_sub(1);
+                drop(state);
+                self.cleanup_progress.notify_waiters();
+            }
+            Err(error) => {
+                record_cleanup_failures(&self.cleanup_failures, [StoredIoError::from_error(error)]);
+            }
         }
     }
 }
@@ -2304,6 +2352,142 @@ mod tests {
                 .map_err(|_| eyre!("cleanup task mutex poisoned"))?
                 .is_none()
         );
+        drop(harness.root);
+        drop(harness.root_events);
+        harness.tracker.wait_connections(0).await?;
+        harness.server.stop().await
+    }
+
+    #[tokio::test]
+    async fn dead_cleanup_worker_waits_for_paused_creation_and_fallback_drain() -> Result<()> {
+        let harness = Harness::new().await?;
+        let (creation_reached, release_creation) =
+            harness.agents.install_barrier(TestBarrierPoint::Creation);
+        let creation = harness.spawn_call("NORMAL_DEAD_CLEANUP_WORKER");
+        timeout(TEST_TIMEOUT, creation_reached)
+            .await
+            .map_err(|_| eyre!("child creation did not pause"))??;
+
+        harness.agents.inject_cleanup_worker_panic();
+        let barrier_error = harness
+            .agents
+            .cleanup_barrier()
+            .await
+            .expect_err("cleanup worker panic did not drop its barrier");
+        assert!(
+            barrier_error
+                .to_string()
+                .contains("dropped its drain barrier")
+        );
+
+        let (drain_reached, release_drain) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::SessionDrain);
+        let shutdown = shutdown_call(&harness.agents);
+        wait_for_registry(&harness.agents, |state| !state.admitting).await?;
+        {
+            let state = harness.agents.state()?;
+            assert_eq!(state.pending_creations, 1);
+            assert!(state.invocations.is_empty());
+            assert!(state.waits.is_empty());
+        }
+        let _ = release_creation.send(());
+        timeout(TEST_TIMEOUT, drain_reached)
+            .await
+            .map_err(|_| eyre!("rejected child did not enter fallback drain"))??;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown published before fallback drain completed"
+        );
+        {
+            let state = harness.agents.state()?;
+            assert_eq!(state.pending_creations, 1);
+            assert_eq!(state.fallback_session_drains.len(), 1);
+        }
+
+        let _ = release_drain.send(());
+        let rejected = timeout(TEST_TIMEOUT, creation)
+            .await
+            .map_err(|_| eyre!("rejected creation did not finish"))??;
+        assert!(rejected.is_err());
+        let first = timeout(TEST_TIMEOUT, shutdown)
+            .await
+            .map_err(|_| eyre!("shutdown hung after fallback drain"))??
+            .expect_err("dead cleanup worker shutdown unexpectedly succeeded");
+        let second = timeout(TEST_TIMEOUT, harness.agents.shutdown())
+            .await
+            .map_err(|_| eyre!("cached dead-worker shutdown result hung"))?
+            .expect_err("cached dead-worker shutdown unexpectedly succeeded");
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(first.to_string().contains("drain barrier"));
+        assert!(first.to_string().contains("cleanup worker failed"));
+        assert_shutdown_drained(&harness).await?;
+
+        drop(harness.root);
+        drop(harness.root_events);
+        harness.tracker.wait_connections(0).await?;
+        harness.server.stop().await
+    }
+
+    #[tokio::test]
+    async fn dead_cleanup_worker_tracks_dropped_active_invocation_fallback() -> Result<()> {
+        let harness = Harness::new().await?;
+        let (control_reached, _release_control) =
+            harness.agents.install_barrier(TestBarrierPoint::Control);
+        let invocation = harness.spawn_call("BLOCK_ACTIVE_FALLBACK");
+        timeout(TEST_TIMEOUT, control_reached)
+            .await
+            .map_err(|_| eyre!("active invocation did not attach its control"))??;
+
+        harness.agents.inject_cleanup_worker_panic();
+        let barrier_error = harness
+            .agents
+            .cleanup_barrier()
+            .await
+            .expect_err("cleanup worker panic did not drop its barrier");
+        assert!(
+            barrier_error
+                .to_string()
+                .contains("dropped its drain barrier")
+        );
+        let (cleanup_reached, release_cleanup) = harness
+            .agents
+            .install_barrier(TestBarrierPoint::CleanupInvocation);
+        let shutdown = shutdown_call(&harness.agents);
+        wait_for_registry(&harness.agents, |state| !state.admitting).await?;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown published before the live invocation owner dropped"
+        );
+        abort_invocation(invocation).await?;
+        timeout(TEST_TIMEOUT, cleanup_reached)
+            .await
+            .map_err(|_| eyre!("fallback invocation cleanup did not start"))??;
+
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown detached fallback invocation cleanup"
+        );
+        {
+            let state = harness.agents.state()?;
+            assert!(!state.fallback_session_drains.is_empty());
+        }
+        let _ = release_cleanup.send(());
+        let first = timeout(TEST_TIMEOUT, shutdown)
+            .await
+            .map_err(|_| eyre!("shutdown hung on fallback invocation cleanup"))??
+            .expect_err("dead cleanup worker shutdown unexpectedly succeeded");
+        let second = timeout(TEST_TIMEOUT, harness.agents.shutdown())
+            .await
+            .map_err(|_| eyre!("cached fallback invocation shutdown result hung"))?
+            .expect_err("cached fallback invocation shutdown unexpectedly succeeded");
+        assert_eq!(first.kind(), second.kind());
+        assert_eq!(first.to_string(), second.to_string());
+        assert!(first.to_string().contains("drain barrier"));
+        assert!(first.to_string().contains("cleanup worker failed"));
+        assert_shutdown_drained(&harness).await?;
+
         drop(harness.root);
         drop(harness.root_events);
         harness.tracker.wait_connections(0).await?;
