@@ -255,15 +255,17 @@ impl ResponsesService {
         connection: &ConnectionState,
         request: &ResponsesAttempt,
     ) -> Result<EncodedRequest, ResponsesServiceError> {
+        let mut config = self.config.as_ref().clone();
+        config.thinking = request.thinking();
         let encoded = match request.kind {
             ResponsesAttemptKind::Warmup => EncodedRequest::new(&ResponseCreate::warmup(
-                &self.config,
+                &config,
                 &request.profile,
                 connection.turn_state.as_deref(),
             )),
             ResponsesAttemptKind::Generation | ResponsesAttemptKind::Compaction => {
                 EncodedRequest::new(&ResponseCreate::generation(
-                    &self.config,
+                    &config,
                     request.input(),
                     request.previous_response_id(),
                     &request.profile,

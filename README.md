@@ -183,6 +183,17 @@ let (agent, _events) = Nanocodex::builder(api_key)
 The CLI equivalents are `--reasoning-mode pro --thinking xhigh`, with matching
 `OPENAI_REASONING_MODE` and `OPENAI_REASONING_EFFORT` environment variables.
 
+The effort can also change without rebuilding the session:
+
+```rust
+agent.set_thinking(Thinking::High).await?;
+```
+
+An in-flight model request keeps its original effort. Prompts already accepted
+ahead of the update also keep their effort; subsequent prompts and newly created
+forks or clean children use the new value. In the TUI, use `/thinking high`
+(or `none`, `low`, `medium`, `xhigh`, or `max`).
+
 Independent agents that use the same immutable instructions and tool definitions
 may deliberately share only their provider-side prompt cache while retaining
 separate conversations, response chains, tools, and workspaces:

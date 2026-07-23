@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- [agent/tui] Allow reasoning effort to change mid-session through
+  `Nanocodex::set_thinking(...)` and `/thinking <effort>` while preserving
+  in-flight, queued-prompt, fork, and retry ordering.
 - [tools] Allow Hashline reads and patches to use absolute or parent-relative
   paths and transactions to select roots outside the configured workspace.
 - [tools] Expose the complete Hashline patch grammar and read continuation,

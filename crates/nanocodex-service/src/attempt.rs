@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use nanocodex_core::{
-    AgentEventKind, EventError, EventSink, ResponseItem,
+    AgentEventKind, EventError, EventSink, ResponseItem, Thinking,
     responses::{RequestProfile, ResponseHistory, ResponsesInput, WarmupResponse},
 };
 use serde::Serialize;
@@ -129,6 +129,7 @@ pub struct ResponsesAttempt {
     incremental_start: usize,
     tail: Option<ResponseItem>,
     previous_response_id: Option<String>,
+    thinking: Thinking,
     pub(crate) profile: Arc<RequestProfile>,
     pub(crate) observer: ResponsesObserver,
     pub(crate) attempt: u32,
@@ -137,7 +138,11 @@ pub struct ResponsesAttempt {
 }
 
 impl ResponsesAttempt {
-    fn warmup(profile: Arc<RequestProfile>, observer: ResponsesObserver) -> Self {
+    fn warmup(
+        profile: Arc<RequestProfile>,
+        thinking: Thinking,
+        observer: ResponsesObserver,
+    ) -> Self {
         Self {
             kind: ResponsesAttemptKind::Warmup,
             call_index: None,
@@ -146,6 +151,7 @@ impl ResponsesAttempt {
             incremental_start: 0,
             tail: None,
             previous_response_id: None,
+            thinking,
             profile,
             observer,
             attempt: 1,
@@ -154,6 +160,7 @@ impl ResponsesAttempt {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generation(
         call_index: u32,
         full_history: ResponseHistory,
@@ -161,6 +168,7 @@ impl ResponsesAttempt {
         incremental_start: usize,
         previous_response_id: Option<&str>,
         profile: Arc<RequestProfile>,
+        thinking: Thinking,
         observer: ResponsesObserver,
     ) -> Self {
         Self {
@@ -171,6 +179,7 @@ impl ResponsesAttempt {
             incremental_start,
             tail: None,
             previous_response_id: previous_response_id.map(str::to_owned),
+            thinking,
             profile,
             observer,
             attempt: 1,
@@ -188,6 +197,7 @@ impl ResponsesAttempt {
         previous_response_id: &str,
         trigger: ResponseItem,
         profile: Arc<RequestProfile>,
+        thinking: Thinking,
         observer: ResponsesObserver,
     ) -> Self {
         Self {
@@ -198,6 +208,7 @@ impl ResponsesAttempt {
             incremental_start,
             tail: Some(trigger),
             previous_response_id: Some(previous_response_id.to_owned()),
+            thinking,
             profile,
             observer,
             attempt: 1,
@@ -239,6 +250,12 @@ impl ResponsesAttempt {
     #[must_use]
     pub const fn attempt(&self) -> u32 {
         self.attempt
+    }
+
+    /// Returns the reasoning effort captured for this replayable attempt.
+    #[must_use]
+    pub const fn thinking(&self) -> Thinking {
+        self.thinking
     }
 
     pub fn input_items(&self) -> impl Iterator<Item = &ResponseItem> {
@@ -318,6 +335,7 @@ impl ResponsesServiceResponse {
 #[must_use]
 pub struct ResponsesAttemptFactory {
     profile: Arc<RequestProfile>,
+    thinking: Thinking,
     observer: ResponsesObserver,
 }
 
@@ -325,8 +343,26 @@ impl ResponsesAttemptFactory {
     pub fn new(profile: RequestProfile, events: EventSink, stats: Arc<TransportStats>) -> Self {
         Self {
             profile: Arc::new(profile),
+            thinking: Thinking::default(),
             observer: ResponsesObserver { events, stats },
         }
+    }
+
+    pub fn new_with_thinking(
+        profile: RequestProfile,
+        thinking: Thinking,
+        events: EventSink,
+        stats: Arc<TransportStats>,
+    ) -> Self {
+        Self {
+            profile: Arc::new(profile),
+            thinking,
+            observer: ResponsesObserver { events, stats },
+        }
+    }
+
+    pub fn set_thinking(&mut self, thinking: Thinking) {
+        self.thinking = thinking;
     }
 
     #[must_use]
@@ -336,7 +372,11 @@ impl ResponsesAttemptFactory {
 
     #[must_use]
     pub fn warmup(&self) -> ResponsesAttempt {
-        ResponsesAttempt::warmup(Arc::clone(&self.profile), self.observer.clone())
+        ResponsesAttempt::warmup(
+            Arc::clone(&self.profile),
+            self.thinking,
+            self.observer.clone(),
+        )
     }
 
     #[must_use]
@@ -355,6 +395,7 @@ impl ResponsesAttemptFactory {
             incremental_start,
             previous_response_id,
             Arc::clone(&self.profile),
+            self.thinking,
             self.observer.clone(),
         )
     }
@@ -378,6 +419,7 @@ impl ResponsesAttemptFactory {
             previous_response_id,
             trigger,
             Arc::clone(&self.profile),
+            self.thinking,
             self.observer.clone(),
         )
     }

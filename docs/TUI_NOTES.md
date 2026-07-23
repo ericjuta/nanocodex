@@ -65,6 +65,8 @@ that may affect the current run, while `Tab` creates a later queued turn.
 | `/btw` | Open an empty side fork, or focus the existing side pane. |
 | `/close` | Close the `/btw` pane once it is idle. A busy pane is retained and reports why it cannot close. |
 | `/cancel` | Cancel the focused turn without the two-stage Escape gesture. |
+| `/thinking` | Show the current reasoning effort. |
+| `/thinking <none|low|medium|high|xhigh|max>` | Change reasoning effort for subsequently accepted prompts across the mainline, retained branches, and `/btw`. An in-flight request and prompts already queued ahead of the command keep their captured effort. |
 | `/trace` | Open Jaeger filtered to the focused session. A `/btw` trace becomes available after its fork has produced a session ID. |
 
 Unknown slash-prefixed input is sent to the model as an ordinary prompt.

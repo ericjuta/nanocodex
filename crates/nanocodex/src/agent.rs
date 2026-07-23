@@ -179,6 +179,7 @@ enum Command {
     Prompt {
         key: TurnKey,
         prompt: Prompt,
+        thinking: Option<Thinking>,
         parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<TurnResult>>,
     },
@@ -189,6 +190,10 @@ enum Command {
     },
     Cancel {
         key: TurnKey,
+        result: oneshot::Sender<Result<()>>,
+    },
+    SetThinking {
+        thinking: Thinking,
         result: oneshot::Sender<Result<()>>,
     },
     Fork {
@@ -204,11 +209,13 @@ enum QueuedTurn {
     Pending {
         key: TurnKey,
         prompt: Prompt,
+        thinking: Thinking,
         parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<TurnResult>>,
     },
     Cancelled {
         prompt: Prompt,
+        thinking: Thinking,
         parent: Option<tracing::Span>,
         result: oneshot::Sender<Result<TurnResult>>,
     },
@@ -350,6 +357,7 @@ impl Nanocodex {
                 key,
                 prompt,
                 parent,
+                thinking: None,
                 result,
             })
             .await
@@ -364,6 +372,24 @@ impl Nanocodex {
             },
             result: receiver,
         })
+    }
+
+    /// Changes the reasoning effort captured by subsequently accepted prompts.
+    ///
+    /// An active model request keeps the effort with which it started. Queued
+    /// prompts preserve command order: prompts accepted before this update keep
+    /// the prior effort, while later prompts use the new value. Forks and clean
+    /// children created after the update inherit it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver has stopped.
+    pub async fn set_thinking(&self, thinking: Thinking) -> Result<()> {
+        request_command(&self.commands, |result| Command::SetThinking {
+            thinking,
+            result,
+        })
+        .await
     }
 
     /// Starts a clean sibling agent with the same private configuration,
@@ -771,7 +797,7 @@ where
         self.tools.start_providers();
         let session_id = self.events.request_id().to_owned();
         let rollout = self.rollout.take();
-        let reasoning = ReasoningSettings {
+        let mut reasoning = ReasoningSettings {
             mode: self.spawner.config.reasoning_mode,
             effort: self.spawner.config.thinking,
         };
@@ -820,21 +846,29 @@ where
                         QueuedTurn::Pending {
                             key,
                             prompt,
+                            thinking,
                             parent,
                             result,
                         } => {
                             break Command::Prompt {
                                 key,
                                 prompt,
+                                thinking: Some(thinking),
                                 parent,
                                 result,
                             };
                         }
                         QueuedTurn::Cancelled {
                             prompt,
+                            thinking,
                             parent,
                             result,
                         } => {
+                            model.set_thinking(thinking);
+                            let turn_reasoning = ReasoningSettings {
+                                effort: thinking,
+                                ..reasoning
+                            };
                             turn_index += 1;
                             let prompt_content = tracing::enabled!(
                                 target: "nanocodex",
@@ -847,7 +881,7 @@ where
                                 session_id.as_str(),
                                 self.spawner.lineage_id.as_ref(),
                                 &self.origin,
-                                reasoning,
+                                turn_reasoning,
                                 turn_index,
                                 prompt.instruction.text_bytes(),
                             );
@@ -881,9 +915,20 @@ where
                 }
                 return Ok(());
             };
+            let command = match command {
+                Command::SetThinking { thinking, result } => {
+                    reasoning.effort = thinking;
+                    Arc::make_mut(&mut self.spawner.config).thinking = thinking;
+                    model.set_thinking(thinking);
+                    drop(result.send(Ok(())));
+                    continue;
+                }
+                command => command,
+            };
             let Command::Prompt {
                 key,
                 prompt,
+                thinking,
                 parent,
                 result,
             } = command
@@ -897,6 +942,12 @@ where
                 );
                 continue;
             };
+            let turn_thinking = thinking.unwrap_or(reasoning.effort);
+            model.set_thinking(turn_thinking);
+            let turn_reasoning = ReasoningSettings {
+                effort: turn_thinking,
+                ..reasoning
+            };
             turn_index += 1;
             let prompt_content = tracing::enabled!(
                 target: "nanocodex",
@@ -909,7 +960,7 @@ where
                 session_id.as_str(),
                 self.spawner.lineage_id.as_ref(),
                 &self.origin,
-                reasoning,
+                turn_reasoning,
                 turn_index,
                 prompt.instruction.text_bytes(),
             );
@@ -966,12 +1017,14 @@ where
                             Some(Command::Prompt {
                                 key,
                                 prompt,
+                                thinking: _,
                                 parent,
                                 result,
                             }) => {
                                 queued_turns.push_back(QueuedTurn::Pending {
                                     key,
                                     prompt,
+                                    thinking: reasoning.effort,
                                     parent,
                                     result,
                                 });
@@ -1011,6 +1064,11 @@ where
                                 let _ = cancel.send(());
                                 cancel_result = Some(cancellation);
                                 break execution.as_mut().await;
+                            }
+                            Some(Command::SetThinking { thinking, result }) => {
+                                reasoning.effort = thinking;
+                                Arc::make_mut(&mut self.spawner.config).thinking = thinking;
+                                drop(result.send(Ok(())));
                             }
                             Some(command @ (Command::Fork { .. } | Command::Spawn { .. })) => {
                                 handle_idle_command(
@@ -1174,6 +1232,7 @@ fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) 
     };
     let QueuedTurn::Pending {
         prompt,
+        thinking,
         parent,
         result,
         ..
@@ -1185,6 +1244,7 @@ fn cancel_queued_turn(queued_turns: &mut VecDeque<QueuedTurn>, target: TurnKey) 
         position,
         QueuedTurn::Cancelled {
             prompt,
+            thinking,
             parent,
             result,
         },
@@ -1220,7 +1280,7 @@ fn handle_idle_command<S>(
         Command::Cancel { result, .. } => {
             drop(result.send(Err(NanocodexError::TurnNotCancellable)));
         }
-        Command::Prompt { .. } => {}
+        Command::SetThinking { .. } | Command::Prompt { .. } => {}
     }
 }
 
@@ -1553,6 +1613,29 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ThinkingCaptureService {
+        attempts: mpsc::UnboundedSender<Thinking>,
+    }
+
+    impl Service<ResponsesAttempt> for ThinkingCaptureService {
+        type Response = ResponsesServiceResponse;
+        type Error = NanocodexError;
+        type Future = Pending<std::result::Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ResponsesAttempt) -> Self::Future {
+            let _ = self.attempts.send(request.thinking());
+            pending()
+        }
+    }
+
     #[tokio::test]
     async fn accepts_a_caller_composed_tower_service_factory() {
         let responses = Responses::builder()
@@ -1742,6 +1825,63 @@ mod tests {
             Err(NanocodexError::TurnCancelled)
         ));
         assert_eq!(builds.load(Ordering::Relaxed), 2);
+        drop((agent, events));
+    }
+
+    #[tokio::test]
+    async fn thinking_updates_preserve_prompt_command_order() {
+        let (attempts, mut received_attempts) = mpsc::unbounded_channel();
+        let responses = Responses::builder()
+            .service(move || ThinkingCaptureService {
+                attempts: attempts.clone(),
+            })
+            .build();
+        let (agent, events) = Nanocodex::builder("test")
+            .thinking(Thinking::Medium)
+            .responses(responses)
+            .build()
+            .unwrap();
+
+        let first = agent.prompt("first").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received_attempts.recv())
+                .await
+                .unwrap(),
+            Some(Thinking::Medium)
+        );
+        let second = agent.prompt("second").await.unwrap();
+        agent.set_thinking(Thinking::High).await.unwrap();
+        let third = agent.prompt("third").await.unwrap();
+
+        first.cancel().await.unwrap();
+        assert!(matches!(
+            first.result().await,
+            Err(NanocodexError::TurnCancelled)
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received_attempts.recv())
+                .await
+                .unwrap(),
+            Some(Thinking::Medium)
+        );
+
+        second.cancel().await.unwrap();
+        assert!(matches!(
+            second.result().await,
+            Err(NanocodexError::TurnCancelled)
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), received_attempts.recv())
+                .await
+                .unwrap(),
+            Some(Thinking::High)
+        );
+
+        third.cancel().await.unwrap();
+        assert!(matches!(
+            third.result().await,
+            Err(NanocodexError::TurnCancelled)
+        ));
         drop((agent, events));
     }
 

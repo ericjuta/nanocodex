@@ -1,8 +1,8 @@
 use std::{collections::HashMap, path::Path, sync::Arc};
 
 use nanocodex_core::{
-    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, ToolDefinition, Usage,
-    responses::RequestProfile,
+    AgentEventKind, EventSink, MODEL, ModelConfig, Prompt, ResponseItem, Thinking, ToolDefinition,
+    Usage, responses::RequestProfile,
 };
 use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
@@ -337,6 +337,7 @@ impl<S> ModelRun<S> {
             prompt_cache.key(),
             &runtime,
             config.system_prompt(),
+            config.thinking,
         );
         Self {
             events,
@@ -371,7 +372,20 @@ impl<S> ModelRun<S> {
             self.prompt_cache.key(),
             tools,
             self.config.system_prompt(),
+            self.config.thinking,
         )
+    }
+
+    pub(crate) fn set_thinking(&mut self, thinking: Thinking) {
+        if self.config.thinking == thinking {
+            return;
+        }
+        let mut config = self.config.as_ref().clone();
+        config.thinking = thinking;
+        self.config = Arc::new(config);
+        if let Some(session) = &mut self.session {
+            session.factory.set_thinking(thinking);
+        }
     }
 
     fn load_agent_instructions(&self, workspace: &str) -> Result<Option<String>> {
@@ -1770,18 +1784,20 @@ fn attempt_factory(
     prompt_cache_key: &str,
     tools: &ToolRuntime,
     system_prompt: &str,
+    thinking: Thinking,
 ) -> ResponsesAttemptFactory {
     #[cfg(not(target_family = "wasm"))]
     let tool_specs = tools.model_specs();
     #[cfg(target_family = "wasm")]
     let tool_specs = tools.model_specs(events.request_id());
-    ResponsesAttemptFactory::new(
+    ResponsesAttemptFactory::new_with_thinking(
         request_profile(
             events.request_id(),
             prompt_cache_key,
             tool_specs,
             system_prompt,
         ),
+        thinking,
         events.clone(),
         Arc::clone(transport_stats),
     )

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Features
+
+- Allow callers to change reasoning effort mid-session while preserving the
+  effort captured by in-flight and already queued prompts.
+
 ### Bug Fixes
 
 - Publish safe fork boundaries before compaction, force authoritative replay

@@ -26,7 +26,8 @@ use crossterm::event::{
 use eyre::{Result, WrapErr};
 use futures_util::StreamExt;
 use nanocodex::{
-    AgentEvent, AgentEvents, Nanocodex, NanocodexError, TimedAgentEvent, TurnControl, TurnResult,
+    AgentEvent, AgentEvents, Nanocodex, NanocodexError, Thinking, TimedAgentEvent, TurnControl,
+    TurnResult,
 };
 use tokio::{
     sync::mpsc,
@@ -92,6 +93,9 @@ enum WorkerCommand {
     },
     SwitchMainBranch {
         id: u64,
+    },
+    SetThinking {
+        thinking: Thinking,
     },
 }
 
@@ -179,6 +183,12 @@ enum WorkerEvent {
     },
     MainBranchEventStreamClosed {
         id: u64,
+    },
+    ThinkingUpdated {
+        thinking: Thinking,
+    },
+    ThinkingUpdateFailed {
+        error: String,
     },
 }
 
@@ -443,6 +453,9 @@ enum Submission {
     CloseBtw,
     Cancel,
     Trace,
+    ShowThinking,
+    SetThinking(Thinking),
+    InvalidThinking,
     Exit,
 }
 
@@ -854,6 +867,13 @@ fn handle_worker_update(
         WorkerEvent::MainBranchEventStreamClosed { id } => {
             app.main_branch_event_stream_closed(id);
         }
+        WorkerEvent::ThinkingUpdated { thinking } => {
+            app.thinking = thinking;
+            app.set_active_status(format!("Thinking effort: {thinking}"));
+        }
+        WorkerEvent::ThinkingUpdateFailed { error } => {
+            app.push_active_error(format!("failed to change thinking effort: {error}"));
+        }
     }
     Ok(())
 }
@@ -944,7 +964,29 @@ impl AgentWorker {
                     .await;
             }
             WorkerCommand::SwitchMainBranch { id } => self.switch_main_branch(id),
+            WorkerCommand::SetThinking { thinking } => self.set_thinking(thinking).await,
         }
+    }
+
+    async fn set_thinking(&self, thinking: Thinking) {
+        let outcome = async {
+            self.main.agent.set_thinking(thinking).await?;
+            for branch in &self.archived_main {
+                branch.agent.set_thinking(thinking).await?;
+            }
+            if let Some(branch) = &self.btw {
+                branch.agent.set_thinking(thinking).await?;
+            }
+            Ok::<(), NanocodexError>(())
+        }
+        .await;
+        let update = match outcome {
+            Ok(()) => WorkerEvent::ThinkingUpdated { thinking },
+            Err(error) => WorkerEvent::ThinkingUpdateFailed {
+                error: error.to_string(),
+            },
+        };
+        drop(self.updates.send(update));
     }
 
     async fn prompt(&mut self, target: PaneId, prompt_id: u64, prompt: SubmittedPrompt) {
@@ -2177,6 +2219,16 @@ fn submit(
                 Err(error) => app.push_active_error(format!("failed to open Jaeger: {error}")),
             }
         }
+        Submission::ShowThinking => {
+            app.set_active_status(format!("Thinking effort: {}", app.thinking));
+        }
+        Submission::SetThinking(thinking) => {
+            app.set_active_status(format!("Switching thinking effort to {thinking}"));
+            send_command(commands, WorkerCommand::SetThinking { thinking })?;
+        }
+        Submission::InvalidThinking => {
+            app.push_active_error("usage: /thinking <none|low|medium|high|xhigh|max>");
+        }
         Submission::Exit => return Ok(TerminalAction::Quit),
     }
     Ok(TerminalAction::Redraw)
@@ -2213,6 +2265,15 @@ fn classify_submission(input: impl Into<SubmittedPrompt>) -> Submission {
     }
     if trimmed == "/trace" {
         return Submission::Trace;
+    }
+    if trimmed == "/thinking" {
+        return Submission::ShowThinking;
+    }
+    if let Some(thinking) = trimmed.strip_prefix("/thinking ") {
+        return thinking
+            .trim()
+            .parse()
+            .map_or(Submission::InvalidThinking, Submission::SetThinking);
     }
     if trimmed == "/exit" {
         return Submission::Exit;
@@ -2396,6 +2457,18 @@ mod tests {
             classify_submission(" /trace ".to_owned()),
             Submission::Trace
         );
+        assert_eq!(
+            classify_submission(" /thinking high ".to_owned()),
+            Submission::SetThinking(Thinking::High)
+        );
+        assert_eq!(
+            classify_submission("/thinking".to_owned()),
+            Submission::ShowThinking
+        );
+        assert_eq!(
+            classify_submission("/thinking enormous".to_owned()),
+            Submission::InvalidThinking
+        );
         assert_eq!(classify_submission(" /exit ".to_owned()), Submission::Exit);
         assert_eq!(
             classify_submission("/btw-not-a-command".to_owned()),
@@ -2409,6 +2482,40 @@ mod tests {
             classify_submission("/exit-now".to_owned()),
             Submission::Prompt("/exit-now".into())
         );
+    }
+
+    #[test]
+    fn thinking_submission_updates_the_worker_and_footer_state() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        app.insert_str("/thinking high");
+
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::SetThinking {
+                thinking: Thinking::High
+            })
+        ));
+        handle_worker_update(
+            &mut app,
+            WorkerEvent::ThinkingUpdated {
+                thinking: Thinking::High,
+            },
+            &commands,
+        )
+        .unwrap();
+        assert_eq!(app.thinking, Thinking::High);
+        assert_eq!(app.main.status, "Thinking effort: high");
     }
 
     #[test]
