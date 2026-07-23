@@ -59,8 +59,9 @@ tool output or deterministic tests.
 - [x] (2026-07-23 13:05Z) Implement Milestone 2: optional rooted patches,
   root-relative lexical validation, contextual/edited-move previews, delete
   metadata, and structural-first routine output bounding.
-- [ ] Implement Milestone 3: transaction receipt observability and actionable
-  parent errors.
+- [x] (2026-07-23 13:40Z) Implement Milestone 3: bounded receipt recovery
+  metadata, shared pruning constants, typed-semantic replay documentation, and
+  actionable existing-parent errors.
 - [ ] Review Milestone 4's directory journal design; implement it only after the
   go/no-go gate passes.
 - [ ] Run focused/workspace validation; update README and changelogs; record
@@ -101,6 +102,9 @@ tool output or deterministic tests.
   `resolve`/`open_parent` and `TransactionLease` require existing parents, and
   journals currently model only files. The smoke failed with “resolve
   transaction parent” when `src/` was absent.
+  Implementation evidence: missing `src/lib.rs` now names required parent
+  `src`, recommends an explicitly authorized operation, and leaves both the
+  parent and recovery storage absent.
 
 - Observation: transaction preview is intentionally stateless.
   Evidence: `TransactionRequest` always carries mutations; `commitPreviewed`
@@ -113,6 +117,10 @@ tool output or deterministic tests.
   the terminal outcome, and leaves the reservation for ID uniqueness.
   `prune_terminal_receipts` bounds complete receipts to 64 during later
   transaction activity.
+  Implementation evidence: preview reports retention `false` without creating
+  storage; commit reports `true` only after terminalization. The focused
+  receipt test derives its 64-receipt/128-entry assertions from the shared
+  policy constant.
 
 - Observation: transaction previews have a 6 KiB aggregate budget; routine
   patch responses have 24 KiB. Structural evidence is already favored over

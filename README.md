@@ -500,9 +500,12 @@ default. An explicit tool selection can enable it with
 Hashline is exposed to the model through Code Mode as `tools.hashline__read`,
 `tools.hashline__find_block`, `tools.hashline__patch`, and
 `tools.hashline__transaction`.
-Paths may be absolute or relative to the configured workspace. A transaction
-can select an external directory with `root`; its mutation paths remain relative
-to that root.
+Paths may be absolute or relative to the configured workspace. Routine patches
+may opt into a compact `root`; while set, section and `MV` paths are strict
+root-relative lexical paths. This scoping is not transaction-grade symlink or
+race containment. Transactions can likewise select an external directory with
+`root`, but their mutation paths remain relative to that root and their
+parents must already exist.
 
 For a direct single-file edit, copy `patchHeader` and a line anchor from a recent
 read, then pass the operations as one Hashline DSL string—not as a JSON array:
@@ -518,6 +521,22 @@ await tools.hashline__patch({
 
 Here `2:f589` is copied from the read output. Reread and rebuild the patch after
 any stale-anchor or file-hash error.
+
+Read results distinguish output/request truncation from file continuation:
+`truncated` and `next_start_line` retain their bounded-request meaning, while
+`has_more` says whether lines remain later in the file. Patch previews include
+one bounded resulting-file context line on each side when budget permits,
+edited moves include textual previews, and deletes report structural size/hash
+metadata without returning deleted contents.
+
+Transaction preview is stateless. `commitPreviewed` resubmits mutations with
+equal deserialized typed semantics—not necessarily byte-identical JSON—plus the
+returned plan digest. Successful commits remove mutation artifacts, retain a
+complete terminal receipt and reservation under
+`.nanocodex/hashline-transactions`, and prune the oldest complete receipts
+during later transaction activity to a limit of 64. Transaction output reports
+this bounded recovery policy without exposing receipt names, absolute paths, or
+before-images.
 
 Code Mode prewarms one persistent Node host alongside the first model call and
 reuses it for the session. Cells receive one shared owned history snapshot;

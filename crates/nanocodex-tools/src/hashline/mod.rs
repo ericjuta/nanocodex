@@ -723,6 +723,14 @@ struct TransactionRequest {
     mutations: Vec<FileMutation>,
 }
 
+fn transaction_recovery(terminal_receipt_retained: bool) -> Value {
+    json!({
+        "terminal_receipt_retained": terminal_receipt_retained,
+        "relative_directory": transaction_fs::RECOVERY_RELATIVE_DIRECTORY,
+        "terminal_receipt_limit": transaction_fs::TERMINAL_RECEIPT_LIMIT,
+    })
+}
+
 fn execute_transaction(
     workspace: &Path,
     request: &TransactionRequest,
@@ -774,6 +782,7 @@ fn execute_transaction(
             "planDigest": plan_digest,
             "mutations": previews,
             "preview_truncated": preview_truncated,
+            "recovery": transaction_recovery(false),
         }));
     }
     let transaction_id = plan_digest.clone();
@@ -790,6 +799,7 @@ fn execute_transaction(
                 "planDigest": plan_digest,
                 "mutations": previews,
                 "preview_truncated": preview_truncated,
+                "recovery": transaction_recovery(true),
             }))
         }
         Err(error) => Err(error),
@@ -1540,7 +1550,7 @@ fn patch_definition() -> ToolDefinition {
 fn transaction_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__transaction",
-        "Preferred for recoverable multi-file edits. Preview, immediately commit, or commit an exact previously previewed bounded Hashline transaction. commitPreviewed requires resubmitting the identical mutations together with the returned expectedPlanDigest; changed files or mutations are rejected. Retains restart-recovery evidence.",
+        "Preferred for recoverable multi-file edits. Preview, immediately commit, or commit an exact previously previewed bounded Hashline transaction. For commitPreviewed, identical mutations means equal deserialized typed semantics, not byte-identical JSON; resubmit those semantics with the returned expectedPlanDigest. Changed files or semantics are rejected. Successful commits retain bounded restart-recovery receipts.",
         json!({
             "type": "object",
             "properties": {
@@ -1553,7 +1563,7 @@ fn transaction_definition() -> ToolDefinition {
                     "type": "string",
                     "description": "Transaction root directory. Relative paths resolve from the configured workspace; absolute paths and parent traversal are accepted. Omit or use \".\" for the workspace root."
                 },
-                "mutations": {"type": "array", "minItems": 1, "maxItems": MAX_MUTATIONS, "description": "For commitPreviewed, resubmit the exact mutations used for preview without any change.", "items": mutation_schema()}
+                "mutations": {"type": "array", "minItems": 1, "maxItems": MAX_MUTATIONS, "description": "For commitPreviewed, resubmit mutations with equal deserialized typed semantics; byte-identical JSON is not required.", "items": mutation_schema()}
             },
             "required": ["action", "mutations"],
             "additionalProperties": false

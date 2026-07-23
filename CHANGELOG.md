@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - [tools] Allow Hashline reads and patches to use absolute or parent-relative
   paths and transactions to select roots outside the configured workspace.
+- [tools] Expose the complete Hashline patch grammar and read continuation,
+  support lexically rooted routine patches, add contextual and edited-move
+  previews plus delete metadata, and report bounded transaction receipt policy
+  with actionable missing-parent errors.
 
 ### Removed
 

@@ -1,6 +1,12 @@
 //! Safe descriptor-relative adaptation of the `OpenAI` Codex Hashline Linux
 //! filesystem capability. See the crate `NOTICE` for source provenance.
 
+pub(in crate::hashline) const RECOVERY_RELATIVE_DIRECTORY: &str =
+    ".nanocodex/hashline-transactions";
+pub(in crate::hashline) const TERMINAL_RECEIPT_LIMIT: usize = 64;
+const STATE_DIRECTORY: &str = ".nanocodex";
+const TRANSACTION_DIRECTORY: &str = "hashline-transactions";
+
 #[cfg(target_os = "linux")]
 mod platform {
     use std::collections::{BTreeMap, BTreeSet};
@@ -18,15 +24,13 @@ mod platform {
         FileMetadata, FunctionCallError, MAX_MUTATIONS, Observed, PreparedMutation, exact_digest,
         model_error,
     };
+    use super::{STATE_DIRECTORY, TERMINAL_RECEIPT_LIMIT, TRANSACTION_DIRECTORY};
 
     const EXT_SUPER_MAGIC: i64 = 0xef53;
     const TMPFS_MAGIC: i64 = 0x0102_1994;
     const CASEFOLD_FLAG: u32 = 0x4000_0000;
-    const STATE_DIRECTORY: &str = ".nanocodex";
-    const TRANSACTION_DIRECTORY: &str = "hashline-transactions";
     const JOURNAL_VERSION: u32 = 2;
     const MAX_JOURNAL_BYTES: usize = 256 * 1024;
-    const MAX_TERMINAL_RECEIPTS: usize = 64;
     const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 
     #[derive(Clone, Debug)]
@@ -370,7 +374,7 @@ mod platform {
             FunctionCallError::RespondToModel("transaction path has no file name".to_owned())
         })?;
         let parent_relative = path.parent().unwrap_or_else(|| Path::new("."));
-        let parent = open_parent(&root.directory, parent_relative)?;
+        let parent = open_parent(&root.directory, parent_relative, model_path)?;
         ensure_supported_directory(&parent)?;
         let parent_identity = directory_identity(&parent)?;
         Ok(NativePath {
@@ -399,7 +403,11 @@ mod platform {
         Ok(())
     }
 
-    fn open_parent(root: &File, relative: &Path) -> Result<File, FunctionCallError> {
+    fn open_parent(
+        root: &File,
+        relative: &Path,
+        model_path: &str,
+    ) -> Result<File, FunctionCallError> {
         let relative = if relative == Path::new("") {
             Path::new(".")
         } else {
@@ -412,7 +420,16 @@ mod platform {
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
         )
-        .map_err(|error| io_error("resolve transaction parent", error))?;
+        .map_err(|error| {
+            if error == rustix::io::Errno::NOENT {
+                FunctionCallError::RespondToModel(format!(
+                    "Hashline transaction path {model_path} requires existing parent {}; create that parent through an explicitly authorized operation before retrying",
+                    relative.display()
+                ))
+            } else {
+                io_error("resolve transaction parent", error)
+            }
+        })?;
         Ok(File::from(fd))
     }
 
@@ -440,7 +457,7 @@ mod platform {
     }
 
     fn verify_path_parent(path: &NativePath) -> Result<(), FunctionCallError> {
-        let reopened = open_parent(&path.root, &path.parent_relative)?;
+        let reopened = open_parent(&path.root, &path.parent_relative, &path.model_path)?;
         if directory_identity(&reopened)? != path.parent_identity {
             return model_error(format!(
                 "transaction path {} changed parent identity while leased",
@@ -1151,7 +1168,7 @@ mod platform {
         let remove_count = complete
             .len()
             .saturating_add(1)
-            .saturating_sub(MAX_TERMINAL_RECEIPTS);
+            .saturating_sub(TERMINAL_RECEIPT_LIMIT);
         for (name, transaction_id, _file) in complete.into_iter().take(remove_count) {
             let reservation_name = format!("{transaction_id}.reserve");
             let reservation = open_named(directory, &reservation_name, OFlags::RDWR)?;

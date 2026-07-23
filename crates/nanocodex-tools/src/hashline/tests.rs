@@ -837,6 +837,7 @@ fn paths_and_transaction_roots_may_resolve_outside_the_workspace() {
     fs::remove_dir_all(external).expect("external workspace should be removed");
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn transaction_preview_digest_commits_exact_plan_and_cleans_sidecar() {
     let root = workspace("transaction");
@@ -869,6 +870,24 @@ fn transaction_preview_digest_commits_exact_plan_and_cleans_sidecar() {
         .expect("digest should be text")
         .to_owned();
     assert_eq!(digest.len(), 64);
+    assert_eq!(
+        preview["recovery"],
+        json!({
+            "terminal_receipt_retained": false,
+            "relative_directory": super::transaction_fs::RECOVERY_RELATIVE_DIRECTORY,
+            "terminal_receipt_limit": super::transaction_fs::TERMINAL_RECEIPT_LIMIT,
+        })
+    );
+    assert!(
+        !root
+            .join(super::transaction_fs::RECOVERY_RELATIVE_DIRECTORY)
+            .exists(),
+        "preview must not create recovery storage"
+    );
+    let encoded_preview = preview.to_string();
+    assert!(!encoded_preview.contains(&root.display().to_string()));
+    assert!(!encoded_preview.contains(".reserve"));
+    assert!(!encoded_preview.contains(".json"));
     assert_eq!(
         fs::read(root.join("a.txt")).expect("file should read"),
         before
@@ -926,6 +945,14 @@ fn transaction_preview_digest_commits_exact_plan_and_cleans_sidecar() {
     )
     .expect("previewed commit should succeed");
     assert_eq!(result["outcome"], "committed");
+    assert_eq!(
+        result["recovery"],
+        json!({
+            "terminal_receipt_retained": true,
+            "relative_directory": super::transaction_fs::RECOVERY_RELATIVE_DIRECTORY,
+            "terminal_receipt_limit": super::transaction_fs::TERMINAL_RECEIPT_LIMIT,
+        })
+    );
     assert_eq!(
         fs::read(root.join("a.txt")).expect("file should read"),
         b"alpha\ninserted\nbeta\n"
@@ -1206,7 +1233,8 @@ fn commit_preserves_update_and_move_permissions() {
 fn terminal_receipts_are_bounded_and_oldest_ids_are_pruned() {
     let root = workspace("receipt-bound");
     let native = super::transaction_fs::open_root(&root, ".").expect("root should open");
-    for index in 0..65 {
+    let limit = super::transaction_fs::TERMINAL_RECEIPT_LIMIT;
+    for index in 0..=limit {
         let directory = format!("directory-{index:03}");
         fs::create_dir(root.join(&directory)).expect("transaction directory should create");
         let path = format!("{directory}/created.txt");
@@ -1227,16 +1255,46 @@ fn terminal_receipts_are_bounded_and_oldest_ids_are_pruned() {
             .expect("transaction should terminalize");
         drop(lease);
     }
-    let storage = root.join(".nanocodex/hashline-transactions");
+    let storage = root.join(super::transaction_fs::RECOVERY_RELATIVE_DIRECTORY);
     let entries = fs::read_dir(&storage)
         .expect("storage should list")
         .collect::<Result<Vec<_>, _>>()
         .expect("entries should list");
-    assert_eq!(entries.len(), 128);
+    assert_eq!(entries.len(), limit * 2);
     assert!(!storage.join("receipt-000.json").exists());
     assert!(!storage.join("receipt-000.reserve").exists());
-    assert!(storage.join("receipt-064.json").exists());
-    assert!(storage.join("receipt-064.reserve").exists());
+    let newest = format!("receipt-{limit:03}");
+    assert!(storage.join(format!("{newest}.json")).exists());
+    assert!(storage.join(format!("{newest}.reserve")).exists());
+    fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn transaction_missing_parent_error_names_model_path_and_required_parent() {
+    let root = workspace("missing-parent");
+    let error = execute_transaction(
+        &root,
+        &TransactionRequest {
+            action: TransactionAction::Preview,
+            root: None,
+            mutations: vec![FileMutation::Create {
+                path: "src/lib.rs".to_owned(),
+                contents: "pub fn ready() {}\n".to_owned(),
+            }],
+        },
+    )
+    .expect_err("missing transaction parent should fail")
+    .to_string();
+    assert!(error.contains("src/lib.rs"));
+    assert!(error.contains("existing parent src"));
+    assert!(error.contains("explicitly authorized operation"));
+    assert!(!root.join("src").exists());
+    assert!(
+        !root
+            .join(super::transaction_fs::RECOVERY_RELATIVE_DIRECTORY)
+            .exists()
+    );
     fs::remove_dir_all(root).expect("workspace should be removed");
 }
 
@@ -1338,6 +1396,14 @@ fn transaction_preview_output_is_capped_before_structural_evidence() {
     )
     .expect("preview should succeed");
     assert_eq!(preview["preview_truncated"], true);
+    assert_eq!(
+        preview["recovery"],
+        json!({
+            "terminal_receipt_retained": false,
+            "relative_directory": super::transaction_fs::RECOVERY_RELATIVE_DIRECTORY,
+            "terminal_receipt_limit": super::transaction_fs::TERMINAL_RECEIPT_LIMIT,
+        })
+    );
     assert!(
         serde_json::to_vec(&preview)
             .expect("preview should encode")
