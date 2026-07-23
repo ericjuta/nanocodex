@@ -1,38 +1,45 @@
-export type NanocodexThinking = "none" | "low" | "medium" | "high" | "xhigh" | "max";
-export type NanocodexReasoningMode = "standard" | "pro";
-export type NanocodexWorkerMessage = { type: string; [key: string]: unknown };
-export type NanocodexWorkerCommand = { type: string; [key: string]: unknown };
+import type { ReasoningMode, Thinking } from "nanocodex";
 
-export type NanocodexState = Readonly<{
-  ready: boolean;
-  configured: boolean | null;
-  credentialSource: "user" | "deployment" | null;
-  stopped: boolean;
+export type WorkerMessage = { type: string; [key: string]: unknown };
+export type WorkerCommand = { type: string; [key: string]: unknown };
+export type Status = "idle" | "starting" | "ready" | "stopped" | "error";
+
+export type Snapshot = Readonly<{
+  status: Status;
+  error?: string;
 }>;
 
-export type NanocodexWorker = {
-  onmessage: ((event: MessageEvent<NanocodexWorkerMessage>) => void) | null;
-  postMessage(message: NanocodexWorkerCommand): void;
+export type WorkerLike<
+  Command extends WorkerCommand = WorkerCommand,
+  Message extends WorkerMessage = WorkerMessage,
+> = {
+  onmessage: ((event: MessageEvent<Message>) => void) | null;
+  postMessage(message: Command): void;
   terminate(): void;
 };
 
-export type NanocodexConfig = Readonly<{
-  getState(): NanocodexState;
+export type Config<
+  Command extends WorkerCommand = WorkerCommand,
+  Message extends WorkerMessage = WorkerMessage,
+> = Readonly<{
+  getSnapshot(): Snapshot;
   subscribe(listener: () => void): () => void;
-  subscribeMessages(listener: (message: NanocodexWorkerMessage) => void): () => void;
+  subscribeMessages(listener: (message: Message) => void): () => void;
   mount(): () => void;
-  send(command: NanocodexWorkerCommand): void;
+  dispatch(command: Command): void;
   stop(): void;
 }>;
 
-export type CreateNanocodexConfigOptions = {
-  thinking?: NanocodexThinking;
-  reasoningMode?: NanocodexReasoningMode;
-  createWorker(): NanocodexWorker;
-  checkHealth?(): Promise<{
-    agent_configured?: boolean;
-    credential_source?: "user" | "deployment" | null;
-  }>;
+export type CreateConfigParameters<
+  Command extends WorkerCommand = WorkerCommand,
+  Message extends WorkerMessage = WorkerMessage,
+> = {
+  worker(): WorkerLike<Command, Message>;
+  thinking?: Thinking;
+  reasoningMode?: ReasoningMode;
 };
 
-export function createNanocodexConfig(options: CreateNanocodexConfigOptions): NanocodexConfig;
+export function createConfig<
+  Command extends WorkerCommand = WorkerCommand,
+  Message extends WorkerMessage = WorkerMessage,
+>(options: CreateConfigParameters<Command, Message>): Config<Command, Message>;

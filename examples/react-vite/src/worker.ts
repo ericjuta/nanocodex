@@ -1,5 +1,4 @@
-import { Agent, type ReasoningMode, type Thinking } from "nanocodex";
-import { browser } from "nanocodex/browser";
+import { Agent, type ReasoningMode, type Thinking } from "nanocodex/browser";
 
 type StartMessage = {
   type: "start";
@@ -17,34 +16,8 @@ type IncomingMessage = StartMessage | PromptMessage;
 
 const worker = self as DedicatedWorkerGlobalScope;
 
-const engine = browser({
-  apiKey: "worker-managed",
-  websocketUrl: workerEndpoint(),
-  // Browser WebSockets cannot attach an Authorization header. The URL must be
-  // authorized by the embedding application, for example through a short-lived
-  // signed URL or same-site session cookie.
-  createWebSocket: (endpoint: string, sessionId: string) => {
-    const url = new URL(endpoint);
-    url.searchParams.set("session_id", sessionId);
-    return new WebSocket(url);
-  },
-  onEvent: (event) => {
-    worker.postMessage({ type: "event", event });
-  },
-  tools: {
-    browserInfo: {
-      description: "Return basic information about the browser Worker runtime.",
-      parameters: { type: "object", additionalProperties: false },
-      handler: async () => ({
-        language: navigator.language,
-        online: navigator.onLine,
-        userAgent: navigator.userAgent,
-      }),
-    },
-  },
-});
-
-let agent: Agent.Client | undefined;
+let agent: Agent.Agent | undefined;
+let eventWatch: ReturnType<Agent.Agent["events"]["watch"]> | undefined;
 
 worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
   void handleMessage(data);
@@ -52,12 +25,35 @@ worker.onmessage = ({ data }: MessageEvent<IncomingMessage>) => {
 
 async function handleMessage(data: IncomingMessage): Promise<void> {
   if (data.type === "start") {
+    eventWatch?.off();
+    eventWatch = undefined;
     agent?.dispose();
     agent = await Agent.create({
-      engine,
+      apiKey: "worker-managed",
+      websocketUrl: workerEndpoint(),
+      // Browser WebSockets cannot attach an Authorization header. The URL must
+      // be authorized by the embedding application.
+      createWebSocket: (endpoint: string, sessionId: string) => {
+        const url = new URL(endpoint);
+        url.searchParams.set("session_id", sessionId);
+        return new WebSocket(url);
+      },
+      tools: {
+        browserInfo: {
+          description: "Return basic information about the browser Worker runtime.",
+          parameters: { type: "object", additionalProperties: false },
+          handler: async () => ({
+            language: navigator.language,
+            online: navigator.onLine,
+            userAgent: navigator.userAgent,
+          }),
+        },
+      },
       thinking: data.thinking,
       reasoningMode: data.reasoningMode,
     });
+    eventWatch = agent.events.watch();
+    eventWatch.onEvent((event) => worker.postMessage({ type: "event", event }));
     worker.postMessage({ type: "ready" });
     return;
   }

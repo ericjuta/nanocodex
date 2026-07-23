@@ -1,65 +1,51 @@
-export function createNanocodexConfig(options) {
-  if (typeof options?.createWorker !== "function") {
-    throw new TypeError("createNanocodexConfig requires createWorker");
+export function createConfig(options) {
+  if (typeof options?.worker !== "function") {
+    throw new TypeError("createConfig requires worker()");
   }
-  const thinking = options.thinking ?? "medium";
-  const reasoningMode = options.reasoningMode ?? "standard";
   const stateListeners = new Set();
   const messageListeners = new Set();
-  let state = Object.freeze({ ready: false, configured: null, credentialSource: null, stopped: false });
+  let snapshot = Object.freeze({ status: "idle", error: undefined });
   let worker;
   let mounts = 0;
-  let healthRequest = 0;
 
-  function setState(patch) {
-    const next = Object.freeze({ ...state, ...patch });
-    if (
-      next.ready === state.ready
-      && next.configured === state.configured
-      && next.credentialSource === state.credentialSource
-      && next.stopped === state.stopped
-    ) return;
-    state = next;
+  function setSnapshot(status, error) {
+    if (snapshot.status === status && snapshot.error === error) return;
+    snapshot = Object.freeze({ status, error });
     for (const listener of stateListeners) listener();
   }
 
   function connect() {
-    if (worker || state.stopped) return;
-    const current = options.createWorker();
-    worker = current;
-    current.onmessage = ({ data }) => {
-      if (data.type === "ready") setState({ ready: true });
-      for (const listener of messageListeners) listener(data);
-    };
-    current.postMessage({ type: "start", thinking, reasoningMode });
-    if (!options.checkHealth) return;
-    const request = ++healthRequest;
-    void options.checkHealth().then(
-      (health) => {
-        if (request === healthRequest) {
-          setState({
-            configured: health.agent_configured === true,
-            credentialSource: health.credential_source === "user" || health.credential_source === "deployment"
-              ? health.credential_source
-              : null,
-          });
+    if (worker || snapshot.status === "stopped") return;
+    setSnapshot("starting");
+    try {
+      const current = options.worker();
+      worker = current;
+      current.onmessage = ({ data }) => {
+        if (data?.type === "ready") setSnapshot("ready");
+        if (data?.type === "fatal") {
+          setSnapshot("error", typeof data.message === "string" ? data.message : "Agent worker failed");
         }
-      },
-      () => {
-        if (request === healthRequest) setState({ configured: null, credentialSource: null });
-      },
-    );
+        for (const listener of messageListeners) listener(data);
+      };
+      current.postMessage({
+        type: "start",
+        thinking: options.thinking ?? "medium",
+        reasoningMode: options.reasoningMode ?? "standard",
+      });
+    } catch (error) {
+      worker = undefined;
+      setSnapshot("error", errorMessage(error));
+    }
   }
 
   function disconnect() {
-    healthRequest += 1;
     worker?.terminate();
     worker = undefined;
-    setState({ ready: false });
+    if (snapshot.status !== "stopped") setSnapshot("idle");
   }
 
   return Object.freeze({
-    getState: () => state,
+    getSnapshot: () => snapshot,
     subscribe(listener) {
       stateListeners.add(listener);
       return () => stateListeners.delete(listener);
@@ -79,12 +65,18 @@ export function createNanocodexConfig(options) {
         if (mounts === 0) disconnect();
       };
     },
-    send(command) {
-      worker?.postMessage(command);
+    dispatch(command) {
+      if (!worker) throw new Error("the Nanocodex worker is not running");
+      worker.postMessage(command);
     },
     stop() {
+      if (snapshot.status === "stopped") return;
+      setSnapshot("stopped");
       disconnect();
-      setState({ stopped: true });
     },
   });
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
