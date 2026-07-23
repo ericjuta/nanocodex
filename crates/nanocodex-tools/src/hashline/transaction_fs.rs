@@ -125,29 +125,26 @@ mod platform {
         workspace: &Path,
         root_name: &str,
     ) -> Result<NativeRoot, FunctionCallError> {
-        let workspace =
-            File::open(workspace).map_err(|error| io_error("open transaction workspace", error))?;
-        if !workspace
+        if root_name.is_empty() {
+            return model_error("transaction root must be a non-empty path");
+        }
+        let requested = Path::new(root_name);
+        let root_path = if root_name == "." {
+            workspace.to_path_buf()
+        } else if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            workspace.join(requested)
+        };
+        let directory =
+            File::open(&root_path).map_err(|error| io_error("open transaction root", error))?;
+        if !directory
             .metadata()
-            .map_err(|error| io_error("inspect transaction workspace", error))?
+            .map_err(|error| io_error("inspect transaction root", error))?
             .is_dir()
         {
-            return model_error("transaction workspace is not a directory");
+            return model_error("transaction root is not a directory");
         }
-        let directory = if root_name == "." {
-            workspace
-        } else {
-            validate_relative(root_name)?;
-            let fd = fs::openat2(
-                &workspace,
-                root_name,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-                ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
-            )
-            .map_err(|error| io_error("open transaction root", error))?;
-            File::from(fd)
-        };
         ensure_supported_directory(&directory)?;
         let identity = identity_bytes(
             &directory
@@ -389,7 +386,7 @@ mod platform {
     fn validate_relative(model_path: &str) -> Result<(), FunctionCallError> {
         let path = Path::new(model_path);
         if model_path.is_empty() || path.is_absolute() {
-            return model_error("Hashline paths must be non-empty and workspace-relative");
+            return model_error("Hashline transaction paths must be non-empty and root-relative");
         }
         if path
             .components()

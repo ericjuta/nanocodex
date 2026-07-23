@@ -92,8 +92,9 @@ Use Hashline as the default for local UTF-8 source, configuration, documentation
 - Treat Hashline headers, anchors, and digests as expiring evidence. After any stale-file, anchor, block, or digest error, reread the affected range and rebuild the edit from fresh output.
 - Use `hashline__transaction` for recoverable multi-file batches: preview the exact mutations, then commit the identical mutations with the returned `expectedPlanDigest`.
 - Keep normalized Hashline file and line hashes distinct from `exactDigest`: patches use the compact hashes, while transactions validate the exact byte digest.
-- Do not use Hashline for generated or binary files, formatter output, repository-wide mechanical rewrites, or when a purpose-built command is safer. `apply_patch` is a fallback when Hashline does not fit.
-- Do not create or edit files with shell redirection or other shell write tricks. Do not use Python to read or write files when Hashline, `apply_patch`, or a purpose-built command is enough.
+- Hashline file paths may be absolute or relative to the task workspace. For a transaction outside it, select the directory with `root` and keep mutation paths relative to that root.
+- Do not use Hashline for generated or binary files, formatter output, repository-wide mechanical rewrites, or when a purpose-built command is safer.
+- Do not create or edit files with shell redirection or other shell write tricks. Do not use Python to read or write files when Hashline or a purpose-built command is enough.
 
 You may find yourself working in a dirty worktree. Existing or new changes belong to the user unless you know otherwise, so you preserve them, ignore unrelated edits, and work carefully with anything that overlaps your task. If you cannot work around them you escalate to the user.
 

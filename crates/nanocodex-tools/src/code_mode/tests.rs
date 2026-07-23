@@ -696,42 +696,6 @@ text("done");
 }
 
 #[tokio::test]
-async fn freeform_apply_patch_accepts_a_string() -> Result<()> {
-    let workspace = temporary_workspace("freeform-apply-patch")?;
-    let tools = test_tools(&workspace);
-    let history = Vec::new();
-    let execution = tools
-        .execute_code(
-            r#"
-const result = await tools.apply_patch("*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch");
-text(result);
-"#,
-            test_context(&history),
-        )
-        .await;
-
-    assert!(execution.success, "{}", execution_output(&execution));
-    assert!(
-        execution_output(&execution)
-            .contains("Success. Updated the following files:\nA created.txt")
-    );
-    assert_eq!(execution.nested_calls.len(), 1);
-    assert_eq!(
-        execution.nested_calls[0].input,
-        Value::String(
-            "*** Begin Patch\n*** Add File: created.txt\n+created by patch\n*** End Patch"
-                .to_owned()
-        )
-    );
-    assert_eq!(
-        std::fs::read_to_string(workspace.join("created.txt"))?,
-        "created by patch\n"
-    );
-    std::fs::remove_dir_all(workspace)?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn hashline_workspace_tools_are_callable_from_code_mode() -> Result<()> {
     let workspace = temporary_workspace("hashline-workspace-tools")?;
     std::fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")?;
@@ -855,7 +819,7 @@ fn nested_shell_yields_follow_the_handlers_bounds() {
     );
     assert_eq!(
         nested_tool_yield_after(
-            "apply_patch",
+            "view_image",
             &serde_json::json!({ "yield_time_ms": 30_000 })
         ),
         None
@@ -957,8 +921,8 @@ fn model_description_uses_codex_style_declarations() {
         .expect("exec should have a description");
     assert!(description.contains("// @exec:"));
     assert!(description.contains("must be a base64-encoded `data:` URL"));
-    assert!(description.contains("apply_patch(input: string): Promise<unknown>"));
-    assert!(description.contains("prefer `hashline__read`"));
+    assert!(!description.contains("apply_patch"));
+    assert!(description.contains("hashline__read(args: {"));
     assert!(description.contains("exec_command(args: {"));
     assert!(!description.contains("Input schema:"));
     assert_eq!(

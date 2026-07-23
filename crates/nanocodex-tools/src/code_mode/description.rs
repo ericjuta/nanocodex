@@ -9,7 +9,8 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - Nested tool methods take either a string or an object as their input argument.
 - Nested tools return either an object or a string, based on the description.
 - Node.js globals and modules such as `process`, `require`, and dynamic `import()` are unavailable. Use the provided tools for file-system, process, and network access.
-- For normal UTF-8 workspace edits, prefer `hashline__read`/`hashline__find_block` plus `hashline__patch`; use `hashline__transaction` for recoverable multi-file batches.
+- For normal UTF-8 file edits, prefer `hashline__read`/`hashline__find_block` plus `hashline__patch`; use `hashline__transaction` for recoverable multi-file batches.
+- Hashline file paths may be absolute or relative to the configured workspace. For transactions outside it, select that directory with `root` and keep mutations relative to that root.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.

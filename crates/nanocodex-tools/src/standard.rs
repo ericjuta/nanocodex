@@ -1,8 +1,6 @@
-use nanocodex_core::{CustomToolFormat, ToolDefinition};
+use nanocodex_core::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-
-const APPLY_PATCH_GRAMMAR: &str = include_str!("apply_patch/apply_patch.lark");
 
 /// Stable identities and model-visible contracts for Nanocodex's standard tools.
 ///
@@ -14,7 +12,6 @@ pub enum StandardTool {
     ExecCommand,
     WriteStdin,
     UpdatePlan,
-    ApplyPatch,
     ViewImage,
 }
 
@@ -25,7 +22,6 @@ impl StandardTool {
             Self::ExecCommand => "exec_command",
             Self::WriteStdin => "write_stdin",
             Self::UpdatePlan => "update_plan",
-            Self::ApplyPatch => "apply_patch",
             Self::ViewImage => "view_image",
         }
     }
@@ -36,11 +32,6 @@ impl StandardTool {
             Self::ExecCommand => exec_command_definition(self.name()),
             Self::WriteStdin => write_stdin_definition(self.name()),
             Self::UpdatePlan => update_plan_definition(self.name()),
-            Self::ApplyPatch => ToolDefinition::custom(
-                self.name(),
-                "Fallback patch editor. Prefer `hashline__read` plus `hashline__patch` for ordinary UTF-8 workspace edits; use this tool when Hashline does not fit or the caller supplied apply_patch syntax. This is a FREEFORM tool, so do not wrap the patch in JSON.",
-                CustomToolFormat::grammar("lark", APPLY_PATCH_GRAMMAR),
-            ),
             Self::ViewImage => view_image_definition(self.name()),
         }
     }

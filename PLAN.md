@@ -76,8 +76,8 @@ Socket tasks and mutable driver details stay private.
 
 - The workspace is a virtual manifest with the executable under `bin/` and
   focused library crates under `crates/`.
-- Tools live in coherent modules under `nanocodex-tools/src/{shell,
-  apply_patch,code_mode,...}` rather than one giant application crate.
+- Tools live in coherent modules under `nanocodex-tools/src/{shell,hashline,
+  code_mode,...}` rather than one giant application crate.
 - Obsolete root `src/`, duplicate CLI library helpers, and unused refactor paths
   are gone.
 - Public crate boundaries follow ownership rather than historical file layout.

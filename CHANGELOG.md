@@ -14,6 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [agent] Preserve safe fork and replay boundaries, including atomic multi-tool
   history, across compaction, cancellation, and reconnects.
 
+### Features
+
+- [tools] Allow Hashline reads and patches to use absolute or parent-relative
+  paths and transactions to select roots outside the configured workspace.
+
+### Removed
+
+- [tools] Remove the legacy `apply_patch` tool from the workspace bundle and
+  Code Mode; Hashline remains the supported source-editing interface.
+
 ### Documentation
 
 - Describe read-only child policy as instruction-based rather than sandboxed and

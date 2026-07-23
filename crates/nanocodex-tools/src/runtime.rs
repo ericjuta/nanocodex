@@ -11,7 +11,6 @@ use tracing::{Instrument, info, info_span};
 #[cfg(feature = "code-mode")]
 use crate::code_mode::{self, CodeModeExecution};
 use crate::{
-    apply_patch,
     hashline::{HashlineHandler, HashlineToolKind},
     plan,
     shell::{self, ShellSessions},
@@ -554,7 +553,7 @@ impl ToolsBuilder {
         self
     }
 
-    /// Enables or disables the standard command, patch, Hashline, plan, and file tools.
+    /// Enables or disables the standard command, Hashline, plan, and file tools.
     #[must_use]
     pub fn workspace(mut self, enabled: bool) -> Self {
         self.tools.workspace = enabled;
@@ -658,7 +657,6 @@ fn built_in_name(tools: &Tools, name: &str) -> bool {
             "exec_command"
                 | "write_stdin"
                 | "update_plan"
-                | "apply_patch"
                 | "hashline__read"
                 | "hashline__find_block"
                 | "hashline__patch"
@@ -749,7 +747,6 @@ impl ToolRuntime {
                     workspace.clone(),
                     HashlineToolKind::Transaction,
                 )),
-                Arc::new(apply_patch::ApplyPatchHandler::new(workspace.clone())),
                 Arc::new(view_image::ViewImageHandler::new(workspace.clone())),
             ]);
         }
@@ -1375,6 +1372,7 @@ mod tests {
         assert!(enabled_names.contains(&"hashline__find_block"));
         assert!(enabled_names.contains(&"hashline__patch"));
         assert!(enabled_names.contains(&"hashline__transaction"));
+        assert!(!enabled_names.contains(&"apply_patch"));
 
         let without_defaults = Tools::builder().without_defaults().build().unwrap();
         let disabled = ToolRuntime::new_with_tools(".", None, None, &without_defaults);

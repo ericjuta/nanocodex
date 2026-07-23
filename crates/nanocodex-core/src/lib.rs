@@ -369,7 +369,8 @@ mod tests {
         let prompt = ModelConfig::default().system_prompt;
         assert!(prompt.contains("Use Hashline as the default"));
         assert!(prompt.contains("`hashline__transaction`"));
-        assert!(prompt.contains("`apply_patch` is a fallback"));
+        assert!(prompt.contains("paths may be absolute"));
+        assert!(!prompt.contains("`apply_patch`"));
     }
 
     #[test]

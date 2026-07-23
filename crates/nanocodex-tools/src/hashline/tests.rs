@@ -216,7 +216,7 @@ fn block_anchor_round_trips_and_rejects_stale_evidence() {
 }
 
 #[test]
-fn tool_schemas_explain_relative_paths_and_patch_grammar() {
+fn tool_schemas_explain_external_paths_and_patch_grammar() {
     let read =
         serde_json::to_value(super::read_definition()).expect("read definition should serialize");
     assert!(
@@ -235,7 +235,7 @@ fn tool_schemas_explain_relative_paths_and_patch_grammar() {
         read["parameters"]["properties"]["path"]["description"]
             .as_str()
             .expect("read path description should be text")
-            .contains("workspace-relative")
+            .contains("absolute paths")
     );
 
     let patch =
@@ -515,48 +515,84 @@ fn patch_rejections_explain_a_valid_hashline_retry() {
         );
     }
 
-    let absolute_path = read(
+    fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[test]
+fn paths_and_transaction_roots_may_resolve_outside_the_workspace() {
+    let root = workspace("path-root");
+    let external = workspace("path-external");
+    let external_file = external.join("outside.txt");
+    fs::write(&external_file, b"outside\n").expect("external fixture should write");
+
+    let absolute = read(
         &root,
         &ReadRequest {
-            path: root.join("notes.txt").display().to_string(),
+            path: external_file.display().to_string(),
             start_line: None,
             end_line: None,
             max_lines: None,
         },
     )
-    .expect_err("absolute paths should fail")
-    .to_string();
-    assert!(absolute_path.contains("workspace-relative"));
-    assert!(absolute_path.contains("invalid `path`"));
+    .expect("absolute path should resolve outside the workspace");
+    assert!(
+        absolute["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("outside"))
+    );
 
-    let patch_path = execute_patch(
+    let parent_relative = PathBuf::from("..")
+        .join(
+            external
+                .file_name()
+                .expect("external directory should have a name"),
+        )
+        .join("outside.txt");
+    read(
+        &root,
+        &ReadRequest {
+            path: parent_relative.display().to_string(),
+            start_line: None,
+            end_line: None,
+            max_lines: None,
+        },
+    )
+    .expect("parent traversal should resolve outside the workspace");
+
+    let absolute_created = external.join("created.txt");
+    execute_patch(
         &root,
         &PatchRequest {
-            patch: "[/absolute.txt]\nINS.HEAD:\n+nope".to_owned(),
+            patch: format!("[{}]\nINS.HEAD:\n+created", absolute_created.display()),
             dry_run: false,
         },
     )
-    .expect_err("an invalid patch section path should fail")
-    .to_string();
-    assert!(patch_path.contains("invalid `path` at Hashline patch program line 1"));
-    assert!(!root.join("absolute.txt").exists());
+    .expect("absolute patch path should commit outside the workspace");
+    assert_eq!(
+        fs::read(&absolute_created).expect("absolute patch result should read"),
+        b"created"
+    );
 
-    let invalid_root = execute_transaction(
+    execute_transaction(
         &root,
         &TransactionRequest {
-            action: TransactionAction::Preview,
-            root: Some("/absolute".to_owned()),
+            action: TransactionAction::Commit,
+            root: Some(external.display().to_string()),
             mutations: vec![FileMutation::Create {
-                path: "created.txt".to_owned(),
-                contents: "nope".to_owned(),
+                path: "transaction.txt".to_owned(),
+                contents: "committed".to_owned(),
             }],
         },
     )
-    .expect_err("an invalid transaction root should fail")
-    .to_string();
-    assert!(invalid_root.contains("invalid `root`"));
+    .expect("absolute transaction root should commit outside the workspace");
+    assert_eq!(
+        fs::read(external.join("transaction.txt"))
+            .expect("external transaction result should read"),
+        b"committed"
+    );
 
     fs::remove_dir_all(root).expect("workspace should be removed");
+    fs::remove_dir_all(external).expect("external workspace should be removed");
 }
 
 #[test]

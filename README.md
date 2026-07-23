@@ -500,6 +500,9 @@ default. An explicit tool selection can enable it with
 Hashline is exposed to the model through Code Mode as `tools.hashline__read`,
 `tools.hashline__find_block`, `tools.hashline__patch`, and
 `tools.hashline__transaction`.
+Paths may be absolute or relative to the configured workspace. A transaction
+can select an external directory with `root`; its mutation paths remain relative
+to that root.
 
 For a direct single-file edit, copy `patchHeader` and a line anchor from a recent
 read, then pass the operations as one Hashline DSL string—not as a JSON array:

@@ -433,7 +433,7 @@ fn execute_patch(workspace: &Path, request: &PatchRequest) -> Result<Value, Func
     }
     reject_conflicts(&prepared)?;
     if !request.dry_run {
-        apply_patch_prepared(workspace, &prepared)?;
+        commit_prepared_patch(workspace, &prepared)?;
     }
     let total_files = details.len();
     let mut bounded_details = Vec::new();
@@ -685,9 +685,7 @@ fn execute_transaction(
         ));
     }
     let root_name = request.root.as_deref().unwrap_or(".");
-    if root_name != "." {
-        validate_model_path_field(root_name, "root", None)?;
-    }
+    validate_model_path_field(root_name, "root", None)?;
     let root = transaction_fs::open_root(workspace, root_name)?;
     transaction_fs::recover_pending(&root)?;
     let mut prepared = prepare_transaction(&root, &request.mutations)?;
@@ -759,7 +757,6 @@ fn prepare_transaction(
     for mutation in mutations {
         let item = match mutation {
             FileMutation::Create { path, contents } => {
-                validate_model_path(path)?;
                 transaction_fs::ensure_missing(root, path)?;
                 PreparedMutation::Write {
                     path: path.clone(),
@@ -800,7 +797,6 @@ fn prepare_transaction(
             } => {
                 let observed = transaction_fs::observe(root, source)?;
                 validate_exact(source, &observed.bytes, &expected.exact_digest)?;
-                validate_model_path(destination)?;
                 transaction_fs::ensure_missing(root, destination)?;
                 let after = if edits.is_empty() {
                     observed.bytes.clone()
@@ -948,47 +944,53 @@ fn validate_model_path_field(
     field: &'static str,
     line: Option<usize>,
 ) -> Result<(), FunctionCallError> {
-    let path = Path::new(model_path);
-    if model_path.is_empty() || path.is_absolute() {
+    if model_path.is_empty() {
         return Err(FunctionCallError::Path {
             field,
             line,
-            message: "must be a non-empty workspace-relative path".to_owned(),
-        });
-    }
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(FunctionCallError::Path {
-            field,
-            line,
-            message: format!("{model_path:?} contains an invalid component"),
+            message: "must be a non-empty path".to_owned(),
         });
     }
     Ok(())
 }
 
-fn resolve_existing(root: &Path, model_path: &str) -> Result<PathBuf, FunctionCallError> {
-    validate_model_path(model_path)?;
-    let root = root
-        .canonicalize()
-        .map_err(|error| io_error("open root", root, error))?;
-    let mut current = root.clone();
-    for component in Path::new(model_path).components() {
-        let Component::Normal(part) = component else {
-            unreachable!()
-        };
-        current.push(part);
-        let metadata =
-            fs::symlink_metadata(&current).map_err(|error| io_error("resolve", &current, error))?;
-        if metadata.file_type().is_symlink() {
-            return model_error(format!(
-                "Hashline path {model_path} traverses a symbolic link"
-            ));
+fn resolve_model_path(root: &Path, model_path: &str) -> Result<PathBuf, FunctionCallError> {
+    let path = Path::new(model_path);
+    let unresolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let root = root
+            .canonicalize()
+            .map_err(|error| io_error("open root", root, error))?;
+        root.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in unresolved.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
         }
     }
-    Ok(current)
+    Ok(normalized)
+}
+
+fn resolve_existing(root: &Path, model_path: &str) -> Result<PathBuf, FunctionCallError> {
+    validate_model_path(model_path)?;
+    let path = resolve_model_path(root, model_path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| io_error("resolve", &path, error))?;
+    if canonical != path {
+        return model_error(format!(
+            "Hashline path {model_path} traverses a symbolic link"
+        ));
+    }
+    Ok(path)
 }
 
 fn resolve_destination(
@@ -997,29 +999,35 @@ fn resolve_destination(
     create_parents: bool,
 ) -> Result<PathBuf, FunctionCallError> {
     validate_model_path(model_path)?;
-    let parent = Path::new(model_path)
+    let target = resolve_model_path(root, model_path)?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "Hashline path {model_path} has no file name"
+            ))
+        })?
+        .to_os_string();
+    let parent = target
         .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let root = root
-        .canonicalize()
-        .map_err(|error| io_error("open root", root, error))?;
-    let parent_path = root.join(parent);
+        .ok_or_else(|| FunctionCallError::RespondToModel("target has no parent".to_owned()))?;
     if create_parents {
-        fs::create_dir_all(&parent_path)
-            .map_err(|error| io_error("create parent", &parent_path, error))?;
+        fs::create_dir_all(parent).map_err(|error| io_error("create parent", parent, error))?;
     }
-    let canonical_parent = parent_path
+    let canonical_parent = parent
         .canonicalize()
-        .map_err(|error| io_error("resolve parent", &parent_path, error))?;
-    if !canonical_parent.starts_with(&root) {
-        return model_error(format!("Hashline path {model_path} escapes the workspace"));
+        .map_err(|error| io_error("resolve parent", parent, error))?;
+    if canonical_parent != parent {
+        return model_error(format!(
+            "Hashline path {model_path} traverses a symbolic link"
+        ));
     }
-    Ok(root.join(model_path))
+    Ok(parent.join(name))
 }
 
 fn ensure_missing(root: &Path, model_path: &str) -> Result<(), FunctionCallError> {
     validate_model_path(model_path)?;
-    let target = root.join(model_path);
+    let target = resolve_model_path(root, model_path)?;
     match fs::symlink_metadata(&target) {
         Ok(_) => model_error(format!("Hashline destination {model_path} already exists")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -1054,7 +1062,7 @@ fn reject_conflicts(prepared: &[PreparedMutation]) -> Result<(), FunctionCallErr
     Ok(())
 }
 
-fn apply_patch_prepared(
+fn commit_prepared_patch(
     root: &Path,
     prepared: &[PreparedMutation],
 ) -> Result<(), FunctionCallError> {
@@ -1287,13 +1295,13 @@ fn model_error<T>(message: impl Into<String>) -> Result<T, FunctionCallError> {
 fn read_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__read",
-        "Preferred first step for editing a known UTF-8 workspace file: read the smallest useful range with compact file/line anchors, an unambiguous copy-ready patchHeader, and a distinct exact-byte SHA-256 digest.",
+        "Preferred first step for editing a known UTF-8 file: read the smallest useful range with compact file/line anchors, an unambiguous copy-ready patchHeader, and a distinct exact-byte SHA-256 digest.",
         json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Non-empty workspace-relative file path. Absolute paths, current-directory components, and parent traversal are rejected."
+                    "description": "Non-empty file path. Relative paths resolve from the configured workspace; absolute paths and parent traversal are accepted."
                 },
                 "start_line": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1},
@@ -1314,7 +1322,7 @@ fn block_definition() -> ToolDefinition {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Non-empty workspace-relative file path. Absolute paths, current-directory components, and parent traversal are rejected."
+                    "description": "Non-empty file path. Relative paths resolve from the configured workspace; absolute paths and parent traversal are accepted."
                 },
                 "anchor": {"type": "string"},
                 "max_lines": {"type": "integer", "minimum": 1, "maximum": HARD_BLOCK_MAX_LINES}
@@ -1328,7 +1336,7 @@ fn block_definition() -> ToolDefinition {
 fn patch_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__patch",
-        "Preferred default for routine UTF-8 workspace edits. For a direct single-file edit, pass hashline__read.patchHeader as header plus one operations DSL string, for example `SWAP 2:f589:\\n+bravo`. Copy recent anchors verbatim; do not invent hashes or pass operations as a JSON array/object. For multi-file edits, pass a fully sectioned patch program. Routine commits are not crash-atomic; use hashline__transaction for recoverable batches.",
+        "Preferred default for routine UTF-8 file edits. For a direct single-file edit, pass hashline__read.patchHeader as header plus one operations DSL string, for example `SWAP 2:f589:\\n+bravo`. Copy recent anchors verbatim; do not invent hashes or pass operations as a JSON array/object. For multi-file edits, pass a fully sectioned patch program. Routine commits are not crash-atomic; use hashline__transaction for recoverable batches.",
         json!({
             "type": "object",
             "properties": {
@@ -1381,7 +1389,7 @@ fn transaction_definition() -> ToolDefinition {
                 ]},
                 "root": {
                     "type": "string",
-                    "description": "Workspace-relative transaction root directory. Omit or use \".\" for the workspace root; absolute paths and parent traversal are rejected."
+                    "description": "Transaction root directory. Relative paths resolve from the configured workspace; absolute paths and parent traversal are accepted. Omit or use \".\" for the workspace root."
                 },
                 "mutations": {"type": "array", "minItems": 1, "maxItems": MAX_MUTATIONS, "description": "For commitPreviewed, resubmit the exact mutations used for preview without any change.", "items": mutation_schema()}
             },
@@ -1394,7 +1402,7 @@ fn transaction_definition() -> ToolDefinition {
 fn mutation_schema() -> Value {
     let path = json!({
         "type": "string",
-        "description": "Non-empty path relative to the selected transaction root. Absolute paths, current-directory components, and parent traversal are rejected."
+        "description": "Non-empty path relative to the selected transaction root. To address another directory, select it through `root`."
     });
     let anchor = json!({"type": "object", "properties": {"line": {"type": "integer", "minimum": 1}, "expectedHash": {"type": "string"}}, "required": ["line", "expectedHash"], "additionalProperties": false});
     let expected = json!({"type": "object", "properties": {"exactDigest": {"type": "string"}}, "required": ["exactDigest"], "additionalProperties": false});

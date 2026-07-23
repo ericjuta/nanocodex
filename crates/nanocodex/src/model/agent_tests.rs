@@ -1558,7 +1558,7 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "await tools.apply_patch(\"*** Begin Patch\\n*** Add File: AGENTS.md\\n+fresh compacted instructions\\n*** End Patch\"); text(\"tool completed\")"
+                    "input": "const result = await tools.hashline__transaction({action:{type:\"commit\"},mutations:[{type:\"create\",path:\"AGENTS.md\",contents:\"fresh compacted instructions\\n\"}]}); text(\"tool completed\")"
                 })],
                 372_001,
             ),
