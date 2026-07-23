@@ -225,7 +225,7 @@ fn highlight_assets() -> &'static HighlightAssets {
             .or_else(|| themes.themes.values().next().cloned())
             .unwrap_or_default();
         HighlightAssets {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
+            syntaxes: two_face::syntax::extra_newlines(),
             theme,
         }
     })
@@ -1226,5 +1226,30 @@ mod tests {
             fallback[0].spans[0].style.fg,
             Some(ratatui::style::Color::Yellow)
         );
+    }
+
+    #[test]
+    fn highlights_typescript_and_tsx() {
+        for (language, source) in [
+            (
+                "typescript",
+                "interface User { name: string }\nconst user: User = { name: \"Ada\" };",
+            ),
+            (
+                "tsx",
+                "const Greeting = ({ name }: { name: string }) => <p>Hello {name}</p>;",
+            ),
+        ] {
+            let highlighted = highlighted_code_lines(Some(language), source);
+            let colors = highlighted
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter_map(|span| span.style.fg)
+                .collect::<HashSet<_>>();
+            assert!(
+                colors.len() > 1,
+                "{language} source should use multiple syntax colors"
+            );
+        }
     }
 }
