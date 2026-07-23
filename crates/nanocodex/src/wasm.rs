@@ -418,6 +418,7 @@ fn spawn_agent(
             Arc::clone(&transport_stats),
             factory.tools.clone(),
             factory.prompt_cache.clone(),
+            None,
         ),
         Some(checkpoint) => ModelRun::from_checkpoint(
             events.clone(),

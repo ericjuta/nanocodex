@@ -8,7 +8,7 @@ import {
   useSyncExternalStore,
 } from "react";
 
-export { createNanocodexConfig } from "./config.mjs";
+export { createConfig } from "./config.mjs";
 
 const NanocodexContext = createContext(null);
 
@@ -18,30 +18,24 @@ export function NanocodexProvider({ children, config }) {
   return createElement(NanocodexContext.Provider, { value: config }, children);
 }
 
-export function useNanocodexConfig() {
+export function useConfig() {
   const config = useContext(NanocodexContext);
   if (!config) throw new Error("Nanocodex hooks must be used inside NanocodexProvider");
   return config;
 }
 
-export function useNanocodexState() {
-  const config = useNanocodexConfig();
-  return useSyncExternalStore(config.subscribe, config.getState, config.getState);
-}
-
 export function useNanocodex() {
-  const config = useNanocodexConfig();
-  const state = useSyncExternalStore(config.subscribe, config.getState, config.getState);
+  const config = useConfig();
+  const snapshot = useSyncExternalStore(config.subscribe, config.getSnapshot, config.getSnapshot);
   return useMemo(() => ({
-    ...state,
-    send: config.send,
-    subscribe: config.subscribeMessages,
+    ...snapshot,
+    dispatch: config.dispatch,
     stop: config.stop,
-  }), [config, state]);
+  }), [config, snapshot]);
 }
 
-export function useNanocodexMessages(listener) {
-  const config = useNanocodexConfig();
+export function useNanocodexMessage(listener) {
+  const config = useConfig();
   const latest = useRef(listener);
   latest.current = listener;
   useEffect(

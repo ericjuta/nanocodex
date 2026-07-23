@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createNanocodexConfig } from "../config.mjs";
+import { createConfig } from "../config.mjs";
 
 test("Nanocodex config owns worker lifecycle outside React", async () => {
   const commands = [];
@@ -11,11 +11,10 @@ test("Nanocodex config owns worker lifecycle outside React", async () => {
     postMessage(command) { commands.push(command); },
     terminate() { terminated = true; },
   };
-  const config = createNanocodexConfig({
+  const config = createConfig({
+    worker: () => worker,
     thinking: "high",
     reasoningMode: "pro",
-    createWorker: () => worker,
-    checkHealth: async () => ({ agent_configured: true, credential_source: "user" }),
   });
   let stateChanges = 0;
   const unsubscribe = config.subscribe(() => { stateChanges += 1; });
@@ -26,21 +25,19 @@ test("Nanocodex config owns worker lifecycle outside React", async () => {
   assert.deepEqual(commands, [{ type: "start", thinking: "high", reasoningMode: "pro" }]);
   worker.onmessage({ data: { type: "ready" } });
   await Promise.resolve();
-  assert.deepEqual(config.getState(), {
-    ready: true,
-    configured: true,
-    credentialSource: "user",
-    stopped: false,
-  });
+  assert.deepEqual(config.getSnapshot(), { status: "ready", error: undefined });
   assert.deepEqual(messages, ["ready"]);
+  config.dispatch({ type: "prompt", prompt: "hello" });
+  assert.deepEqual(commands.at(-1), { type: "prompt", prompt: "hello" });
 
   unmount();
   unsubscribe();
   assert.equal(terminated, true);
-  assert.equal(config.getState().ready, false);
+  assert.equal(config.getSnapshot().status, "idle");
+  assert.throws(() => config.dispatch({ type: "prompt" }), /not running/);
   assert.ok(stateChanges >= 2);
 });
 
 test("the library requires the application to provide its Worker boundary", () => {
-  assert.throws(() => createNanocodexConfig(), /requires createWorker/);
+  assert.throws(() => createConfig(), /requires worker/);
 });

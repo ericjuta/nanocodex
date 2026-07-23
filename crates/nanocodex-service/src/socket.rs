@@ -631,6 +631,10 @@ mod tests {
     }
 
     fn assert_subscription_headers(request: &Request) {
+        let user_agent = format!(
+            "codex_cli_rs/0.1337.0 (nanocodex/{})",
+            env!("CARGO_PKG_VERSION")
+        );
         for (name, expected) in [
             ("authorization", "Bearer subscription-token"),
             ("ChatGPT-Account-ID", "account-test"),
@@ -642,7 +646,7 @@ mod tests {
             ("x-openai-internal-codex-responses-lite", "true"),
             ("originator", "codex_cli_rs"),
             ("version", "0.1337.0"),
-            ("user-agent", "codex_cli_rs/0.1337.0 (nanocodex/0.1.0)"),
+            ("user-agent", user_agent.as_str()),
         ] {
             assert_eq!(
                 request

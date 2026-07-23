@@ -12,10 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Publish safe fork boundaries before compaction, force authoritative replay
   after a failed continuation, and keep multi-tool history atomic.
 
-## [0.1.0](https://github.com/gakonst/nanocodex/releases/tag/v0.1.0) - 2026-07-21
+## [0.1.1](https://github.com/gakonst/nanocodex/releases/tag/v0.1.1) - 2026-07-23
 
 ### Bug Fixes
 
+- [wasm] Scope host tools to agent sessions
 - [observability] Retain yielded tool lineage
 - Emit completed assistant items from Responses ([#4](https://github.com/gakonst/nanocodex/issues/4))
 - Preserve assistant message phases in events ([#3](https://github.com/gakonst/nanocodex/issues/3))
@@ -29,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- Support GPT-5.6 Pro reasoning mode
+- Share prompt-cache warmups
+- Persist Codex-compatible rollouts
+- Expose VM-ready standard tools
+- [agent] Propagate reasoning mode across runtime surfaces
+- [wasm] Add full agent lifecycle control
+- [agent] Add shared cache and resumable rollouts
+- Expose VM-ready standard tools
+- [tools] Allow replacing workspace tools
+- [agent] Expose clean sibling spawn
+- [tools] Embed QuickJS code mode
+- [telemetry] Measure end-to-end TUI stream latency
 - Add ChatGPT subscription authentication
 - [observability] Export full-fidelity agent traces
 - [agent] Checkpoint active turn boundaries
@@ -41,16 +54,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- [release] Prepare 0.1.0
 - [release] Refresh 0.1.0 changelogs
 - [release] Add per-crate changelogs
 - [release] Automate publishing and native updates
 
 ### Other
 
+- Merge pull request [#11](https://github.com/gakonst/nanocodex/issues/11) from gakonst/agent/gpt-5-6-pro-config
+- Merge pull request [#9](https://github.com/gakonst/nanocodex/issues/9) from gakonst/agent/cloneable-nanocodex-builder
+- Make NanocodexBuilder cloneable
+- Merge pull request [#8](https://github.com/gakonst/nanocodex/issues/8) from gakonst/agent/embedded-quickjs-code-mode
 - Compose subagents with unified events
 
 ### Performance
 
+- [tui] Optimize long-session rendering and interaction
 - [tools] Share code mode history snapshots
 
 ### Refactor

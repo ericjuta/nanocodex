@@ -145,6 +145,12 @@ impl AgentEvents {
         self.receiver.recv().await
     }
 
+    /// Receives one immediately available event without waiting.
+    #[doc(hidden)]
+    pub fn try_recv_timed(&mut self) -> Option<TimedAgentEvent> {
+        self.receiver.try_recv().ok()
+    }
+
     /// Writes every event as one flushed JSONL record.
     ///
     /// # Errors
@@ -269,6 +275,9 @@ impl EventSink {
         payload: P,
         source_received_ns: Option<u64>,
     ) -> Result<u64, EventError> {
+        if self.sender.is_closed() {
+            return Ok(self.next_seq.fetch_add(1, Ordering::Relaxed));
+        }
         let payload = to_raw_value(&payload).map_err(EventError::Encode)?;
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         drop(self.sender.send(TimedAgentEvent {
@@ -290,6 +299,7 @@ impl EventSink {
 
 #[cfg(test)]
 mod tests {
+    use serde::{Serialize, Serializer};
     use serde_json::json;
 
     use super::{AgentEventKind, EventSink};
@@ -317,6 +327,30 @@ mod tests {
     }
 
     #[test]
+    fn receiver_drop_skips_payload_serialization() {
+        struct MustNotSerialize;
+
+        impl Serialize for MustNotSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                panic!("closed event streams must not serialize payloads")
+            }
+        }
+
+        let (events, receiver) = EventSink::channel("request-1".to_owned());
+        drop(receiver);
+
+        assert_eq!(
+            events
+                .emit_with_sequence(AgentEventKind::ApiEvent, MustNotSerialize)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn timing_is_private_and_preserves_the_jsonl_contract() {
         let (events, mut receiver) = EventSink::channel("request-1".to_owned());
         let source_received_ns = super::monotonic_now_ns();
@@ -335,5 +369,21 @@ mod tests {
         assert!(encoded.get("timing").is_none());
         assert!(encoded.get("source_received_ns").is_none());
         assert_eq!(encoded["type"], "assistant.delta");
+    }
+
+    #[test]
+    fn timed_events_can_be_drained_without_async_receive_round_trips() {
+        let (events, mut receiver) = EventSink::channel("request-1".to_owned());
+        for n in 1..=3 {
+            events
+                .emit(AgentEventKind::AssistantDelta, json!({ "n": n }))
+                .unwrap();
+        }
+
+        let sequences = std::iter::from_fn(|| receiver.try_recv_timed())
+            .map(|event| event.event.seq)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2, 3]);
+        assert!(receiver.try_recv_timed().is_none());
     }
 }

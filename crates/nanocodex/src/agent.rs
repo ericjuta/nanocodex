@@ -23,7 +23,10 @@ use tracing::{Instrument, error, info, info_span};
 use crate::prompt_cache::{ModelPromptCache, SharedPromptCache};
 use crate::{
     NanocodexError, Result,
-    model::agent::{CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome},
+    model::{
+        agent::{CompletedModelTurn, ModelCheckpoint, ModelRun, ModelTurnOutcome},
+        load_global_instructions,
+    },
     responses::{FactoryResponses, LayeredResponses, Responses, StandardResponses},
     rollout::{RolloutConfig, RolloutInfo, RolloutOrigin, RolloutRecorder, RolloutTurn},
 };
@@ -287,7 +290,7 @@ impl Nanocodex {
             workspace: None,
             session_id: None,
             prompt_cache: PromptCacheConfig::default(),
-            rollout: None,
+            codex: CodexCompatibility::default(),
             responses: Responses::default(),
         }
     }
@@ -445,7 +448,7 @@ pub struct NanocodexBuilder<S = StandardResponses> {
     workspace: Option<PathBuf>,
     session_id: Option<String>,
     prompt_cache: PromptCacheConfig,
-    rollout: Option<RolloutConfig>,
+    codex: CodexCompatibility,
     responses: Responses<S>,
 }
 
@@ -455,6 +458,11 @@ struct PromptCacheConfig {
     shared: Option<SharedPromptCache>,
 }
 
+#[derive(Clone, Default)]
+struct CodexCompatibility {
+    home: Option<PathBuf>,
+    rollout: Option<RolloutConfig>,
+}
 impl<S> NanocodexBuilder<S> {
     /// Replaces the stable system/developer instructions.
     #[must_use]
@@ -549,10 +557,21 @@ impl<S> NanocodexBuilder<S> {
         self
     }
 
+    /// Loads global user instructions from `AGENTS.override.md` or `AGENTS.md`
+    /// in the supplied Codex state directory.
+    #[must_use]
+    pub fn codex_home(mut self, codex_home: impl Into<PathBuf>) -> Self {
+        self.codex.home = Some(codex_home.into());
+        self
+    }
+
     /// Records committed history in Codex's resumable JSONL rollout layout.
     #[must_use]
     pub fn rollout(mut self, rollout: RolloutConfig) -> Self {
-        self.rollout = Some(rollout);
+        if self.codex.home.is_none() {
+            self.codex.home = Some(rollout.codex_home().to_path_buf());
+        }
+        self.codex.rollout = Some(rollout);
         self
     }
 
@@ -565,7 +584,7 @@ impl<S> NanocodexBuilder<S> {
             workspace: self.workspace,
             session_id: self.session_id,
             prompt_cache: self.prompt_cache,
-            rollout: self.rollout,
+            codex: self.codex,
             responses,
         }
     }
@@ -585,7 +604,7 @@ impl NanocodexBuilder<StandardResponses> {
             &self.config,
             self.session_id.as_deref(),
             self.prompt_cache.key.as_deref(),
-            self.rollout.as_ref(),
+            self.codex.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
         let service_factory: ServiceFactory<DefaultResponsesService> = Arc::new({
@@ -598,7 +617,7 @@ impl NanocodexBuilder<StandardResponses> {
             self.workspace,
             self.session_id,
             self.prompt_cache,
-            self.rollout,
+            self.codex,
             service_factory,
         )
     }
@@ -625,7 +644,7 @@ where
             &self.config,
             self.session_id.as_deref(),
             self.prompt_cache.key.as_deref(),
-            self.rollout.as_ref(),
+            self.codex.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
         let layers = self.responses.service.0;
@@ -643,7 +662,7 @@ where
             self.workspace,
             self.session_id,
             self.prompt_cache,
-            self.rollout,
+            self.codex,
             service_factory,
         )
     }
@@ -670,7 +689,7 @@ where
             &self.config,
             self.session_id.as_deref(),
             self.prompt_cache.key.as_deref(),
-            self.rollout.as_ref(),
+            self.codex.rollout.as_ref(),
         )?;
         let config = Arc::new(self.config);
         let service_factory: ServiceFactory<S> = Arc::new(self.responses.service.0);
@@ -680,7 +699,7 @@ where
             self.workspace,
             self.session_id,
             self.prompt_cache,
-            self.rollout,
+            self.codex,
             service_factory,
         )
     }
@@ -694,6 +713,7 @@ struct AgentDriver<S> {
     transport_stats: Arc<TransportStats>,
     tools: Tools,
     workspace: Option<Arc<str>>,
+    global_instructions: Option<Arc<str>>,
     spawner: BranchSpawner<S>,
     initial_checkpoint: Option<ModelCheckpoint>,
     origin: AgentOrigin,
@@ -706,6 +726,7 @@ struct BranchSpawner<S> {
     lineage_id: Arc<str>,
     prompt_cache_key: Option<Arc<str>>,
     shared_prompt_cache: Option<SharedPromptCache>,
+    codex_home: Option<PathBuf>,
     depth: u32,
     rollout: Option<RolloutConfig>,
     service_factory: ServiceFactory<S>,
@@ -726,6 +747,7 @@ impl<S> Clone for BranchSpawner<S> {
             lineage_id: Arc::clone(&self.lineage_id),
             prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
             shared_prompt_cache: self.shared_prompt_cache.clone(),
+            codex_home: self.codex_home.clone(),
             depth: self.depth,
             rollout: self.rollout.clone(),
             service_factory: Arc::clone(&self.service_factory),
@@ -784,6 +806,7 @@ where
                 Arc::clone(&self.transport_stats),
                 self.tools.clone(),
                 prompt_cache.clone(),
+                self.global_instructions.clone(),
             )
         };
         let mut turn_index = 0_u64;
@@ -813,7 +836,12 @@ where
                             result,
                         } => {
                             turn_index += 1;
-                            let prompt_content = serde_json::to_string(&prompt).ok();
+                            let prompt_content = tracing::enabled!(
+                                target: "nanocodex",
+                                tracing::Level::INFO
+                            )
+                            .then(|| serde_json::to_string(&prompt).ok())
+                            .flatten();
                             let turn_span = agent_turn_span(
                                 parent.as_ref(),
                                 session_id.as_str(),
@@ -870,7 +898,12 @@ where
                 continue;
             };
             turn_index += 1;
-            let prompt_content = serde_json::to_string(&prompt).ok();
+            let prompt_content = tracing::enabled!(
+                target: "nanocodex",
+                tracing::Level::INFO
+            )
+            .then(|| serde_json::to_string(&prompt).ok())
+            .flatten();
             let turn_span = agent_turn_span(
                 parent.as_ref(),
                 session_id.as_str(),
@@ -1212,6 +1245,7 @@ where
             workspace,
             (self.service_factory)(),
             Some(checkpoint.model.clone()),
+            None,
             AgentOrigin {
                 kind: "fork",
                 depth: self.depth.saturating_add(1),
@@ -1233,17 +1267,20 @@ where
             lineage_id: Arc::from(session_id.as_str()),
             prompt_cache_key: self.prompt_cache_key.as_ref().map(Arc::clone),
             shared_prompt_cache: self.shared_prompt_cache.clone(),
+            codex_home: self.codex_home.clone(),
             depth,
             rollout: self.rollout.clone(),
             service_factory: Arc::clone(&self.service_factory),
         };
         let service = (self.service_factory)();
+        let global_instructions = load_global_instructions(self.codex_home.as_deref());
         spawn_agent_driver(
             spawner,
             session_id,
             workspace,
             service,
             None,
+            global_instructions,
             AgentOrigin {
                 kind: "spawn",
                 depth,
@@ -1259,7 +1296,7 @@ fn build_agent<S>(
     workspace: Option<PathBuf>,
     session_id: Option<String>,
     prompt_cache: PromptCacheConfig,
-    rollout: Option<RolloutConfig>,
+    codex: CodexCompatibility,
     service_factory: ServiceFactory<S>,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
@@ -1281,6 +1318,7 @@ where
         })
         .transpose()?;
     let service = service_factory();
+    let global_instructions = load_global_instructions(codex.home.as_deref());
     spawn_agent_driver(
         BranchSpawner {
             config,
@@ -1288,14 +1326,16 @@ where
             lineage_id,
             prompt_cache_key: key.map(Arc::from),
             shared_prompt_cache: shared,
+            codex_home: codex.home,
             depth: 0,
-            rollout,
+            rollout: codex.rollout,
             service_factory,
         },
         session_id,
         workspace,
         service,
         None,
+        global_instructions,
         AgentOrigin {
             kind: "root",
             depth: 0,
@@ -1310,6 +1350,7 @@ fn spawn_agent_driver<S>(
     workspace: Option<Arc<str>>,
     service: S,
     initial_checkpoint: Option<ModelCheckpoint>,
+    global_instructions: Option<Arc<str>>,
     origin: AgentOrigin,
 ) -> Result<(Nanocodex, AgentEvents)>
 where
@@ -1371,6 +1412,7 @@ where
                 transport_stats,
                 tools,
                 workspace,
+                global_instructions,
                 spawner,
                 initial_checkpoint,
                 origin,
@@ -1600,6 +1642,28 @@ mod tests {
         assert!(rollout.path().is_file());
         agent.flush_rollout().await.unwrap();
         drop((agent, events));
+    }
+
+    #[test]
+    fn rollout_codex_home_also_configures_global_instructions() {
+        let home = tempdir().unwrap();
+        let builder = Nanocodex::builder("test").rollout(RolloutConfig::new(home.path()));
+
+        assert_eq!(builder.codex.home.as_deref(), Some(home.path()));
+    }
+
+    #[test]
+    fn explicit_codex_home_is_not_replaced_by_rollout_home() {
+        let instructions_home = tempdir().unwrap();
+        let rollout_home = tempdir().unwrap();
+        let builder = Nanocodex::builder("test")
+            .codex_home(instructions_home.path())
+            .rollout(RolloutConfig::new(rollout_home.path()));
+
+        assert_eq!(
+            builder.codex.home.as_deref(),
+            Some(instructions_home.path())
+        );
     }
 
     #[tokio::test]

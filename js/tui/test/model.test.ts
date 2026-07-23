@@ -4,16 +4,29 @@ import { test } from "node:test";
 
 import {
   applyAgentEvents,
+  groupAgentEventsByTarget,
   initialTerminalState,
   queuePrompt,
   queueSteer,
   steerAdmitted,
+  turnRejected,
   type AgentEvent,
-} from "./agentTerminalModel.ts";
+} from "../src/index.ts";
 
 function event(seq: number, type: string, payload: Record<string, unknown>): AgentEvent {
   return { protocol_version: 1, request_id: "test", seq, type, payload };
 }
+
+test("a prompt rejected before run start leaves no phantom queued work", () => {
+  const queued = queuePrompt(initialTerminalState(), 7, "fork me");
+  const rejected = turnRejected(queued, "no safe conversation boundary");
+
+  assert.equal(rejected.pendingTurns, 0);
+  assert.equal(rejected.queuedPrompts.length, 0);
+  assert.equal(rejected.displayedQueuedPrompt, undefined);
+  assert.equal(rejected.entries.at(-1)?.kind, "error");
+  assert.equal(rejected.pendingSteers.length + rejected.queuedPrompts.length, 0);
+});
 
 test("a streaming burst remains one semantic transcript entry", () => {
   const events = Array.from({ length: 20_000 }, (_, index) =>
@@ -27,6 +40,56 @@ test("a streaming burst remains one semantic transcript entry", () => {
   assert.equal(state.entries[0]?.kind, "assistant");
   assert.equal("text" in state.entries[0]! ? state.entries[0].text.length : 0, 20_000);
   assert.ok(elapsed < 750, `20,000 deltas took ${elapsed.toFixed(1)} ms`);
+});
+
+test("one browser frame groups each session into one reducer pass", () => {
+  const main = { pane: "main" as const, branchId: 3 };
+  const btw = { pane: "btw" as const, id: 9 };
+  const batches = groupAgentEventsByTarget([
+    { target: main, event: event(1, "assistant.delta", { text: "a" }) },
+    { target: btw, event: event(2, "assistant.delta", { text: "side" }) },
+    { target: main, event: event(3, "assistant.delta", { text: "b" }) },
+  ]);
+
+  assert.equal(batches.length, 2);
+  assert.deepEqual(batches[0]?.events.map(({ seq }) => seq), [1, 3]);
+  assert.deepEqual(batches[1]?.events.map(({ seq }) => seq), [2]);
+});
+
+test("status-only event batches preserve transcript identity", () => {
+  const state = {
+    ...initialTerminalState(),
+    entries: [{ id: "user-1", kind: "user" as const, text: "hello", promptId: 1 }],
+  };
+  const next = applyAgentEvents(state, [
+    event(1, "model.call.completed", {}),
+    event(2, "run.error", { message: "retrying" }),
+  ]);
+
+  assert.equal(next.entries, state.entries);
+  assert.equal(next.modelCalls, 1);
+});
+
+test("representative long-tail streaming stays within the reducer gate", () => {
+  const state = {
+    ...initialTerminalState(),
+    entries: Array.from({ length: 2_000 }, (_, index) => ({
+      id: `user-${index}`,
+      kind: "user" as const,
+      text: "representative long transcript line ".repeat(4),
+      promptId: index,
+    })),
+  };
+  const events = Array.from({ length: 5_000 }, (_, index) =>
+    event(index + 1, "assistant.delta", { text: "x" }),
+  );
+  const startedAt = performance.now();
+  const next = applyAgentEvents(state, events);
+  const elapsed = performance.now() - startedAt;
+
+  assert.equal(next.entries.length, 2_001);
+  assert.equal(next.entries.at(-1)?.kind, "assistant");
+  assert.ok(elapsed < 250, `2,000 rows + 5,000 deltas took ${elapsed.toFixed(1)} ms`);
 });
 
 test("tool results update their original activity without growing the transcript", () => {
@@ -82,8 +145,8 @@ test("generated image content remains attached to its Code Mode row", () => {
 test("a final assistant message seals the streaming tail", () => {
   const state = applyAgentEvents(initialTerminalState(), [
     event(1, "run.started", {}),
-    event(2, "assistant.delta", { text: "hel" }),
-    event(3, "assistant.delta", { text: "lo" }),
+    event(2, "assistant.delta", { text: "he" }),
+    event(3, "assistant.delta", { text: "llo" }),
     event(4, "assistant.message", { text: "hello" }),
     event(5, "run.completed", {}),
   ]);
@@ -134,6 +197,57 @@ test("code-mode children render under their parent tool activity", () => {
   assert.equal(entry?.kind, "tool");
   assert.equal(entry?.kind === "tool" ? entry.tool.children.length : 0, 1);
   assert.equal(entry?.kind === "tool" ? entry.tool.children[0]?.status : undefined, "completed");
+});
+
+test("empty terminal polls stay hidden even when they fail", () => {
+  const state = applyAgentEvents(initialTerminalState(), [
+    event(1, "tool.call", {
+      call_id: "call-exec",
+      tool: "exec",
+      arguments: "await tools.write_stdin({ session_id: 7 })",
+    }),
+    event(2, "tool.call", {
+      call_id: "call-exec/code-1",
+      tool: "write_stdin",
+      arguments: { session_id: 7, chars: "" },
+    }),
+    event(3, "tool.result", {
+      call_id: "call-exec/code-1",
+      tool: "write_stdin",
+      status: "failed",
+      result: "unknown session",
+    }),
+  ]);
+
+  assert.equal(state.entries.length, 1);
+  assert.equal(state.entries[0]?.kind === "tool" ? state.entries[0].tool.children.length : -1, 0);
+});
+
+test("plan updates become checklist entries", () => {
+  const state = applyAgentEvents(initialTerminalState(), [
+    event(1, "tool.call", {
+      call_id: "call-plan",
+      tool: "update_plan",
+      arguments: {
+        explanation: "Adapting the work",
+        plan: [
+          { step: "Inspect", status: "completed" },
+          { step: "Implement", status: "in_progress" },
+          { step: "Verify", status: "pending" },
+        ],
+      },
+    }),
+    event(2, "tool.result", {
+      call_id: "call-plan",
+      tool: "update_plan",
+      status: "completed",
+      result: "Plan updated",
+    }),
+  ]);
+
+  assert.equal(state.entries.length, 1);
+  assert.equal(state.entries[0]?.kind, "plan");
+  assert.equal(state.entries[0]?.kind === "plan" ? state.entries[0].update.plan[1]?.status : undefined, "in_progress");
 });
 
 test("apply_patch activities summarize added and removed lines", () => {

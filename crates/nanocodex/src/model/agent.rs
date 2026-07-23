@@ -8,6 +8,7 @@ use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
     ResponsesOutput, ResponsesServiceResponse, TRANSPORT, TransportStats, TurnResult,
 };
+use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::sync::watch;
 use tower::Service;
@@ -18,7 +19,7 @@ use super::{
     CompactionCompleted, CompactionFailed, CompactionStarted, ModelCallCompleted, ModelCallFailed,
     ModelCallStarted, RunError, RunStarted, RunStats, RunSteered, ToolCallArguments, ToolCallEvent,
     ToolResultEvent, WarmupCompleted, WarmupFailed, WarmupStarted,
-    agents_md::load_project_instructions,
+    agents_md::load_instructions,
     compaction,
     context_manager::ContextManager,
     display_endpoint, elapsed_ns,
@@ -50,6 +51,7 @@ pub(crate) struct ModelRun<S> {
     tool_call_indices: HashMap<Box<str>, u32>,
     tools: Tools,
     prompt_cache: ModelPromptCache,
+    global_instructions: Option<Arc<str>>,
 }
 
 pub(crate) enum ModelTurnOutcome {
@@ -67,6 +69,7 @@ pub(crate) struct ModelCheckpoint {
     workspace: String,
     conversation: ConversationState,
     preserve_inherited_delta: bool,
+    global_instructions: Option<Arc<str>>,
 }
 
 impl ModelCheckpoint {
@@ -296,6 +299,7 @@ impl<S> ModelRun<S> {
         transport_stats: Arc<TransportStats>,
         tools: Tools,
         prompt_cache: ModelPromptCache,
+        global_instructions: Option<Arc<str>>,
     ) -> Self {
         Self {
             events,
@@ -312,6 +316,7 @@ impl<S> ModelRun<S> {
             tool_call_indices: HashMap::new(),
             tools,
             prompt_cache,
+            global_instructions,
         }
     }
 
@@ -355,6 +360,7 @@ impl<S> ModelRun<S> {
             tool_call_indices: HashMap::new(),
             tools,
             prompt_cache,
+            global_instructions: checkpoint.global_instructions,
         }
     }
 
@@ -366,6 +372,10 @@ impl<S> ModelRun<S> {
             tools,
             self.config.system_prompt(),
         )
+    }
+
+    fn load_agent_instructions(&self, workspace: &str) -> Result<Option<String>> {
+        load_instructions(Path::new(workspace), self.global_instructions.as_deref())
     }
 }
 
@@ -524,7 +534,7 @@ where
             session
         } else {
             let workspace = resolve_workspace(requested_workspace.as_deref())?;
-            let project_instructions = load_project_instructions(Path::new(&workspace))?;
+            let project_instructions = self.load_agent_instructions(&workspace)?;
             let tools = tool_runtime(&workspace, &self.config, &self.tools);
             self.active_tools = Some(tools.control());
             let factory = self.attempt_factory(&tools);
@@ -544,7 +554,11 @@ where
                 preserve_inherited_delta: false,
                 replay_full_history_on_next_prompt: false,
             };
-            Self::publish_fork_snapshot(&mut session, fork_snapshots);
+            Self::publish_fork_snapshot(
+                &mut session,
+                fork_snapshots,
+                self.global_instructions.as_ref(),
+            );
             let warmup = {
                 let warmup = self.perform_warmup(&session.factory);
                 tokio::pin!(warmup);
@@ -604,6 +618,7 @@ where
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
             preserve_inherited_delta: false,
+            global_instructions: self.global_instructions.clone(),
         })
     }
 
@@ -652,19 +667,30 @@ where
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
             preserve_inherited_delta: false,
+            global_instructions: self.global_instructions.clone(),
         })
     }
 
     fn publish_fork_snapshot(
         session: &mut ModelSessionState,
         snapshots: &watch::Sender<Option<ModelCheckpoint>>,
+        global_instructions: Option<&Arc<str>>,
     ) {
         session.conversation.context.commit_tail();
         snapshots.send_replace(Some(ModelCheckpoint {
             workspace: session.workspace.clone(),
             conversation: session.conversation.clone(),
             preserve_inherited_delta: true,
+            global_instructions: global_instructions.cloned(),
         }));
+    }
+
+    fn publish_current_fork_snapshot(
+        &self,
+        session: &mut ModelSessionState,
+        snapshots: &watch::Sender<Option<ModelCheckpoint>>,
+    ) {
+        Self::publish_fork_snapshot(session, snapshots, self.global_instructions.as_ref());
     }
 
     fn record_task_outcome(
@@ -693,7 +719,7 @@ where
         };
         session.conversation.append(pending.into_safe_items(None));
         session.conversation.reset_for_full_request();
-        Self::publish_fork_snapshot(session, snapshots);
+        self.publish_current_fork_snapshot(session, snapshots);
     }
 
     async fn drive_session(
@@ -711,7 +737,7 @@ where
                 self.drain_steers(&mut session.conversation, &mut steers)
                     .await?;
             }
-            Self::publish_fork_snapshot(session, fork_snapshots);
+            self.publish_current_fork_snapshot(session, fork_snapshots);
             let call_index = self.stats.model_calls + 1;
             let Some(response) = self
                 .model_call_with_overflow_recovery(call_index, session, &mut overflow_compacted)
@@ -737,7 +763,7 @@ where
                 session.conversation.append(output_items);
                 if end_turn == Some(false) {
                     session.conversation.clear_delta();
-                    Self::publish_fork_snapshot(session, fork_snapshots);
+                    self.publish_current_fork_snapshot(session, fork_snapshots);
                     self.maybe_compact(
                         call_index,
                         &mut session.conversation,
@@ -792,7 +818,7 @@ where
                     detail: "completed model tools lost their pending response",
                 })?
                 .commit(&mut session.conversation);
-            Self::publish_fork_snapshot(session, fork_snapshots);
+            self.publish_current_fork_snapshot(session, fork_snapshots);
             self.maybe_compact(
                 call_index,
                 &mut session.conversation,
@@ -811,7 +837,9 @@ where
         steers: &mut tokio::sync::mpsc::Receiver<Prompt>,
     ) -> Result<()> {
         while let Ok(steer) = steers.try_recv() {
-            if let Ok(content) = serde_json::to_string(&steer) {
+            if trace_content_enabled()
+                && let Ok(content) = serde_json::to_string(&steer)
+            {
                 info!(
                     target: "nanocodex",
                     content_kind = "steer",
@@ -903,7 +931,7 @@ where
                 .await
         };
         prepare_output_images(&mut execution.output).await;
-        if let Ok(content) = serde_json::to_string(&execution.output) {
+        if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(&tool_span, "tool.output", &content);
         }
         self.active_tool_call = None;
@@ -1089,7 +1117,7 @@ where
                 factory,
             )
             .await?;
-        let project_instructions = load_project_instructions(Path::new(project_workspace))?;
+        let project_instructions = self.load_agent_instructions(project_workspace)?;
         let canonical_context =
             task_context(working_directory, shell, project_instructions.as_deref());
         conversation.install_compaction(item, canonical_context, factory.profile().prefix());
@@ -1161,7 +1189,7 @@ where
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
-        if let Ok(content) = serde_json::to_string(factory.profile().prefix()) {
+        if let Some(content) = serialize_trace_content(factory.profile().prefix()) {
             record_span_content(&span, "model.input", &content);
         }
         let shared_prompt_cache = self.prompt_cache.shared().cloned();
@@ -1441,7 +1469,7 @@ where
         };
         let duration_ns = elapsed_ns(started_at);
         span.record("model.response.id", response.id.as_str());
-        if let Ok(content) = serde_json::to_string(&response.item) {
+        if let Some(content) = serialize_trace_content(&response.item) {
             record_span_content(&span, "model.output_item", &content);
         }
         span.record("status", "completed");
@@ -1524,10 +1552,23 @@ fn unsupported_tool_message(call: &CodeCall) -> Option<String> {
 
 fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize, Option<String>) {
     let item_count = request.input_item_count();
+    if !trace_content_enabled() {
+        return (item_count, 0, None);
+    }
     let items = request.input_items().collect::<Vec<_>>();
     let content = serde_json::to_string(&items).ok();
     let bytes = content.as_ref().map_or(0, String::len);
     (item_count, bytes, content)
+}
+
+fn trace_content_enabled() -> bool {
+    tracing::enabled!(target: "nanocodex", tracing::Level::INFO)
+}
+
+fn serialize_trace_content<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    trace_content_enabled()
+        .then(|| serde_json::to_string(value).ok())
+        .flatten()
 }
 
 fn model_tool_span(call: &CodeCall, call_index: u32) -> tracing::Span {
@@ -1643,9 +1684,9 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
     }
     span.record("model.output.item_count", response.output_items.len());
     span.record("model.tool_call_count", response.code_calls.len());
-    let output_content = serde_json::to_string(&response.output_items).ok();
-    let output_bytes = output_content.as_ref().map_or(0, String::len);
-    span.record("model.output.bytes", output_bytes);
+    let trace_content = trace_content_enabled();
+    let mut output_bytes = usize::from(trace_content).saturating_mul(2);
+    let mut serialized_items = 0_usize;
     let mut summary_count = 0_usize;
     for (index, item) in response.output_items.iter().enumerate() {
         let kind = if let ResponseItem::Reasoning { summary, .. } = item {
@@ -1654,10 +1695,15 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
         } else {
             "model.output_item"
         };
-        if let Ok(content) = serde_json::to_string(item) {
+        if trace_content && let Ok(content) = serde_json::to_string(item) {
+            output_bytes = output_bytes
+                .saturating_add(usize::from(serialized_items != 0))
+                .saturating_add(content.len());
+            serialized_items = serialized_items.saturating_add(1);
             record_indexed_span_content(span, kind, index, &content);
         }
     }
+    span.record("model.output.bytes", output_bytes);
     if let Some(message) = &response.final_message {
         span.record("assistant.output.bytes", message.len());
     }
@@ -1725,11 +1771,15 @@ fn attempt_factory(
     tools: &ToolRuntime,
     system_prompt: &str,
 ) -> ResponsesAttemptFactory {
+    #[cfg(not(target_family = "wasm"))]
+    let tool_specs = tools.model_specs();
+    #[cfg(target_family = "wasm")]
+    let tool_specs = tools.model_specs(events.request_id());
     ResponsesAttemptFactory::new(
         request_profile(
             events.request_id(),
             prompt_cache_key,
-            tools.model_specs(),
+            tool_specs,
             system_prompt,
         ),
         events.clone(),

@@ -1,73 +1,116 @@
-# Node.js and browser WebAssembly binding
+# Nanocodex for JavaScript
 
-`nanocodex-wasm` compiles the shared Rust model loop, typed history, prompt
-cache behavior, event protocol, Responses request/stream handling, and Tower
-retry stack to `wasm32-unknown-unknown`. JavaScript supplies only the host
-capabilities Rust cannot own on that target: a WebSocket and code execution.
-
-Build both packages and run their deterministic tests:
-
-```sh
-just bootstrap-bindings
-just test-wasm
-```
-
-The public JavaScript layer is shared by Node and the browser. It keeps the
-generated WASM handles private and exposes a small, namespaced API:
+The Node and browser entrypoints expose the same viem-v3-style API over the
+same Rust/WASM agent. Runtime-specific host options are flattened into
+`Agent.create(...)`; generated WASM handles and host routing remain private.
 
 ```js
-import { Actions } from "nanocodex";
-import { Agent } from "nanocodex/node";
+import { Actions, Agent } from "nanocodex/node";
 
 const agent = await Agent.create({
   apiKey: process.env.OPENAI_API_KEY,
-  tools,
   reasoningMode: "pro",
-  thinking: "high", // none, low, medium, high, xhigh, or max
+  thinking: "high",
+  tools,
 });
 
 const turn = agent.turn.prompt({ input: "Build the thing." });
 console.log(await turn.result());
 
-// Every decorated operation is also available as a standalone action.
+const branch = await agent.session.fork({ at: turn });
+console.log(await branch.turn.prompt({ input: "Try another approach." }).result());
+
 const followOn = Actions.turn.prompt(agent, { input: "Now explain it." });
-console.log(await Actions.turn.result(followOn));
+console.log(await Actions.turn.getResult(followOn));
 ```
 
-The runtime entry point owns its obvious defaults: `nanocodex/node` flattens
-Node host and agent policy into one `Agent.create(...)` call. The package root
-retains the lower-level environment-neutral `Agent` and `Engine`, while
-`node()` and `browser()` remain available for reusable or custom engine
-composition. Agent actions are grouped under `turn`, `fork`, and `events`;
-`agent.extend(...)` adds application actions without replacing the owned
-session lifecycle.
+`Agent` and `Actions` are module namespaces, not classes. `Agent.create` returns
+an owned client decorated with matching domain actions:
 
-The Node example is a standalone npm consumer and defines an application tool
-as an ordinary async JavaScript function:
+- `agent.turn.prompt(...)` / `Actions.turn.prompt(agent, ...)`
+- `agent.session.fork(...)` / `Actions.session.fork(agent, ...)`
+- `agent.session.spawn()` / `Actions.session.spawn(agent)`
+- `agent.events.watch(...)` / `Actions.events.watch(agent, ...)`
+
+Every action owns its types, for example `Actions.turn.prompt.Options`,
+`Actions.turn.prompt.ReturnType`, and `Actions.events.watch.Watcher`.
+
+Event watches are lazy, terminal handles:
+
+```js
+const watch = agent.events.watch();
+const unlisten = watch.onEvent(console.log);
+
+unlisten();
+watch.off();
+```
+
+The same watcher can instead be consumed as an ordered async iterable; breaking
+the loop releases that iterator, while `watch.off()` terminates the whole watch.
+
+```js
+const watch = agent.events.watch();
+for await (const event of watch) {
+  console.log(event);
+  if (done) break;
+}
+watch.off();
+```
+
+Applications add typed action domains with decorators:
+
+```js
+const extended = agent.extend((client) => ({
+  inspect: {
+    session: () => client.sessionId,
+  },
+}));
+
+extended.inspect.session();
+```
+
+Browser Workers use the identical shape:
+
+```js
+import { Agent } from "nanocodex/browser";
+
+const agent = await Agent.create({
+  websocketUrl: signedOrCookieAuthorizedEndpoint,
+  createWebSocket(endpoint, sessionId) {
+    const url = new URL(endpoint);
+    url.searchParams.set("session_id", sessionId);
+    return new WebSocket(url);
+  },
+  tools,
+});
+```
+
+After publication, a browser can load the same entrypoint without a package
+manager or build step:
+
+```html
+<script type="module">
+  import { Agent } from "https://cdn.jsdelivr.net/npm/nanocodex@0.1.0/browser/index.mjs";
+  const agent = await Agent.create({ websocketUrl: "/api/responses" });
+  console.log(await agent.turn.prompt({ input: "Hello." }).result());
+</script>
+```
+
+Pin the package version in production. The adjacent WASM file is part of the
+npm package and is resolved relative to the browser module. The endpoint must
+be authorized by the embedding application because browser WebSockets cannot
+attach OpenAI's upgrade authorization header.
+
+The owned Rust session retains follow-on history, response state, tool output,
+its WebSocket, and stable prompt-cache identity. Typed browser content accepts
+ordered text, remote/data-URL image, and audio items. JavaScript tools are
+ordinary async handlers described by JSON Schema and appear in the same ordered
+agent event stream as built-in code mode.
+
+Run the standalone Node proof with:
 
 ```sh
 cd examples/node
 npm install
 OPENAI_API_KEY=... npm start
 ```
-
-See [`examples/node`](../../examples/node) for persistent follow-on prompting,
-events, and a custom `multiply` tool. `agent.turn.prompt()` returns a `Turn`
-synchronously; `await turn.result()` returns the final message. A turn can be
-steered or cancelled, and an agent can fork its latest checkpoint, fork an
-exact completed turn, or spawn a clean sibling. The Rust-owned session
-retains all prior messages, response IDs, tool outputs, WebSocket state, and the
-stable prompt-cache key. Browser-safe typed content accepts ordered text,
-remote/data-URL image, and audio items while rejecting local filesystem paths.
-
-[`examples/react-vite`](../../examples/react-vite) is a complete React + Vite
-consumer using the same API inside a module Worker. Standard browser WebSockets
-cannot attach the `Authorization` header required by the Responses upgrade, so
-the Worker accepts an already-authorized WebSocket endpoint. Nanocodex does not
-add an app server or credential relay. A product embedding chooses its own
-credential and endpoint boundary while the agent stays inside the Worker.
-
-JavaScript tools are described with a name, description, JSON Schema, and
-handler. They are injected into code mode as `tools.<name>(input)`, and their
-calls/results are folded into the same ordered Rust `AgentEvent` stream as the
-parent `exec` call.

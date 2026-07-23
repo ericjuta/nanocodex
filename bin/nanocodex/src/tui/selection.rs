@@ -3,11 +3,32 @@ use std::time::{Duration, Instant};
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
-    style::Color,
+    style::{Color, Modifier, Style},
 };
 use unicode_width::UnicodeWidthStr;
 
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+const MULTI_CLICK_COPY_DELAY: Duration = Duration::from_millis(200);
+const COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(300);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SelectionScrollDirection {
+    Older,
+    Newer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SelectionScrollRequest {
+    pub(super) surface_index: usize,
+    pub(super) direction: SelectionScrollDirection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SelectionClick {
+    pub(super) surface_index: usize,
+    pub(super) surface: Rect,
+    pub(super) position: Position,
+}
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 enum SelectionMode {
@@ -15,6 +36,13 @@ enum SelectionMode {
     Character,
     Word,
     Line,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum HighlightMode {
+    #[default]
+    Selection,
+    Copy,
 }
 
 #[derive(Clone, Copy)]
@@ -30,6 +58,7 @@ pub(super) struct ScreenSelection {
     anchor: Option<Position>,
     head: Option<Position>,
     surface: Option<Rect>,
+    surface_index: Option<usize>,
     selectable_areas: [Rect; 3],
     selectable_area_count: usize,
     dragging: bool,
@@ -39,6 +68,14 @@ pub(super) struct ScreenSelection {
     completed_click: Option<CompletedClick>,
     copy_after_render: bool,
     pending_copy: Option<String>,
+    highlight_mode: HighlightMode,
+    copy_at: Option<Instant>,
+    clear_at: Option<Instant>,
+    auto_scroll: Option<SelectionScrollDirection>,
+    scroll_snapshot: Option<Buffer>,
+    copied_before: Vec<String>,
+    copied_after: Vec<String>,
+    pending_click: Option<SelectionClick>,
 }
 
 impl ScreenSelection {
@@ -49,13 +86,21 @@ impl ScreenSelection {
     fn begin_at(&mut self, position: Position, now: Instant) -> bool {
         self.pending_copy = None;
         self.copy_after_render = false;
+        self.highlight_mode = HighlightMode::Selection;
+        self.copy_at = None;
+        self.clear_at = None;
+        self.auto_scroll = None;
+        self.scroll_snapshot = None;
+        self.copied_before.clear();
+        self.copied_after.clear();
+        self.pending_click = None;
         if !self.is_selectable(position) {
             return self.clear();
         }
-        let surface = self.selectable_areas[..self.selectable_area_count]
+        let surface_index = self.selectable_areas[..self.selectable_area_count]
             .iter()
-            .copied()
-            .find(|area| area.contains(position));
+            .position(|area| area.contains(position));
+        let surface = surface_index.map(|index| self.selectable_areas[index]);
         let click_count = self.completed_click.map_or(1, |last| {
             if last.surface == surface.unwrap_or_default()
                 && now.saturating_duration_since(last.at) <= MULTI_CLICK_INTERVAL
@@ -67,6 +112,7 @@ impl ScreenSelection {
             }
         });
         self.surface = surface;
+        self.surface_index = surface_index;
         self.anchor = Some(position);
         self.head = Some(position);
         self.dragging = true;
@@ -81,12 +127,17 @@ impl ScreenSelection {
     }
 
     pub(super) fn drag(&mut self, position: Position) -> bool {
-        if !self.dragging || self.head == Some(position) {
+        if !self.dragging {
             return false;
         }
-        self.moved = true;
-        self.head = Some(position);
-        true
+        let auto_scroll = self.auto_scroll_direction(position);
+        let changed = self.head != Some(position) || self.auto_scroll != auto_scroll;
+        if self.head != Some(position) {
+            self.moved = true;
+            self.head = Some(position);
+        }
+        self.auto_scroll = auto_scroll;
+        changed
     }
 
     pub(super) fn finish(&mut self, position: Position) -> bool {
@@ -98,6 +149,8 @@ impl ScreenSelection {
             return false;
         }
         self.dragging = false;
+        self.auto_scroll = None;
+        self.scroll_snapshot = None;
         self.moved |= self.head != Some(position);
         self.head = Some(position);
         if self.moved {
@@ -111,9 +164,21 @@ impl ScreenSelection {
             });
         }
         if self.anchor == self.head && self.mode == SelectionMode::Character {
+            if let (Some(surface_index), Some(surface)) = (self.surface_index, self.surface) {
+                self.pending_click = Some(SelectionClick {
+                    surface_index,
+                    surface,
+                    position,
+                });
+            }
             return self.clear_active();
         }
-        self.copy_after_render = true;
+        if !self.moved && self.mode != SelectionMode::Character {
+            self.copy_at = Some(now + MULTI_CLICK_COPY_DELAY);
+        } else {
+            self.copy_after_render = true;
+        }
+        self.highlight_mode = HighlightMode::Selection;
         true
     }
 
@@ -125,12 +190,20 @@ impl ScreenSelection {
     fn clear_active(&mut self) -> bool {
         let changed = self.anchor.take().is_some() || self.head.take().is_some();
         self.surface = None;
+        self.surface_index = None;
         self.dragging = false;
         self.moved = false;
         self.mode = SelectionMode::Character;
         self.click_count = 0;
         self.copy_after_render = false;
         self.pending_copy = None;
+        self.highlight_mode = HighlightMode::Selection;
+        self.copy_at = None;
+        self.clear_at = None;
+        self.auto_scroll = None;
+        self.scroll_snapshot = None;
+        self.copied_before.clear();
+        self.copied_after.clear();
         changed
     }
 
@@ -173,17 +246,150 @@ impl ScreenSelection {
             self.mode,
         );
         if self.copy_after_render {
-            let text = selected_text(buffer, surface, start, end);
+            let visible = selected_text(buffer, surface, start, end);
+            let text = joined_selection(&self.copied_before, &visible, &self.copied_after);
             if !text.is_empty() {
                 self.pending_copy = Some(text);
             }
             self.copy_after_render = false;
         }
-        highlight(buffer, surface, start, end);
+        highlight(buffer, surface, start, end, self.highlight_mode);
+        self.scroll_snapshot =
+            (self.dragging && self.auto_scroll.is_some()).then(|| buffer.clone());
     }
 
     pub(super) fn take_pending_copy(&mut self) -> Option<String> {
         self.pending_copy.take()
+    }
+
+    pub(super) fn take_pending_click(&mut self) -> Option<SelectionClick> {
+        self.pending_click.take()
+    }
+
+    pub(super) fn surface_index(&self) -> Option<usize> {
+        self.surface_index
+    }
+
+    pub(super) fn selectable_area_count(&self) -> usize {
+        self.selectable_area_count
+    }
+
+    pub(super) fn scroll_request(&self) -> Option<SelectionScrollRequest> {
+        Some(SelectionScrollRequest {
+            surface_index: self.surface_index?,
+            direction: self.auto_scroll?,
+        })
+    }
+
+    pub(super) fn scrolled(&mut self, direction: SelectionScrollDirection, rows: usize) -> bool {
+        if rows == 0 {
+            self.auto_scroll = None;
+            self.scroll_snapshot = None;
+            return false;
+        }
+        let Some(surface) = self.surface else {
+            return false;
+        };
+        let Some(buffer) = self.scroll_snapshot.take() else {
+            return false;
+        };
+        let Some(anchor) = self.anchor else {
+            return false;
+        };
+        let Some(head) = self.head else {
+            return false;
+        };
+        let (start, end) = resolve_selection(&buffer, surface, anchor, head, self.mode);
+        let rows = u16::try_from(rows).unwrap_or(u16::MAX).min(surface.height);
+        match direction {
+            SelectionScrollDirection::Newer => {
+                let last_departing = surface
+                    .y
+                    .saturating_add(rows)
+                    .saturating_sub(1)
+                    .min(surface.bottom().saturating_sub(1));
+                if selected_rows_intersect(start, end, surface.y, last_departing) {
+                    append_selection(
+                        &mut self.copied_before,
+                        selected_text_in_rows(
+                            &buffer,
+                            surface,
+                            start,
+                            end,
+                            surface.y,
+                            last_departing,
+                        ),
+                        false,
+                    );
+                }
+                self.anchor = Some(Position::new(
+                    anchor.x,
+                    anchor.y.saturating_sub(rows).max(surface.y),
+                ));
+            }
+            SelectionScrollDirection::Older => {
+                let first_departing = surface.bottom().saturating_sub(rows);
+                if selected_rows_intersect(
+                    start,
+                    end,
+                    first_departing,
+                    surface.bottom().saturating_sub(1),
+                ) {
+                    append_selection(
+                        &mut self.copied_after,
+                        selected_text_in_rows(
+                            &buffer,
+                            surface,
+                            start,
+                            end,
+                            first_departing,
+                            surface.bottom().saturating_sub(1),
+                        ),
+                        true,
+                    );
+                }
+                self.anchor = Some(Position::new(
+                    anchor.x,
+                    anchor
+                        .y
+                        .saturating_add(rows)
+                        .min(surface.bottom().saturating_sub(1)),
+                ));
+            }
+        }
+        true
+    }
+
+    pub(super) fn copy_finished(&mut self, copied: bool) -> bool {
+        self.copy_finished_at(copied, Instant::now())
+    }
+
+    fn copy_finished_at(&mut self, copied: bool, now: Instant) -> bool {
+        if !copied || !self.is_active() {
+            return false;
+        }
+        self.highlight_mode = HighlightMode::Copy;
+        self.clear_at = Some(now + COPY_HIGHLIGHT_DURATION);
+        true
+    }
+
+    pub(super) fn advance(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if self.copy_at.is_some_and(|copy_at| now >= copy_at) {
+            self.copy_at = None;
+            self.copy_after_render = true;
+            changed = true;
+        }
+        if self.clear_at.is_none_or(|clear_at| now < clear_at) {
+            return changed;
+        }
+        self.clear_active()
+    }
+
+    pub(super) fn needs_tick(&self) -> bool {
+        self.copy_at.is_some()
+            || self.clear_at.is_some()
+            || (self.dragging && self.auto_scroll.is_some())
     }
 
     fn ordered(&self) -> Option<(Position, Position)> {
@@ -200,6 +406,17 @@ impl ScreenSelection {
         self.selectable_areas[..self.selectable_area_count]
             .iter()
             .any(|area| area.contains(position))
+    }
+
+    fn auto_scroll_direction(&self, position: Position) -> Option<SelectionScrollDirection> {
+        let surface = self.surface?;
+        if position.y <= surface.y {
+            Some(SelectionScrollDirection::Older)
+        } else if position.y >= surface.bottom().saturating_sub(1) {
+            Some(SelectionScrollDirection::Newer)
+        } else {
+            None
+        }
     }
 }
 
@@ -309,10 +526,24 @@ fn word_class(symbol: &str) -> WordClass {
 }
 
 fn selected_text(buffer: &Buffer, surface: Rect, start: Position, end: Position) -> String {
+    selected_text_in_rows(buffer, surface, start, end, start.y, end.y)
+}
+
+fn selected_text_in_rows(
+    buffer: &Buffer,
+    surface: Rect,
+    start: Position,
+    end: Position,
+    first_row: u16,
+    last_row: u16,
+) -> String {
     let mut output = String::new();
     let last_buffer_x = buffer.area.right().saturating_sub(1);
-    let first_y = start.y.max(buffer.area.y);
-    let last_y = end.y.min(buffer.area.bottom().saturating_sub(1));
+    let first_y = start.y.max(first_row).max(buffer.area.y);
+    let last_y = end
+        .y
+        .min(last_row)
+        .min(buffer.area.bottom().saturating_sub(1));
     if first_y > last_y {
         return output;
     }
@@ -348,7 +579,35 @@ fn selected_text(buffer: &Buffer, surface: Rect, start: Position, end: Position)
     output
 }
 
-fn highlight(buffer: &mut Buffer, surface: Rect, start: Position, end: Position) {
+fn selected_rows_intersect(start: Position, end: Position, first_row: u16, last_row: u16) -> bool {
+    start.y.max(first_row) <= end.y.min(last_row)
+}
+
+fn append_selection(target: &mut Vec<String>, chunk: String, prepend: bool) {
+    if prepend {
+        target.insert(0, chunk);
+    } else {
+        target.push(chunk);
+    }
+}
+
+fn joined_selection(before: &[String], visible: &str, after: &[String]) -> String {
+    before
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(visible))
+        .chain(after.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn highlight(
+    buffer: &mut Buffer,
+    surface: Rect,
+    start: Position,
+    end: Position,
+    mode: HighlightMode,
+) {
     let last_buffer_x = buffer.area.right().saturating_sub(1);
     let first_y = start.y.max(buffer.area.y);
     let last_y = end.y.min(buffer.area.bottom().saturating_sub(1));
@@ -368,7 +627,16 @@ fn highlight(buffer: &mut Buffer, surface: Rect, start: Position, end: Position)
             continue;
         };
         for x in first_x..=last_x {
-            buffer[(x, y)].set_fg(Color::Black).set_bg(Color::LightBlue);
+            let cell = &mut buffer[(x, y)];
+            match mode {
+                HighlightMode::Selection => {
+                    cell.set_bg(Color::Indexed(8));
+                }
+                HighlightMode::Copy => {
+                    cell.set_fg(Color::Yellow)
+                        .set_style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+            }
         }
     }
 }
@@ -402,9 +670,9 @@ fn row_bounds(start: Position, end: Position, y: u16, last_x: u16) -> (u16, u16)
 mod tests {
     use std::time::{Duration, Instant};
 
-    use ratatui::{buffer::Buffer, layout::Rect};
+    use ratatui::{buffer::Buffer, layout::Rect, style::Modifier};
 
-    use super::ScreenSelection;
+    use super::{ScreenSelection, SelectionScrollDirection};
 
     #[test]
     fn selection_copies_only_text_from_the_surface_where_it_started() {
@@ -430,15 +698,15 @@ mod tests {
         );
         assert_eq!(
             buffer.cell((2, 1)).unwrap().bg,
-            ratatui::style::Color::LightBlue
+            ratatui::style::Color::Indexed(8)
         );
         assert_ne!(
             buffer.cell((0, 0)).unwrap().bg,
-            ratatui::style::Color::LightBlue
+            ratatui::style::Color::Indexed(8)
         );
         assert_ne!(
             buffer.cell((13, 1)).unwrap().bg,
-            ratatui::style::Color::LightBlue
+            ratatui::style::Color::Indexed(8)
         );
     }
 
@@ -459,12 +727,118 @@ mod tests {
         );
         assert_eq!(
             buffer.cell((4, 1)).unwrap().bg,
-            ratatui::style::Color::LightBlue
+            ratatui::style::Color::Indexed(8)
         );
         assert_ne!(
             buffer.cell((5, 1)).unwrap().bg,
-            ratatui::style::Color::LightBlue
+            ratatui::style::Color::Indexed(8)
         );
+    }
+
+    #[test]
+    fn successful_copy_flashes_then_clears_while_failure_keeps_selection() {
+        let area = Rect::new(0, 0, 12, 1);
+        let mut buffer = Buffer::with_lines(["styled text"]);
+        let mut selection = ScreenSelection::default();
+        selection.render(&mut buffer, &[area]);
+        assert!(selection.begin((0, 0).into()));
+        assert!(selection.finish((5, 0).into()));
+        selection.render(&mut buffer, &[area]);
+        assert_eq!(selection.take_pending_copy().as_deref(), Some("styled"));
+
+        let copied_at = Instant::now();
+        assert!(!selection.copy_finished_at(false, copied_at));
+        assert!(selection.is_active());
+        assert!(!selection.needs_tick());
+
+        assert!(selection.copy_finished_at(true, copied_at));
+        assert!(selection.needs_tick());
+        let mut feedback = Buffer::with_lines(["styled text"]);
+        selection.render(&mut feedback, &[area]);
+        let cell = feedback.cell((0, 0)).unwrap();
+        assert_eq!(cell.fg, ratatui::style::Color::Yellow);
+        assert!(cell.modifier.contains(Modifier::REVERSED));
+
+        assert!(!selection.advance(copied_at + Duration::from_millis(299)));
+        assert!(selection.is_active());
+        assert!(selection.advance(copied_at + Duration::from_millis(300)));
+        assert!(!selection.is_active());
+        assert!(!selection.needs_tick());
+    }
+
+    #[test]
+    fn edge_drag_preserves_rows_that_scroll_out_of_view() {
+        let area = Rect::new(0, 0, 8, 3);
+        let mut selection = ScreenSelection::default();
+        let mut first = Buffer::with_lines(["older", "anchor", "middle"]);
+        selection.render(&mut first, &[area]);
+
+        assert!(selection.begin((0, 1).into()));
+        assert!(selection.drag((5, 2).into()));
+        selection.render(&mut first, &[area]);
+        assert_eq!(
+            selection.scroll_request().unwrap().direction,
+            SelectionScrollDirection::Newer
+        );
+        assert!(selection.scrolled(SelectionScrollDirection::Newer, 1));
+
+        let mut second = Buffer::with_lines(["anchor", "middle", "newer"]);
+        selection.render(&mut second, &[area]);
+        assert!(selection.scrolled(SelectionScrollDirection::Newer, 1));
+
+        let mut third = Buffer::with_lines(["middle", "newer", "newest"]);
+        selection.render(&mut third, &[area]);
+        assert!(selection.finish((5, 2).into()));
+        selection.render(&mut third, &[area]);
+        assert_eq!(
+            selection.take_pending_copy().as_deref(),
+            Some("anchor\nmiddle\nnewer\nnewest")
+        );
+    }
+
+    #[test]
+    fn upward_edge_drag_prepends_older_rows_before_the_anchor() {
+        let area = Rect::new(0, 0, 8, 3);
+        let mut selection = ScreenSelection::default();
+        let mut first = Buffer::with_lines(["middle", "anchor", "newer"]);
+        selection.render(&mut first, &[area]);
+
+        assert!(selection.begin((5, 1).into()));
+        assert!(selection.drag((0, 0).into()));
+        selection.render(&mut first, &[area]);
+        assert_eq!(
+            selection.scroll_request().unwrap().direction,
+            SelectionScrollDirection::Older
+        );
+        assert!(selection.scrolled(SelectionScrollDirection::Older, 1));
+
+        let mut second = Buffer::with_lines(["older", "middle", "anchor"]);
+        selection.render(&mut second, &[area]);
+        assert!(selection.scrolled(SelectionScrollDirection::Older, 1));
+
+        let mut third = Buffer::with_lines(["oldest", "older", "middle"]);
+        selection.render(&mut third, &[area]);
+        assert!(selection.finish((0, 0).into()));
+        selection.render(&mut third, &[area]);
+        assert_eq!(
+            selection.take_pending_copy().as_deref(),
+            Some("oldest\nolder\nmiddle\nanchor")
+        );
+    }
+
+    #[test]
+    fn plain_click_reports_its_surface_for_cursor_placement() {
+        let area = Rect::new(2, 4, 12, 2);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 10));
+        let mut selection = ScreenSelection::default();
+        selection.render(&mut buffer, &[area]);
+
+        assert!(selection.begin((7, 5).into()));
+        assert!(selection.finish((7, 5).into()));
+        let click = selection.take_pending_click().unwrap();
+        assert_eq!(click.surface_index, 0);
+        assert_eq!(click.surface, area);
+        assert_eq!(click.position, (7, 5).into());
     }
 
     #[test]
@@ -481,7 +855,7 @@ mod tests {
         assert_eq!(selection.take_pending_copy().as_deref(), Some("left"));
         assert_ne!(
             buffer.cell((8, 0)).unwrap().bg,
-            ratatui::style::Color::LightBlue
+            ratatui::style::Color::Indexed(8)
         );
     }
 
@@ -514,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn double_click_copies_a_word_and_triple_click_copies_the_line() {
+    fn triple_click_supersedes_the_pending_double_click_copy() {
         let area = Rect::new(0, 0, 25, 1);
         let mut buffer = Buffer::with_lines(["let snake_case = value"]);
         let mut selection = ScreenSelection::default();
@@ -532,15 +906,40 @@ mod tests {
         assert!(selection.take_pending_copy().is_none());
         assert!(selection.finish_at(position, start + Duration::from_millis(110)));
         selection.render(&mut buffer, &[area]);
-        assert_eq!(selection.take_pending_copy().as_deref(), Some("snake_case"));
+        assert!(selection.take_pending_copy().is_none());
 
         assert!(selection.begin_at(position, start + Duration::from_millis(200)));
         assert!(selection.finish_at(position, start + Duration::from_millis(210)));
+        selection.render(&mut buffer, &[area]);
+        assert!(selection.take_pending_copy().is_none());
+        assert!(selection.advance(start + Duration::from_millis(410)));
         selection.render(&mut buffer, &[area]);
         assert_eq!(
             selection.take_pending_copy().as_deref(),
             Some("let snake_case = value")
         );
+    }
+
+    #[test]
+    fn double_click_copies_the_word_after_the_triple_click_window() {
+        let area = Rect::new(0, 0, 25, 1);
+        let mut buffer = Buffer::with_lines(["let snake_case = value"]);
+        let mut selection = ScreenSelection::default();
+        selection.render(&mut buffer, &[area]);
+        let start = Instant::now();
+        let position = (6, 0).into();
+
+        assert!(selection.begin_at(position, start));
+        assert!(selection.finish_at(position, start + Duration::from_millis(10)));
+        assert!(selection.begin_at(position, start + Duration::from_millis(100)));
+        assert!(selection.finish_at(position, start + Duration::from_millis(110)));
+        assert!(!selection.advance(start + Duration::from_millis(309)));
+        selection.render(&mut buffer, &[area]);
+        assert!(selection.take_pending_copy().is_none());
+
+        assert!(selection.advance(start + Duration::from_millis(310)));
+        selection.render(&mut buffer, &[area]);
+        assert_eq!(selection.take_pending_copy().as_deref(), Some("snake_case"));
     }
 
     #[test]

@@ -1,11 +1,39 @@
 import { memo, useEffect, useState } from "react";
-import type { BundledLanguage, ThemeRegistrationRaw } from "shiki";
+import type { SpecialLanguage, ThemeRegistrationRaw } from "shiki/core";
 
 const MAX_HIGHLIGHT_CHARS = 50_000;
 const MAX_CACHE_ENTRIES = 256;
 const htmlCache = new Map<string, Promise<string>>();
 
-const languageAliases: Record<string, BundledLanguage> = {
+const languageLoaders = {
+  bash: () => import("@shikijs/langs/bash"),
+  c: () => import("@shikijs/langs/c"),
+  cpp: () => import("@shikijs/langs/cpp"),
+  css: () => import("@shikijs/langs/css"),
+  diff: () => import("@shikijs/langs/diff"),
+  dockerfile: () => import("@shikijs/langs/dockerfile"),
+  go: () => import("@shikijs/langs/go"),
+  html: () => import("@shikijs/langs/html"),
+  javascript: () => import("@shikijs/langs/javascript"),
+  json: () => import("@shikijs/langs/json"),
+  jsx: () => import("@shikijs/langs/jsx"),
+  markdown: () => import("@shikijs/langs/markdown"),
+  python: () => import("@shikijs/langs/python"),
+  rust: () => import("@shikijs/langs/rust"),
+  shellscript: () => import("@shikijs/langs/shellscript"),
+  sql: () => import("@shikijs/langs/sql"),
+  toml: () => import("@shikijs/langs/toml"),
+  tsx: () => import("@shikijs/langs/tsx"),
+  typescript: () => import("@shikijs/langs/typescript"),
+  xml: () => import("@shikijs/langs/xml"),
+  yaml: () => import("@shikijs/langs/yaml"),
+  zig: () => import("@shikijs/langs/zig"),
+} as const;
+
+type SupportedLanguage = keyof typeof languageLoaders;
+type SyntaxLanguage = SupportedLanguage | SpecialLanguage;
+
+const languageAliases: Record<string, SupportedLanguage> = {
   bash: "bash",
   c: "c",
   cpp: "cpp",
@@ -83,11 +111,11 @@ export const SyntaxCode = memo(function SyntaxCode({
   return <div className={className} dangerouslySetInnerHTML={{ __html: html }} />;
 });
 
-function resolveLanguage(language?: string): BundledLanguage {
+function resolveLanguage(language?: string): SyntaxLanguage {
   return languageAliases[(language ?? "").toLowerCase()] ?? "text";
 }
 
-function highlightedHtml(code: string, language: BundledLanguage): Promise<string> {
+function highlightedHtml(code: string, language: SyntaxLanguage): Promise<string> {
   const key = `${language}\0${code}`;
   const cached = htmlCache.get(key);
   if (cached) return cached;
@@ -103,18 +131,41 @@ function highlightedHtml(code: string, language: BundledLanguage): Promise<strin
   return rendered;
 }
 
-async function renderHighlightedHtml(code: string, language: BundledLanguage): Promise<string> {
-  const [{ codeToHtml }, { default: light }, { default: dark }] = await Promise.all([
-    import("shiki"),
-    import("@pierre/theme/pierre-light"),
-    import("@pierre/theme/pierre-dark"),
-  ]);
+async function renderHighlightedHtml(code: string, language: SyntaxLanguage): Promise<string> {
+  const codeToHtml = await loadCodeToHtml();
   return codeToHtml(code, {
     lang: language,
     themes: {
-      light: light as unknown as ThemeRegistrationRaw,
-      dark: dark as unknown as ThemeRegistrationRaw,
+      light: "pierre-light",
+      dark: "pierre-dark",
     },
     defaultColor: false,
   });
+}
+
+let codeToHtmlPromise: ReturnType<typeof createCodeToHtml> | undefined;
+
+function loadCodeToHtml(): ReturnType<typeof createCodeToHtml> {
+  codeToHtmlPromise ??= createCodeToHtml();
+  return codeToHtmlPromise;
+}
+
+async function createCodeToHtml() {
+  const [{ createBundledHighlighter, createSingletonShorthands }, { createJavaScriptRegexEngine }] = await Promise.all([
+    import("shiki/core"),
+    import("shiki/engine/javascript"),
+  ]);
+  const createHighlighter = createBundledHighlighter({
+    langs: languageLoaders,
+    themes: {
+      "pierre-light": async () => ({
+        default: (await import("@pierre/theme/pierre-light")).default as unknown as ThemeRegistrationRaw,
+      }),
+      "pierre-dark": async () => ({
+        default: (await import("@pierre/theme/pierre-dark")).default as unknown as ThemeRegistrationRaw,
+      }),
+    },
+    engine: createJavaScriptRegexEngine,
+  });
+  return createSingletonShorthands(createHighlighter).codeToHtml;
 }

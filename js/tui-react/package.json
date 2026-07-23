@@ -1,0 +1,58 @@
+{
+  "name": "nanocodex-tui-react",
+  "version": "0.1.0",
+  "description": "Accessible, themeable React TUI for browser-embedded Nanocodex agents",
+  "type": "module",
+  "sideEffects": [
+    "./structure.css",
+    "./theme.css"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    },
+    "./structure.css": "./structure.css",
+    "./theme.css": "./theme.css"
+  },
+  "files": [
+    "src",
+    "structure.css",
+    "theme.css",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pierre/theme": "^1.1.0",
+    "@shikijs/langs": "^4.3.1",
+    "@tanstack/react-virtual": "^3.14.6",
+    "shiki": "^4.3.1",
+    "streamdown": "^2.5.0"
+  },
+  "peerDependencies": {
+    "nanocodex-react": "^0.1.0",
+    "nanocodex-tui": "^0.1.0",
+    "react": ">=18",
+    "react-dom": ">=18"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "nanocodex-react": "file:../react",
+    "nanocodex-tui": "file:../tui",
+    "react": "19.2.6",
+    "react-dom": "19.2.6",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gakonst/nanocodex.git",
+    "directory": "js/tui-react"
+  }
+}

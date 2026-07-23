@@ -315,7 +315,10 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect, layout: &Compos
         PaneId::Btw(_) => "BTW",
     };
     let title = if app.historical_editor_active() {
-        " Message composer · editing history inline above ".to_owned()
+        format!(
+            " Draft parked · editing branch {} message above ",
+            app.historical_editor_source_branch().unwrap_or_default()
+        )
     } else if app.branch_navigator_active() {
         " Message composer · browsing branches ".to_owned()
     } else if conversation.running {
@@ -372,8 +375,16 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let state = if app.branch_navigator_active() {
         "Branches — ↑/↓ or j/k switch + preview · Esc close".to_owned()
     } else if app.historical_editor_active() {
-        "Editing history — Enter fork/send · Shift+Enter newline · Esc cancel · Ctrl+G $EDITOR"
-            .to_owned()
+        let branch = app.historical_editor_source_branch().unwrap_or_default();
+        if app.main.running || app.main.pending_turns > 0 {
+            format!(
+                "Editing branch {branch} — Enter stops live turn + forks · Shift+Enter newline · Esc cancel"
+            )
+        } else {
+            format!(
+                "Editing branch {branch} — Enter forks here · Shift+Enter newline · Esc cancel · Ctrl+G $EDITOR"
+            )
+        }
     } else if app.transcript_selection_active() {
         "History — ↑/↓ navigate · e fork-edit · Esc return".to_owned()
     } else if app.cancel_confirmation_active() {
@@ -403,14 +414,19 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         "Esc interrupt/send"
     };
+    let tool_help = if app.tool_details_expanded() {
+        "Ctrl+T fold"
+    } else {
+        "Ctrl+T expand"
+    };
     let help = if app.btw.is_some() {
         format!(
-            "  Thinking: {} · BackTab switch · Ctrl+V image · Ctrl+O copy · /close dismiss · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
+            "  Thinking: {} · BackTab switch · Ctrl+O copy · /close dismiss · Enter send/steer · Tab queue · {tool_help} · Ctrl+V image · {escape_help} · Ctrl+C quit",
             app.thinking,
         )
     } else {
         format!(
-            "  Thinking: {} · /btw <question> side fork · Ctrl+V image · Ctrl+O copy · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
+            "  Thinking: {} · /btw <question> side fork · Ctrl+O copy · Enter send/steer · Tab queue · {tool_help} · Ctrl+V image · {escape_help} · Ctrl+C quit",
             app.thinking,
         )
     };
@@ -538,7 +554,7 @@ mod tests {
         backend::{Backend, ClearType, TestBackend, WindowSize},
         buffer::Cell,
         layout::{Position, Rect, Size},
-        style::Color,
+        style::{Color, Modifier},
     };
 
     use super::render;
@@ -617,7 +633,7 @@ mod tests {
         assert_eq!(app.take_pending_copy().as_deref(), Some("copy composer"));
         assert_eq!(
             terminal.backend().buffer().cell((1, 9)).unwrap().bg,
-            Color::LightBlue
+            Color::Indexed(8)
         );
 
         let _ = app.clear_mouse_selection();
@@ -912,5 +928,97 @@ mod tests {
         assert!(rendered.contains("Thinking: xhigh · /btw <question> side fork"));
         assert!(rendered.contains("Ctrl+O copy"));
         assert!(rendered.contains("Enter send/steer · Tab queue"));
+    }
+
+    #[test]
+    fn plain_composer_click_places_the_cursor() {
+        let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        app.input = "click the composer".to_owned();
+        app.cursor = app.input.len();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(app.begin_mouse_selection((7, 9).into()));
+        assert!(app.finish_mouse_selection((7, 9).into()));
+        assert_eq!(app.cursor, 6);
+    }
+
+    #[test]
+    fn transcript_edge_drag_auto_scrolls_without_ending_the_selection() {
+        let mut terminal = Terminal::new(TestBackend::new(48, 12)).unwrap();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        for index in 0..12 {
+            app.main
+                .transcript
+                .push(TranscriptItem::User(format!("message {index}")));
+        }
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.main.scroll_from_bottom = 5;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert!(app.begin_mouse_selection((2, 3).into()));
+        assert!(app.drag_mouse_selection((20, 6).into()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let before = app.main.scroll_from_bottom;
+        app.on_tick();
+
+        assert_eq!(app.main.scroll_from_bottom, before - 1);
+        assert!(app.mouse_selection_needs_redraw());
+    }
+
+    #[test]
+    fn rendered_markdown_uses_the_same_selection_and_copy_path() {
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        app.main.transcript.push(TranscriptItem::Assistant(
+            "**bold** and [docs](https://example.com)".to_owned(),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let needle = "bold and docs";
+        let buffer = terminal.backend().buffer();
+        let (start_x, row) = (0..buffer.area.height)
+            .find_map(|row| {
+                (0..buffer.area.width).find_map(|column| {
+                    let end = column.saturating_add(u16::try_from(needle.len()).ok()?);
+                    (end <= buffer.area.width
+                        && (column..end)
+                            .map(|x| buffer[(x, row)].symbol())
+                            .collect::<String>()
+                            == needle)
+                        .then_some((column, row))
+                })
+            })
+            .expect("rendered Markdown should be visible");
+        let end_x = start_x.saturating_add(u16::try_from(needle.len() - 1).unwrap_or(u16::MAX));
+
+        assert!(app.begin_mouse_selection((start_x, row).into()));
+        assert!(app.finish_mouse_selection((end_x, row).into()));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        assert_eq!(
+            app.take_pending_copy().as_deref(),
+            Some("bold and [docs](https://example.com)")
+        );
+        let selected = terminal.backend().buffer().cell((start_x, row)).unwrap();
+        assert_eq!(selected.bg, Color::Indexed(8));
+        assert!(selected.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn running_historical_edit_explains_that_submit_stops_and_forks() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        app.main
+            .transcript
+            .push_editable_user("active prompt".to_owned(), 1);
+        app.main.running = true;
+        app.move_up();
+        assert!(app.start_historical_edit());
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Draft parked · editing branch 0 message above"));
+        assert!(rendered.contains("Editing branch 0 — Enter stops live turn + forks"));
     }
 }

@@ -25,7 +25,11 @@
     "test": "node --test test/*.test.mjs"
   },
   "peerDependencies": {
+    "nanocodex": "^0.1.0",
     "react": ">=18"
+  },
+  "devDependencies": {
+    "nanocodex": "file:../bindings"
   },
   "engines": {
     "node": ">=22.13.0"

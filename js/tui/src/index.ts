@@ -8,6 +8,33 @@ export type AgentEvent = {
   payload: JsonObject;
 };
 
+export type TuiTarget =
+  | { pane: "main"; branchId: number }
+  | { pane: "btw"; id: number };
+
+export type TuiCommand =
+  | { type: "start"; thinking: "none" | "low" | "medium" | "high" | "xhigh" | "max"; reasoningMode: "standard" | "pro" }
+  | { type: "prompt"; target: TuiTarget; id: number; prompt: string; images?: string[]; intent: "immediate" | "queue" }
+  | { type: "cancel"; target: TuiTarget }
+  | { type: "openBtw"; id: number; sourceBranchId: number; promptId?: number; prompt?: string; images?: string[] }
+  | { type: "closeBtw"; id: number }
+  | { type: "historicalFork"; sourceBranchId: number; newBranchId: number; selectedPromptId: number; newPromptId: number; prompt: string };
+
+export type TuiMessage =
+  | { type: "ready"; sessionId: string }
+  | { type: "event"; target: TuiTarget; event: AgentEvent }
+  | { type: "turnFinished"; target: TuiTarget; id: number; message?: string; error?: string }
+  | { type: "steerAdmitted"; target: TuiTarget; id: number }
+  | { type: "steerQueued"; target: TuiTarget; id: number; prompt: string }
+  | { type: "steerFailed"; target: TuiTarget; id: number; error: string }
+  | { type: "cancelAccepted"; target: TuiTarget }
+  | { type: "cancelFailed"; target: TuiTarget; error: string }
+  | { type: "btwOpened"; id: number; sessionId: string }
+  | { type: "btwOpenFailed"; id: number; error: string }
+  | { type: "branchOpened"; id: number; parentId: number; sessionId: string }
+  | { type: "branchOpenFailed"; id: number; error: string }
+  | { type: "fatal"; message: string };
+
 export type ToolStatus = "running" | "completed" | "cancelled" | "failed";
 
 export type ToolActivity = {
@@ -21,11 +48,18 @@ export type ToolActivity = {
   children: ToolActivity[];
 };
 
+export type PlanStepStatus = "pending" | "in_progress" | "completed";
+export type PlanUpdate = {
+  explanation?: string;
+  plan: { step: string; status: PlanStepStatus }[];
+};
+
 export type TerminalEntry =
   | { id: string; kind: "user"; text: string; promptId?: number }
   | { id: string; kind: "reasoning"; text: string; streaming: boolean }
   | { id: string; kind: "assistant"; text: string; streaming: boolean }
   | { id: string; kind: "tool"; tool: ToolActivity }
+  | { id: string; kind: "plan"; update: PlanUpdate }
   | { id: string; kind: "error"; text: string };
 
 export type PendingSteer = {
@@ -137,6 +171,20 @@ export function turnFinished(state: TerminalState, error?: string): TerminalStat
   return error && error !== "the turn was cancelled" ? appendError(next, error) : next;
 }
 
+/** Remove a prompt that was rejected before its run could start. */
+export function turnRejected(state: TerminalState, error: string): TerminalState {
+  const [rejected, ...queuedPrompts] = state.queuedPrompts;
+  return appendError({
+    ...state,
+    running: false,
+    pendingTurns: Math.max(0, state.pendingTurns - 1),
+    queuedPrompts,
+    displayedQueuedPrompt: rejected?.id === state.displayedQueuedPrompt
+      ? undefined
+      : state.displayedQueuedPrompt,
+  }, error);
+}
+
 export function appendError(state: TerminalState, text: string): TerminalState {
   const syntheticId = state.syntheticId + 1;
   return {
@@ -152,20 +200,37 @@ export function applyAgentEvents(
 ): TerminalState {
   if (events.length === 0) return state;
 
-  let next = { ...state, entries: state.entries.slice() };
+  let next = { ...state };
+  let ownsEntries = false;
   let bufferedKind: "assistant" | "reasoning" | undefined;
   let bufferedId = "";
   let bufferedText: string[] = [];
 
+  const mutableEntries = () => {
+    if (!ownsEntries) {
+      next = { ...next, entries: next.entries.slice() };
+      ownsEntries = true;
+    }
+    return next.entries;
+  };
+
+  const sealTail = () => {
+    const tail = next.entries.at(-1);
+    if (tail && (tail.kind === "assistant" || tail.kind === "reasoning") && tail.streaming) {
+      sealStreamingTail(mutableEntries());
+    }
+  };
+
   const flushDeltas = () => {
     if (!bufferedKind || bufferedText.length === 0) return;
     const text = bufferedText.join("");
-    const tail = next.entries.at(-1);
+    const entries = mutableEntries();
+    const tail = entries.at(-1);
     if (tail?.kind === bufferedKind && tail.streaming) {
-      next.entries[next.entries.length - 1] = { ...tail, text: tail.text + text };
+      entries[entries.length - 1] = { ...tail, text: tail.text + text };
     } else {
-      sealStreamingTail(next.entries);
-      next.entries.push({ id: bufferedId, kind: bufferedKind, text, streaming: true });
+      sealStreamingTail(entries);
+      entries.push({ id: bufferedId, kind: bufferedKind, text, streaming: true });
     }
     next.streamedThisTurn ||= bufferedKind === "assistant";
     bufferedKind = undefined;
@@ -188,7 +253,7 @@ export function applyAgentEvents(
       case "run.started": {
         const [prompt, ...queuedPrompts] = next.queuedPrompts;
         if (prompt && next.displayedQueuedPrompt !== prompt.id) {
-          next.entries.push({
+          mutableEntries().push({
             id: `user-${prompt.id}`,
             kind: "user",
             text: prompt.text,
@@ -218,18 +283,30 @@ export function applyAgentEvents(
         const text = payloadString(event.payload, "text") ?? "";
         const tail = next.entries.at(-1);
         if (tail?.kind === "assistant") {
-          next.entries[next.entries.length - 1] = { ...tail, text, streaming: false };
+          const entries = mutableEntries();
+          entries[entries.length - 1] = { ...tail, text, streaming: false };
         } else if (text) {
-          next.entries.push({ id: `assistant-${event.seq}`, kind: "assistant", text, streaming: false });
+          mutableEntries().push({ id: `assistant-${event.seq}`, kind: "assistant", text, streaming: false });
         }
         break;
       }
-      case "tool.call":
-        applyToolCall(next.entries, event);
-        next.status = `Running ${payloadString(event.payload, "tool") ?? "tool"}`;
+      case "tool.call": {
+        const tool = payloadString(event.payload, "tool") ?? "tool";
+        if (isEmptyTerminalPoll(tool, event.payload.arguments)) break;
+        if (tool === "update_plan") {
+          const update = decodePlanUpdate(event.payload.arguments);
+          if (update) {
+            mutableEntries().push({ id: `plan-${event.seq}`, kind: "plan", update });
+            next.status = "Working";
+            break;
+          }
+        }
+        applyToolCall(mutableEntries(), event);
+        next.status = `Running ${tool}`;
         break;
+      }
       case "tool.result":
-        applyToolResult(next.entries, event);
+        applyToolResult(mutableEntries(), event);
         next.status = "Working";
         break;
       case "model.call.completed":
@@ -239,31 +316,58 @@ export function applyAgentEvents(
         next.pendingRunError = payloadString(event.payload, "message");
         break;
       case "run.completed":
-        sealStreamingTail(next.entries);
-        if (next.pendingRunError) next = appendError(next, next.pendingRunError);
+        sealTail();
+        if (next.pendingRunError) {
+          next = appendError(next, next.pendingRunError);
+          ownsEntries = true;
+        }
         next = reconcileSteers({
           ...next,
           running: false,
           pendingRunError: undefined,
           status: "Ready",
         });
+        ownsEntries = true;
         break;
       case "run.failed": {
-        sealStreamingTail(next.entries);
+        sealTail();
         const cancelled = payloadString(event.payload, "status") === "cancelled";
-        if (!cancelled && next.pendingRunError) next = appendError(next, next.pendingRunError);
+        if (!cancelled && next.pendingRunError) {
+          next = appendError(next, next.pendingRunError);
+          ownsEntries = true;
+        }
         next = reconcileSteers({
           ...next,
           running: false,
           pendingRunError: undefined,
           status: cancelled ? "Cancelled" : "Turn failed",
         });
+        ownsEntries = true;
         break;
       }
     }
   }
   flushDeltas();
   return next;
+}
+
+export type TargetedAgentEvent = { target: TuiTarget; event: AgentEvent };
+export type TargetedAgentEventBatch = { target: TuiTarget; events: AgentEvent[] };
+
+/** Coalesce one browser frame of independent session events before reduction. */
+export function groupAgentEventsByTarget(
+  items: readonly TargetedAgentEvent[],
+): TargetedAgentEventBatch[] {
+  const batches = new Map<string, TargetedAgentEventBatch>();
+  for (const item of items) {
+    const key = item.target.pane === "main"
+      ? `main:${item.target.branchId}`
+      : `btw:${item.target.id}`;
+    const batch = batches.get(key);
+    if (batch) batch.events.push(item.event);
+    else batches.set(key, { target: item.target, events: [item.event] });
+  }
+  return [...batches.values()];
 }
 
 export function pendingCount(state: TerminalState): number {
@@ -334,6 +438,27 @@ function applyToolCall(entries: TerminalEntry[], event: AgentEvent): void {
     }
   }
   entries.push({ id: `tool-${callId}`, kind: "tool", tool });
+}
+
+function isEmptyTerminalPoll(tool: string, value: unknown): boolean {
+  return tool === "write_stdin"
+    && isObject(value)
+    && (typeof value.chars !== "string" || value.chars.length === 0);
+}
+
+function decodePlanUpdate(value: unknown): PlanUpdate | undefined {
+  if (!isObject(value) || !Array.isArray(value.plan)) return undefined;
+  const plan = value.plan.flatMap((item) => {
+    if (!isObject(item) || typeof item.step !== "string") return [];
+    const status = item.status;
+    if (status !== "pending" && status !== "in_progress" && status !== "completed") return [];
+    return [{ step: item.step, status } satisfies PlanUpdate["plan"][number]];
+  });
+  if (plan.length !== value.plan.length) return undefined;
+  return {
+    ...(typeof value.explanation === "string" ? { explanation: value.explanation } : {}),
+    plan,
+  };
 }
 
 function applyToolResult(entries: TerminalEntry[], event: AgentEvent): void {

@@ -56,6 +56,7 @@ BTW question:
 const DEFAULT_JAEGER_UI_URL: &str = "http://127.0.0.1:16686";
 const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
 const MOUSE_SCROLL_ROWS: usize = 3;
+const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
 enum WorkerCommand {
     Prompt {
         target: PaneId,
@@ -482,6 +483,54 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
     .await
 }
 
+fn apply_main_agent_event_batch(
+    ui: &mut UiModel,
+    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
+    stream_telemetry: &mut StreamTelemetry,
+    scheduler: &mut RenderScheduler,
+    agent_events: &mut AgentEvents,
+    first: Option<TimedAgentEvent>,
+) -> Result<bool> {
+    if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
+        return Ok(true);
+    }
+    for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
+        if scheduler.is_due(Instant::now()) {
+            break;
+        }
+        let Some(event) = agent_events.try_recv_timed() else {
+            break;
+        };
+        if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_main_agent_event(
+    ui: &mut UiModel,
+    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
+    stream_telemetry: &mut StreamTelemetry,
+    scheduler: &mut RenderScheduler,
+    event: Option<TimedAgentEvent>,
+) -> Result<bool> {
+    let received = event
+        .as_ref()
+        .map(|event| stream_telemetry.event_received(PaneId::Main, event));
+    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
+        UiAction::Agent(event.event)
+    });
+    let update = ui.update(action, worker_tx)?;
+    if let Some(received) = received {
+        stream_telemetry.event_applied(
+            received,
+            matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
+        );
+    }
+    Ok(apply_update(update, scheduler))
+}
+
 struct UiLoop {
     terminal: TerminalSession,
     input_events: EventStream,
@@ -563,20 +612,14 @@ impl UiLoop {
                     }
                 }
                 event = self.agent_events.recv_timed(), if self.ui.agent_events_open => {
-                    let received = event
-                        .as_ref()
-                        .map(|event| self.stream_telemetry.event_received(PaneId::Main, event));
-                    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
-                        UiAction::Agent(event.event)
-                    });
-                    let update = self.ui.update(action, &self.worker_tx)?;
-                    if let Some(received) = received {
-                        self.stream_telemetry.event_applied(
-                            received,
-                            matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-                        );
-                    }
-                    if apply_update(update, &mut self.scheduler) {
+                    if apply_main_agent_event_batch(
+                        &mut self.ui,
+                        &self.worker_tx,
+                        &mut self.stream_telemetry,
+                        &mut self.scheduler,
+                        &mut self.agent_events,
+                        event,
+                    )? {
                         return Ok(());
                     }
                 }
@@ -601,7 +644,9 @@ impl UiLoop {
                         return Ok(());
                     }
                 }
-                _ = self.ticker.tick(), if self.ui.app.main.running || self.ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running) => {
+                _ = self.ticker.tick(), if self.ui.app.main.running
+                    || self.ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running)
+                    || self.ui.app.mouse_selection_needs_redraw() => {
                     if apply_update(
                         self.ui.update(UiAction::Tick, &self.worker_tx)?,
                         &mut self.scheduler,
@@ -643,12 +688,18 @@ fn render_due_frame(
     ui.app.advance_smooth_scroll();
     let render_started = Instant::now();
     let draw_metrics = terminal.draw(|frame| view::render(frame, &mut ui.app))?;
-    if let Some(text) = ui.app.take_pending_copy()
-        && let Err(error) = clipboard::copy_to_clipboard(&text)
-    {
-        tracing::warn!(%error, "failed to copy text to the clipboard");
-        ui.app
-            .set_active_status(format!("Clipboard copy failed: {error}"));
+    if let Some(text) = ui.app.take_pending_copy() {
+        match clipboard::copy_to_clipboard(&text) {
+            Ok(()) => {
+                let _ = ui.app.complete_mouse_copy(true);
+            }
+            Err(error) => {
+                let _ = ui.app.complete_mouse_copy(false);
+                tracing::warn!(%error, "failed to copy text to the clipboard");
+                ui.app
+                    .set_active_status(format!("Clipboard copy failed: {error}"));
+            }
+        }
     }
     let presented_at = Instant::now();
     scheduler.presented(presented_at);
@@ -1180,6 +1231,21 @@ impl AgentWorker {
             }));
             return;
         };
+        if !self.main.turns.is_empty()
+            && !cancel_turn(
+                Some(&self.main.turns),
+                &self.main.request_id,
+                PaneId::Main,
+                &self.updates,
+            )
+            .await
+        {
+            drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
+                id: new_branch_id,
+                error: "the active turn could not be cancelled before editing".to_owned(),
+            }));
+            return;
+        }
         let parent = self.main.prompt_order[..position]
             .iter()
             .rev()
@@ -1692,6 +1758,9 @@ fn handle_key(
         match key.code {
             KeyCode::Char('c') => return Ok(TerminalAction::Quit),
             KeyCode::Char('g') => return Ok(TerminalAction::ExternalEditor),
+            KeyCode::Char('t') => {
+                let _ = app.toggle_tool_details();
+            }
             KeyCode::Char('d') if app.input.is_empty() => return Ok(TerminalAction::Quit),
             KeyCode::Char('d') => app.delete(),
             KeyCode::Char('h') => app.backspace(),
@@ -1919,9 +1988,13 @@ fn request_historical_edit(
     app: &mut App,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
+    let cancel_source = app.main.running || app.main.pending_turns > 0;
     let Some(request) = app.commit_historical_edit() else {
         return Ok(());
     };
+    if cancel_source {
+        app.cancel_pending(PaneId::Main);
+    }
     send_command(
         commands,
         WorkerCommand::EditHistorical {
@@ -2236,6 +2309,7 @@ mod tests {
     use crate::tui::{app::App, transcript::TranscriptItem};
 
     #[tokio::test]
+
     async fn tui_restores_terminal_before_awaiting_child_shutdown() -> eyre::Result<()> {
         for ui_fails in [false, true] {
             let restored = Arc::new(AtomicBool::new(false));
@@ -2300,6 +2374,7 @@ mod tests {
     }
 
     #[test]
+
     fn parses_tui_commands_without_capturing_similar_prompts() {
         assert_eq!(
             classify_submission("/btw".to_owned()),
@@ -2337,6 +2412,7 @@ mod tests {
     }
 
     #[test]
+
     fn exit_submission_quits_without_sending_an_agent_command() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -2356,6 +2432,7 @@ mod tests {
     }
 
     #[test]
+
     fn clipboard_image_paste_attaches_the_materialized_image() {
         let mut app = App::new("/workspace".into(), Thinking::Medium);
         let path = PathBuf::from("/tmp/copied-image.png");
@@ -2377,6 +2454,7 @@ mod tests {
     }
 
     #[test]
+
     fn control_end_jumps_the_focused_transcript_to_the_tail() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -2401,6 +2479,7 @@ mod tests {
     }
 
     #[test]
+
     fn jaeger_search_targets_the_focused_session_and_encodes_its_tag() {
         let mut app = App::new("/workspace".into(), Thinking::Medium);
         assert_eq!(
@@ -2429,6 +2508,7 @@ mod tests {
     }
 
     #[test]
+
     fn side_boundary_wraps_only_the_first_btw_prompt() {
         let mut first = true;
         assert!(BTW_BOUNDARY.contains("fresh tool runtime"));
@@ -2443,6 +2523,7 @@ mod tests {
     }
 
     #[test]
+
     fn all_event_sources_cross_the_ui_action_boundary() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut ui = UiModel::new(
@@ -2468,6 +2549,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
+
     async fn tui_worker_steer_becomes_a_user_item_at_the_next_model_boundary() -> eyre::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -2579,7 +2661,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn historical_edit_forks_before_the_selected_prompt_and_keeps_the_parent_branch()
+    async fn historical_edit_cancels_the_active_turn_and_keeps_the_parent_branch()
     -> eyre::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -2618,7 +2700,7 @@ mod tests {
                 "revised second prompt"
             );
             send_completed(&mut branch, "resp-edited", "edited answer").await?;
-            send_completed(&mut root, "resp-second", "second answer").await
+            Ok::<_, eyre::Report>(())
         });
 
         let workspace = temporary_workspace("tui-historical-edit")?;
@@ -2676,16 +2758,22 @@ mod tests {
             prompt_id: 2,
         })?;
         timeout(Duration::from_secs(5), async {
+            let mut cancellation_accepted = false;
+            let mut branch_opened = false;
             loop {
-                if matches!(
-                    update_rx.recv().await,
+                match update_rx.recv().await {
+                    Some(WorkerEvent::CancelAccepted {
+                        target: PaneId::Main,
+                    }) => cancellation_accepted = true,
                     Some(WorkerEvent::MainBranchOpened {
                         id: 1,
                         parent_id: 0,
                         prompt_id: 2,
                         ..
-                    })
-                ) {
+                    }) => branch_opened = true,
+                    _ => {}
+                }
+                if cancellation_accepted && branch_opened {
                     break;
                 }
             }
@@ -2721,7 +2809,7 @@ mod tests {
             }
         })
         .await
-        .map_err(|_| eyre::eyre!("concurrent parent and edited branch turns did not finish"))?;
+        .map_err(|_| eyre::eyre!("parent cancellation or edited branch did not finish"))?;
 
         commands.send(WorkerCommand::SwitchMainBranch { id: 0 })?;
         timeout(Duration::from_secs(5), async {
@@ -2747,6 +2835,7 @@ mod tests {
     }
 
     #[tokio::test]
+
     async fn failed_accepted_turn_does_not_repeat_the_run_error_on_completion() -> eyre::Result<()>
     {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2823,6 +2912,7 @@ mod tests {
     }
 
     #[test]
+
     fn second_escape_sends_cancel_for_the_focused_turn() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -2850,6 +2940,7 @@ mod tests {
     }
 
     #[test]
+
     fn first_escape_interrupts_and_resubmits_pending_steers() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), nanocodex::Thinking::Medium);
@@ -2889,6 +2980,7 @@ mod tests {
     }
 
     #[test]
+
     fn control_g_requests_the_external_editor_without_changing_the_draft() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -2905,6 +2997,7 @@ mod tests {
     }
 
     #[test]
+
     fn control_o_queues_the_exact_latest_assistant_message_for_copy() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -2940,6 +3033,7 @@ mod tests {
     }
 
     #[test]
+
     fn up_selects_a_just_submitted_prompt_before_worker_events_arrive() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -2976,6 +3070,7 @@ mod tests {
     }
 
     #[test]
+
     fn e_edits_the_selected_prompt_inline_before_requesting_a_fork() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -3034,6 +3129,7 @@ mod tests {
     }
 
     #[test]
+
     fn escape_cancels_inline_history_edit_and_restores_the_composer_draft() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -3042,6 +3138,7 @@ mod tests {
             .push_editable_user("earlier prompt".to_owned(), 17);
         app.input = "preserved draft".to_owned();
         app.cursor = app.input.len();
+        app.move_up();
         app.move_up();
         assert!(app.start_historical_edit());
         app.replace_input("discard this revision".to_owned());
@@ -3057,13 +3154,14 @@ mod tests {
             TerminalAction::Redraw
         );
         assert_eq!(app.input, "preserved draft");
-        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.cursor, 0);
         assert!(!app.historical_editor_active());
         assert!(!app.transcript_selection_active());
         assert!(worker.try_recv().is_err());
     }
 
     #[test]
+
     fn opened_historical_branch_submits_the_inline_revision() {
         let mut app = App::new("/workspace".into(), Thinking::Medium);
         app.main
@@ -3104,6 +3202,7 @@ mod tests {
     }
 
     #[test]
+
     fn control_alt_arrows_request_branch_navigation() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -3134,6 +3233,7 @@ mod tests {
     }
 
     #[test]
+
     fn branch_navigator_switches_as_selection_moves() -> eyre::Result<()> {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -3211,6 +3311,7 @@ mod tests {
     }
 
     #[test]
+
     fn readline_control_keys_are_dispatched_to_the_composer() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -3292,6 +3393,7 @@ mod tests {
     }
 
     #[test]
+
     fn alt_and_command_edit_the_composer_by_word_line_and_draft() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -3391,6 +3493,7 @@ mod tests {
     }
 
     #[test]
+
     fn reversing_a_queued_mouse_scroll_discards_the_previous_direction() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into(), Thinking::Medium);
@@ -3424,6 +3527,7 @@ mod tests {
     }
 
     #[test]
+
     fn same_direction_mouse_scrolls_accumulate_until_the_frame() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut ui = UiModel::new(
@@ -3444,6 +3548,7 @@ mod tests {
     }
 
     #[test]
+
     fn completion_notification_is_queued_only_while_unfocused() {
         let (commands, _worker) = mpsc::unbounded_channel();
         let mut ui = UiModel::new(
@@ -3480,5 +3585,98 @@ mod tests {
         )
         .unwrap();
         assert!(ui.pending_notification.is_none());
+    }
+
+    #[test]
+    fn control_t_toggles_tool_detail_density() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        let key = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+        assert!(app.tool_details_expanded());
+        assert_eq!(
+            handle_key(key, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
+        assert!(!app.tool_details_expanded());
+    }
+
+    #[test]
+    fn running_generation_continues_while_its_prompt_is_selected_and_edited() {
+        let (commands, mut worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        app.input = "message with typo".to_owned();
+        app.cursor = app.input.len();
+
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::Prompt { prompt, .. }) if prompt == "message with typo"
+        ));
+        app.main.running = true;
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+        assert!(app.transcript_selection_active());
+        assert!(worker.try_recv().is_err());
+
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+        assert_eq!(app.input, "message with typo");
+        assert!(app.historical_editor_active());
+        assert!(app.main.running);
+        assert!(worker.try_recv().is_err());
+
+        app.main.push_assistant_delta("generation continues");
+        assert!(app.historical_editor_active());
+        assert_eq!(app.input, "message with typo");
+        assert!(app.main.running);
+        assert!(worker.try_recv().is_err());
+
+        app.replace_input("message without typo".to_owned());
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::EditHistorical {
+                source_branch_id: 0,
+                new_branch_id: 1,
+                prompt_id: 1,
+            })
+        ));
+        assert_eq!(app.main.status, "Cancelling");
+        assert!(!app.historical_editor_active());
     }
 }

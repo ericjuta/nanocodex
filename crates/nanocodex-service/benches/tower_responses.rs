@@ -393,6 +393,41 @@ fn timed_agent_event_delivery(criterion: &mut Criterion) {
             }
         });
     });
+    group.bench_function("emit_then_try_receive_1024", |bencher| {
+        bencher.iter(|| {
+            let (sink, mut events) = EventSink::channel("benchmark-session".to_owned());
+            for _ in 0..EVENTS_PER_BATCH {
+                sink.emit(
+                    AgentEventKind::AssistantDelta,
+                    ReplyPayload { message: "delta" },
+                )
+                .unwrap();
+            }
+            let received = std::iter::from_fn(|| events.try_recv_timed()).count();
+            assert_eq!(
+                u64::try_from(received).expect("event count should fit in u64"),
+                EVENTS_PER_BATCH
+            );
+            black_box((sink, events));
+        });
+    });
+    let large_payload = "x".repeat(128 * 1_024);
+    group.bench_function("emit_dropped_1024_large_payload", |bencher| {
+        bencher.iter(|| {
+            let (sink, events) = EventSink::channel("benchmark-session".to_owned());
+            drop(events);
+            for _ in 0..EVENTS_PER_BATCH {
+                sink.emit(
+                    AgentEventKind::ApiEvent,
+                    ReplyPayload {
+                        message: black_box(&large_payload),
+                    },
+                )
+                .unwrap();
+            }
+            black_box(sink);
+        });
+    });
     group.finish();
 }
 

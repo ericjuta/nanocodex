@@ -10,7 +10,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::composer::ComposerLayout;
-use super::selection::ScreenSelection;
+use super::selection::{
+    ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
+};
 use super::transcript::{ToolStatus, Transcript, TranscriptItem};
 
 use ratatui::{
@@ -177,6 +179,7 @@ pub(super) struct Conversation {
     streamed_this_turn: bool,
     pending_run_error: Option<String>,
     hidden_terminal_polls: HashMap<String, String>,
+    hidden_plan_calls: HashSet<String>,
     pub(super) queued_prompts: VecDeque<String>,
     queued_prompt_ids: VecDeque<u64>,
     displayed_queued_prompt: Option<u64>,
@@ -203,6 +206,7 @@ impl Conversation {
             streamed_this_turn: false,
             pending_run_error: None,
             hidden_terminal_polls: HashMap::new(),
+            hidden_plan_calls: HashSet::new(),
             queued_prompts: VecDeque::new(),
             queued_prompt_ids: VecDeque::new(),
             displayed_queued_prompt: None,
@@ -303,6 +307,7 @@ impl Conversation {
                 self.streamed_this_turn = false;
                 self.pending_run_error = None;
                 self.hidden_terminal_polls.clear();
+                self.hidden_plan_calls.clear();
                 "Thinking...".clone_into(&mut self.status);
             }
             AgentEventKind::RunSteered => {
@@ -378,6 +383,21 @@ impl Conversation {
         let Ok(payload) = event.decode_payload::<ToolCallPayload>() else {
             return false;
         };
+        if payload.tool == "update_plan"
+            && let Ok(update) =
+                serde_json::from_value::<PlanUpdatePayload>(payload.arguments.clone())
+        {
+            self.hidden_plan_calls.insert(payload.call_id);
+            self.push_output(TranscriptItem::Plan {
+                explanation: update.explanation,
+                steps: update
+                    .plan
+                    .into_iter()
+                    .map(|item| (item.step, item.status))
+                    .collect(),
+            });
+            return true;
+        }
         if is_empty_terminal_poll(&payload.tool, &payload.arguments) {
             let arguments = summarize_tool_arguments(&payload.tool, &payload.arguments);
             self.hidden_terminal_polls
@@ -418,27 +438,13 @@ impl Conversation {
             "cancelled" => ToolStatus::Cancelled,
             _ => ToolStatus::Failed,
         };
-        if let Some(arguments) = self.hidden_terminal_polls.remove(&payload.call_id) {
-            if status == ToolStatus::Completed {
-                return false;
-            }
-            let call_id = payload.call_id.clone();
-            if self.transcript.has_tool_parent(&call_id) {
-                self.note_tail_will_change();
-                let _ = self.transcript.push_tool_child(
-                    call_id,
-                    "terminal wait".to_owned(),
-                    arguments,
-                    status,
-                );
-            } else {
-                self.push_output(TranscriptItem::Tool {
-                    call_id,
-                    name: "terminal wait".to_owned(),
-                    arguments,
-                    status,
-                });
-            }
+        if self
+            .hidden_terminal_polls
+            .remove(&payload.call_id)
+            .is_some()
+            || self.hidden_plan_calls.remove(&payload.call_id)
+        {
+            return false;
         }
         let result = payload
             .result
@@ -914,6 +920,7 @@ pub(super) struct App {
     cancel_confirmation: Option<CancelConfirmation>,
     screen_selection: ScreenSelection,
     pending_clipboard_copy: Option<String>,
+    tool_details_expanded: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -963,6 +970,7 @@ impl App {
             cancel_confirmation: None,
             screen_selection: ScreenSelection::default(),
             pending_clipboard_copy: None,
+            tool_details_expanded: true,
         }
     }
 
@@ -1153,14 +1161,36 @@ impl App {
         let layout = ComposerLayout::new(&self.input, self.composer_width);
         let position = layout.cursor_position(&self.input, self.cursor);
         let Some(target_row) = position.row.checked_add_signed(direction) else {
-            return false;
+            return self.move_to_visual_row_boundary(&layout, position.row, direction);
         };
         if target_row >= layout.row_count() {
-            return false;
+            return self.move_to_visual_row_boundary(&layout, position.row, direction);
         }
         let column = self.preferred_column.unwrap_or(position.column);
         self.cursor = layout.byte_at_column(&self.input, target_row, column);
         self.preferred_column = Some(column);
+        true
+    }
+
+    fn move_to_visual_row_boundary(
+        &mut self,
+        layout: &ComposerLayout,
+        row: usize,
+        direction: isize,
+    ) -> bool {
+        let Some(range) = layout.row(row) else {
+            return false;
+        };
+        let boundary = if direction.is_negative() {
+            range.start
+        } else {
+            range.end
+        };
+        if boundary == self.cursor {
+            return false;
+        }
+        self.cursor = boundary;
+        self.preferred_column = None;
         true
     }
 
@@ -1401,6 +1431,12 @@ impl App {
 
     pub(super) fn historical_editor_active(&self) -> bool {
         self.historical_editor.is_some()
+    }
+
+    pub(super) fn historical_editor_source_branch(&self) -> Option<u64> {
+        self.historical_editor
+            .as_ref()
+            .map(|editor| editor.source_branch_id)
     }
 
     pub(super) fn start_historical_edit(&mut self) -> bool {
@@ -1777,8 +1813,35 @@ impl App {
             request_id: None,
             conversation: Conversation::new("Forking latest checkpoint"),
         });
+        if !self.tool_details_expanded
+            && let Some(btw) = &mut self.btw
+        {
+            btw.conversation.transcript.set_tool_details_expanded(false);
+        }
         self.focus = PaneId::Btw(id);
         id
+    }
+
+    pub(super) fn toggle_tool_details(&mut self) -> bool {
+        self.tool_details_expanded = !self.tool_details_expanded;
+        let expanded = self.tool_details_expanded;
+        self.main.transcript.set_tool_details_expanded(expanded);
+        for branch in &mut self.main_branches {
+            branch
+                .conversation
+                .transcript
+                .set_tool_details_expanded(expanded);
+        }
+        if let Some(btw) = &mut self.btw {
+            btw.conversation
+                .transcript
+                .set_tool_details_expanded(expanded);
+        }
+        expanded
+    }
+
+    pub(super) fn tool_details_expanded(&self) -> bool {
+        self.tool_details_expanded
     }
 
     pub(super) fn btw_id(&self) -> Option<u64> {
@@ -2067,7 +2130,12 @@ impl App {
 
     pub(super) fn on_tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
-        self.expire_cancel_confirmation(Instant::now());
+        let now = Instant::now();
+        self.expire_cancel_confirmation(now);
+        let _ = self.screen_selection.advance(now);
+        if let Some(request) = self.screen_selection.scroll_request() {
+            self.auto_scroll_mouse_selection(request);
+        }
     }
 
     pub(super) fn begin_mouse_selection(&mut self, position: Position) -> bool {
@@ -2086,7 +2154,12 @@ impl App {
     }
 
     pub(super) fn finish_mouse_selection(&mut self, position: Position) -> bool {
-        self.screen_selection.finish(position)
+        let changed = self.screen_selection.finish(position);
+        let clicked = self
+            .screen_selection
+            .take_pending_click()
+            .is_some_and(|click| self.place_composer_cursor(click));
+        changed || clicked
     }
 
     pub(super) fn clear_mouse_selection(&mut self) -> bool {
@@ -2116,9 +2189,107 @@ impl App {
     }
 
     pub(super) fn take_pending_copy(&mut self) -> Option<String> {
-        self.pending_clipboard_copy
-            .take()
-            .or_else(|| self.screen_selection.take_pending_copy())
+        if let Some(text) = self.pending_clipboard_copy.take() {
+            return Some(text);
+        }
+        let text = self.screen_selection.take_pending_copy()?;
+        Some(self.semanticize_mouse_copy(text))
+    }
+
+    pub(super) fn complete_mouse_copy(&mut self, copied: bool) -> bool {
+        self.screen_selection.copy_finished(copied)
+    }
+
+    pub(super) fn mouse_selection_needs_redraw(&self) -> bool {
+        self.screen_selection.needs_tick()
+    }
+
+    fn place_composer_cursor(&mut self, click: SelectionClick) -> bool {
+        if self.historical_editor_active()
+            || self.branch_navigator_active()
+            || click.surface_index + 1 != self.screen_selection.selectable_area_count()
+        {
+            return false;
+        }
+        let row = self.composer_scroll.saturating_add(usize::from(
+            click.position.y.saturating_sub(click.surface.y),
+        ));
+        let column = usize::from(click.position.x.saturating_sub(click.surface.x));
+        let layout = ComposerLayout::new(&self.input, self.composer_width);
+        let cursor = layout.byte_at_column(
+            &self.input,
+            row.min(layout.row_count().saturating_sub(1)),
+            column,
+        );
+        let focus = self.focus;
+        let history_selected = self
+            .conversation(focus)
+            .is_some_and(|conversation| conversation.selected_user.is_some());
+        let changed = self.cursor != cursor || history_selected;
+        self.cursor = cursor;
+        self.preferred_column = None;
+        if let Some(conversation) = self.conversation_mut(focus) {
+            conversation.selected_user = None;
+        }
+        changed
+    }
+
+    fn auto_scroll_mouse_selection(&mut self, request: SelectionScrollRequest) {
+        let conversation = if request.surface_index == 0 {
+            if self.branch_navigator_active() {
+                self.branch_navigator_conversation_mut()
+            } else {
+                &mut self.main
+            }
+        } else if request.surface_index == 1 {
+            let Some(btw) = self.btw.as_mut() else {
+                let _ = self.screen_selection.scrolled(request.direction, 0);
+                return;
+            };
+            &mut btw.conversation
+        } else {
+            let _ = self.screen_selection.scrolled(request.direction, 0);
+            return;
+        };
+        let before = conversation.display_scroll_from_bottom();
+        match request.direction {
+            SelectionScrollDirection::Older => conversation.scroll_up(1),
+            SelectionScrollDirection::Newer => conversation.scroll_down(1),
+        }
+        let after = conversation.display_scroll_from_bottom();
+        let _ = self
+            .screen_selection
+            .scrolled(request.direction, before.abs_diff(after));
+    }
+
+    fn semanticize_mouse_copy(&self, text: String) -> String {
+        let Some(surface_index) = self.screen_selection.surface_index() else {
+            return text;
+        };
+        let transcript = if surface_index == 0 {
+            if let Some(selected) = self.branch_navigator {
+                if selected == self.main_branch_id {
+                    &self.main.transcript
+                } else {
+                    self.main_branches
+                        .iter()
+                        .find(|branch| branch.id == selected)
+                        .map_or(&self.main.transcript, |branch| {
+                            &branch.conversation.transcript
+                        })
+                }
+            } else {
+                &self.main.transcript
+            }
+        } else if surface_index == 1 {
+            let Some(btw) = self.btw.as_ref() else {
+                return text;
+            };
+            &btw.conversation.transcript
+        } else {
+            return text;
+        };
+        transcript.semanticize_copy(text)
     }
 
     pub(super) fn advance_smooth_scroll(&mut self) {
@@ -2364,6 +2535,27 @@ struct ToolResultPayload {
     duration_ns: Option<u64>,
     #[serde(default)]
     result: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct PlanUpdatePayload {
+    #[serde(default)]
+    explanation: Option<String>,
+    plan: Vec<PlanUpdateItem>,
+}
+
+#[derive(Deserialize)]
+struct PlanUpdateItem {
+    step: String,
+    status: PlanStepStatus,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 fn summarize_tool_arguments(tool: &str, arguments: &Value) -> String {
@@ -2920,6 +3112,10 @@ mod tests {
         assert!(!app.transcript_selection_active());
 
         app.move_up();
+        assert_eq!(app.cursor, 0);
+        assert!(!app.transcript_selection_active());
+
+        app.move_up();
         assert_eq!(app.input, "first row\nsecond row");
         assert_eq!(
             app.main
@@ -2949,7 +3145,31 @@ mod tests {
         app.move_down();
         assert!(!app.transcript_selection_active());
         assert_eq!(app.input, "first row\nsecond row");
-        assert_eq!(app.cursor, "first row".len());
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn vertical_motion_clamps_to_the_composer_edges_before_opening_history() {
+        let mut app = App::new(".".into(), Thinking::Medium);
+        app.main
+            .transcript
+            .push_editable_user("submitted prompt".to_owned(), 1);
+        app.input = "draft".to_owned();
+        app.cursor = app.input.len();
+
+        app.move_up();
+        assert_eq!(app.cursor, 0);
+        assert!(!app.transcript_selection_active());
+
+        app.move_up();
+        assert!(app.transcript_selection_active());
+
+        app.move_down();
+        assert!(!app.transcript_selection_active());
+        assert_eq!(app.cursor, 0);
+
+        app.move_down();
+        assert_eq!(app.cursor, app.input.len());
     }
 
     #[test]
@@ -3634,9 +3854,61 @@ mod tests {
         assert!(!rendered.contains("write_stdin"));
         assert!(rendered.contains("terminal input"));
         assert!(rendered.contains("session 7 · Ctrl-C"));
-        assert!(rendered.contains("terminal wait"));
-        assert!(rendered.contains("unknown session 99"));
+        assert!(!rendered.contains("terminal wait"));
+        assert!(!rendered.contains("unknown session 99"));
         assert!(!app.main.hidden_terminal_polls.contains_key("call-1/code-1"));
+        assert!(!app.main.hidden_terminal_polls.contains_key("call-1/code-3"));
+    }
+
+    #[test]
+    fn plan_updates_render_as_checklists_instead_of_tools() {
+        let mut app = App::new(".".into(), Thinking::Medium);
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolCall,
+            &json!({
+                "call_id": "call-plan",
+                "tool": "update_plan",
+                "arguments": {
+                    "explanation": "Adapting the work",
+                    "plan": [
+                        { "step": "Inspect", "status": "completed" },
+                        { "step": "Implement", "status": "in_progress" },
+                        { "step": "Verify", "status": "pending" }
+                    ]
+                }
+            }),
+        ));
+        app.main.on_agent_event(&event(
+            AgentEventKind::ToolResult,
+            &json!({
+                "call_id": "call-plan",
+                "tool": "update_plan",
+                "status": "completed",
+                "result": "Plan updated"
+            }),
+        ));
+
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buffer = Buffer::empty(area);
+        app.main
+            .transcript
+            .widget(0, None, None, "empty")
+            .render(area, &mut buffer);
+        let rendered = buffer
+            .content
+            .chunks(usize::from(area.width))
+            .map(|row| {
+                row.iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Updated Plan"));
+        assert!(rendered.contains("✔ Inspect"));
+        assert!(rendered.contains("□ Implement"));
+        assert!(!rendered.contains("update_plan"));
+        assert!(!app.main.hidden_plan_calls.contains("call-plan"));
     }
 
     #[test]
