@@ -1,7 +1,7 @@
 # Improve Hashline ergonomics without weakening edit safety
 
 - Branch: `master`
-- Status: Ready for Implementation
+- Status: Complete (Milestones 1-3 shipped; Milestone 4 deferred at safety gate)
 - Owner(s): Eric Juta / implementing agent
 - Created: 2026-07-23
 - Last Updated: 2026-07-23
@@ -62,10 +62,11 @@ tool output or deterministic tests.
 - [x] (2026-07-23 13:40Z) Implement Milestone 3: bounded receipt recovery
   metadata, shared pruning constants, typed-semantic replay documentation, and
   actionable existing-parent errors.
-- [ ] Review Milestone 4's directory journal design; implement it only after the
-  go/no-go gate passes.
-- [ ] Run focused/workspace validation; update README and changelogs; record
-  exact evidence here.
+- [x] (2026-07-23 14:00Z) Review Milestone 4's directory journal design.
+  Record a no-go and defer implementation because current leases cannot prevent
+  external ancestor replacement across directory publication.
+- [x] (2026-07-23 14:20Z) Run focused/workspace validation; update README and
+  changelogs; record exact evidence and residual risks.
 
 ## Surprises & Discoveries
 
@@ -171,14 +172,51 @@ tool output or deterministic tests.
   `create_dir_all` side effect.
   Date/Author: 2026-07-23 / Codex
 
+- Decision: defer Milestone 4; the reviewed directory journal is insufficient
+  without stronger namespace-stability guarantees.
+  Candidate design: add explicit directory-create journal mutations before
+  dependent files, each binding the model path, parent identity, transaction-
+  owned staging/publication identity, and phase. Persist and sync transitions
+  `planned -> staged -> published -> complete`; on rollback process files
+  first and directories deepest-first through `rollbackPending -> removed`,
+  syncing each parent. Recovery removes only verified transaction-owned empty
+  directories; identity mismatch, external content, or replacement becomes
+  `recoveryRequired`.
+  No-go evidence: `TransactionLease` retains directory descriptors and
+  advisory `flock` locks, while `verify_path_parent` only proves the
+  root-relative inode identity at one instant. An uncooperative process can
+  rename the nearest existing ancestor after that check and replace its name;
+  descriptor-relative `mkdirat` would then publish into the displaced tree. A
+  crash before post-publication revalidation leaves recovery with only the
+  root-relative model path and no way to locate or safely remove that
+  directory. Additional `openat2` checks or post-operation identity checks
+  narrow but cannot close this window. Preventing it requires a stronger
+  namespace lock/cooperative protocol or a new filesystem assumption, all
+  outside this slice.
+  Date/Author: 2026-07-23 / Codex
+
 ## Outcomes & Retrospective
 
-- Outcome: research and the implementation proposal are complete; product code
-  has not changed.
-  Evidence: the smoke's generated Rust fixture compiled and passed one test;
-  all routine mutation kinds and expected rejection paths were exercised.
-  Remaining: Milestones 1-3, Milestone 4 review, implementation, validation,
-  docs/changelogs, and final evidence.
+- Outcome: Milestones 1-3 shipped without changing existing omitted-root,
+  stateless-preview, receipt-retention, or stale-evidence behavior. Reads expose
+  `has_more`; schema/errors expose the exact DSL; routine patches support
+  lexical roots, contextual/edited-move previews, and structural delete
+  metadata; transaction output reports bounded recovery policy and missing
+  parents actionably.
+- Validation: every focused acceptance test passed. The complete Hashline suite
+  passed 30 tests with 3 subprocess helpers ignored in 6.01s; both durable-
+  transition and reverse-rollback subprocess fault matrices passed. Final
+  `cargo fmt --all -- --check`, workspace/all-target/all-feature Clippy with
+  warnings denied, `cargo test --workspace`, and
+  `cargo check --workspace --all-targets` all exited successfully. Public
+  examples compiled in the all-target check.
+- Deferred: Milestone 4 and `create_parents` did not ship. The ancestor-
+  replacement race documented in the Decision Log prevents crash-safe recovery
+  under current assumptions.
+- Residual risks: rooted routine patches remain lexical scoping rather than a
+  filesystem sandbox and routine multi-file commits remain best-effort.
+  Transactions still require pre-existing parents; incomplete/disturbed
+  recovery evidence remains intentionally operator-owned.
 
 ## Context and Orientation
 
@@ -415,8 +453,9 @@ Acceptance:
 - `hashline__patch` response keeps its structure and gains contextual/edited
   move previews plus delete metadata.
 - `hashline__transaction` response adds bounded `recovery` metadata.
-- Milestone 4 alone adds optional `create_parents`. All stale digest, plan,
-  filesystem, race, and disturbed-recovery failures remain fail-closed.
+- `create_parents` is not exposed; Milestone 4 was deferred at its safety
+  gate. All stale digest, plan, filesystem, race, and disturbed-recovery
+  failures remain fail-closed.
 - No external dependency or Codex parity claim is involved.
 
 ## Concrete Steps
@@ -490,10 +529,10 @@ the recovery reader cannot deserialize.
 
 ## Rollout and Operations
 
-No flag, environment variable, migration, or service is required. `root` and
-`create_parents` are opt-in. Update README and both changelogs as public slices
-ship. Operators continue treating `.nanocodex/hashline-transactions` as bounded
-recovery state, not cache.
+No flag, environment variable, migration, or service is required. Patch `root`
+is opt-in; transaction `create_parents` remains deferred. README and both
+changelogs describe the shipped public slices. Operators continue treating
+`.nanocodex/hashline-transactions` as bounded recovery state, not cache.
 
 Each implementation handoff updates this spec with progress, decisions, exact
 validation, residual risks, and revision notes.
@@ -542,3 +581,7 @@ records were removed.
   evidence. Preserved stateless preview replay and bounded receipts, separated
   low-risk ergonomics from durable parent creation, and defined compatibility,
   recovery, and acceptance gates.
+- 2026-07-23: Implemented and validated Milestones 1-3. Reviewed and deferred
+  Milestone 4 after proving the current lease/openat2 contract cannot prevent an
+  external ancestor-replacement crash window. Updated interfaces, outcomes,
+  documentation, and changelogs to match the shipped scope.
