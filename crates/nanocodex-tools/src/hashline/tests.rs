@@ -45,6 +45,104 @@ fn canonical_hash_fixtures_cover_normalization_and_exact_bytes() {
 }
 
 #[test]
+fn read_reports_file_continuation_independently_from_request_truncation() {
+    let root = workspace("read-continuation");
+    let numbered = (1..=29)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(root.join("numbered.txt"), format!("{numbered}\n")).expect("fixture should write");
+
+    let explicit = read(
+        &root,
+        &ReadRequest {
+            path: "numbered.txt".to_owned(),
+            start_line: Some(1),
+            end_line: Some(17),
+            max_lines: None,
+        },
+    )
+    .expect("explicit range should read");
+    assert_eq!(explicit["truncated"], false);
+    assert_eq!(explicit["next_start_line"], json!(null));
+    assert_eq!(explicit["has_more"], true);
+
+    let capped = read(
+        &root,
+        &ReadRequest {
+            path: "numbered.txt".to_owned(),
+            start_line: Some(1),
+            end_line: None,
+            max_lines: Some(10),
+        },
+    )
+    .expect("capped range should read");
+    assert_eq!(capped["truncated"], true);
+    assert_eq!(capped["next_start_line"], 11);
+    assert_eq!(capped["has_more"], true);
+
+    let final_page = read(
+        &root,
+        &ReadRequest {
+            path: "numbered.txt".to_owned(),
+            start_line: Some(18),
+            end_line: None,
+            max_lines: None,
+        },
+    )
+    .expect("final page should read");
+    assert_eq!(final_page["truncated"], false);
+    assert_eq!(final_page["has_more"], false);
+
+    fs::write(
+        root.join("large.txt"),
+        format!("{}\ntail\n", "x".repeat(30 * 1024)),
+    )
+    .expect("large fixture should write");
+    let byte_capped = read(
+        &root,
+        &ReadRequest {
+            path: "large.txt".to_owned(),
+            start_line: None,
+            end_line: None,
+            max_lines: None,
+        },
+    )
+    .expect("byte-capped file should read");
+    assert_eq!(byte_capped["truncated"], true);
+    assert_eq!(byte_capped["has_more"], true);
+
+    fs::write(root.join("empty.txt"), b"").expect("empty fixture should write");
+    let empty = read(
+        &root,
+        &ReadRequest {
+            path: "empty.txt".to_owned(),
+            start_line: None,
+            end_line: None,
+            max_lines: None,
+        },
+    )
+    .expect("empty file should read");
+    assert_eq!(empty["has_more"], false);
+    fs::remove_dir_all(root).expect("workspace should be removed");
+}
+
+#[test]
+fn unsupported_block_operation_suggests_canonical_spelling() {
+    let error = super::patch_parser::parse_hashline_patch("SWAP.BLOCK 1:93c8@01234567:\n+x")
+        .expect_err("unsupported spelling should fail")
+        .to_string();
+    assert!(error.contains("unsupported Hashline operation SWAP.BLOCK"));
+    assert!(error.contains("did you mean SWAP.BLK?"));
+    for operation in super::patch_parser::CANONICAL_HASHLINE_OPERATIONS {
+        assert!(
+            error.contains(operation),
+            "unsupported-operation error should list {operation}"
+        );
+    }
+}
+
+#[test]
 fn read_anchors_feed_patch_and_stale_guards_fail_without_writing() {
     let root = workspace("read-patch");
     fs::write(root.join("notes.txt"), b"alpha\r\nbeta\r\n").expect("fixture should write");
@@ -268,10 +366,15 @@ fn tool_schemas_explain_external_paths_and_patch_grammar() {
         "patchHeader",
         "[path]#HASH",
         "SWAP",
+        "DEL.BLK",
+        "SWAP.BLK",
+        "INS.BLK.PRE",
+        "INS.BLK.POST",
+        "INS.BLK",
         "not a JSON array or object",
         "SWAP 2:f589",
+        "SWAP.BLK 2:f589@89abcdef",
         "REM",
-        "MV",
         "fully sectioned",
         "Preferred default",
     ] {
@@ -280,6 +383,10 @@ fn tool_schemas_explain_external_paths_and_patch_grammar() {
             "patch schema should document {required}"
         );
     }
+    let operations_description = properties["operations"]["description"]
+        .as_str()
+        .expect("operations description should be text");
+    assert!(operations_description.contains(r#"MV "path with spaces.txt""#));
 
     let transaction = serde_json::to_value(super::transaction_definition())
         .expect("transaction definition should serialize");

@@ -6,6 +6,40 @@ use super::hash::FILE_HASH_WIDTH;
 use super::hash::LINE_HASH_WIDTH;
 use super::patch_sections::parse_contextual_patch_file_header;
 
+pub(super) const CANONICAL_HASHLINE_OPERATIONS: &[&str] = &[
+    "SWAP",
+    "DEL",
+    "INS.PRE",
+    "INS.POST",
+    "INS.HEAD",
+    "INS.TAIL",
+    "SWAP.BLK",
+    "DEL.BLK",
+    "INS.BLK.PRE",
+    "INS.BLK.POST",
+    "REM",
+    "MV",
+];
+
+pub(super) const HASHLINE_OPERATION_ALIASES: &[&str] = &["INS.BLK"];
+
+pub(super) fn hashline_operation_names() -> String {
+    CANONICAL_HASHLINE_OPERATIONS.join(", ")
+}
+
+fn unsupported_operation_message(operation: &str) -> String {
+    let suggestion = operation
+        .strip_suffix(".BLOCK")
+        .map(|prefix| format!("{prefix}.BLK"))
+        .filter(|candidate| CANONICAL_HASHLINE_OPERATIONS.contains(&candidate.as_str()))
+        .map(|candidate| format!("; did you mean {candidate}?"))
+        .unwrap_or_default();
+    format!(
+        "unsupported Hashline operation {operation}{suggestion}; supported operations: {}",
+        hashline_operation_names()
+    )
+}
+
 struct PayloadLine {
     text: String,
     kind: PayloadLineKind,
@@ -221,9 +255,9 @@ pub(super) fn parse_hashline_patch(
                 new_path: parse_move_target(rest)?,
             },
             _ => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "unsupported Hashline operation {op}"
-                )));
+                return Err(FunctionCallError::RespondToModel(
+                    unsupported_operation_message(&op),
+                ));
             }
         };
         operations.push(operation);

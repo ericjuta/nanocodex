@@ -54,7 +54,8 @@ tool output or deterministic tests.
   requests, directory leases, recovery journal, receipt pruning, and tests.
 - [x] (2026-07-23 11:00Z) Freeze compatibility decisions, implementation order,
   and acceptance gates in this spec.
-- [ ] Implement Milestone 1: grammar discoverability and read metadata.
+- [x] (2026-07-23 12:15Z) Implement Milestone 1: canonical grammar/schema names,
+  unsupported-operation guidance, and independent read `has_more` metadata.
 - [ ] Implement Milestone 2: rooted patches and clearer previews.
 - [ ] Implement Milestone 3: transaction receipt observability and actionable
   parent errors.
@@ -75,6 +76,9 @@ tool output or deterministic tests.
   Evidence: `hashline::read` compares `returned_end` with the requested
   interval. Reading through line 17 of a 29-line file correctly returned
   `truncated=false` and `next_start_line=null`, but gave no continuation signal.
+  Implementation evidence: focused schema, parser-suggestion, and read
+  continuation tests pass for explicit, capped, byte-truncated, final, and
+  empty reads without changing `truncated` or `next_start_line`.
 
 - Observation: previews use a common-prefix/common-suffix minimal diff.
   Evidence: `build_hashline_patch_preview` in `patch.rs`. A newly inserted

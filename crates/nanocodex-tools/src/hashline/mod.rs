@@ -29,6 +29,7 @@ use patch::{
     hashline_patch_has_line_operations, hashline_patch_is_aborted,
     parse_hashline_patch_file_operation, validate_file_hash,
 };
+use patch_parser::{HASHLINE_OPERATION_ALIASES, hashline_operation_names};
 use patch_sections::{HashlinePatchSection, split_hashline_patch_sections};
 
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -192,6 +193,7 @@ fn read(workspace: &Path, request: &ReadRequest) -> Result<Value, FunctionCallEr
             "end_line": null,
             "total_lines": 0,
             "truncated": false,
+            "has_more": false,
             "next_start_line": null,
             "content": "",
         }));
@@ -218,6 +220,7 @@ fn read(workspace: &Path, request: &ReadRequest) -> Result<Value, FunctionCallEr
     let returned_end = excerpt.end_line;
     let truncated =
         excerpt.truncated || returned_end.is_some_and(|line| line < requested_end.min(lines.len()));
+    let has_more = returned_end.is_some_and(|line| line < lines.len());
     let next_start = truncated.then(|| returned_end.map_or(start, |line| line + 1));
     let file_hash = hash_hex(&observed.text);
     let patch_header = format!("[{}]#{file_hash}", request.path);
@@ -230,6 +233,7 @@ fn read(workspace: &Path, request: &ReadRequest) -> Result<Value, FunctionCallEr
         "end_line": returned_end,
         "total_lines": lines.len(),
         "truncated": truncated,
+        "has_more": has_more,
         "next_start_line": next_start,
         "content": excerpt.content,
     }))
@@ -1333,6 +1337,14 @@ fn block_definition() -> ToolDefinition {
     )
 }
 
+fn patch_operations_description() -> String {
+    format!(
+        "One string containing single-file Hashline DSL placed after header, not a JSON array or object. Canonical operations: {}. Alias: {} means INS.BLK.POST. Payload rows start with +. Line example: SWAP 2:f589:\n+bravo. Exact block anchors come from find_block, for example SWAP.BLK 2:f589@89abcdef:\n+replacement. Head/tail examples: INS.HEAD:\n+first and INS.TAIL:\n+last. File examples: REM and MV \"path with spaces.txt\".",
+        hashline_operation_names(),
+        HASHLINE_OPERATION_ALIASES.join(", ")
+    )
+}
+
 fn patch_definition() -> ToolDefinition {
     ToolDefinition::function(
         "hashline__patch",
@@ -1350,7 +1362,7 @@ fn patch_definition() -> ToolDefinition {
                 },
                 "operations": {
                     "type": "string",
-                    "description": "One string containing single-file Hashline DSL placed after header, not a JSON array or object. Copy anchors from a recent read/find result. Example: SWAP 2:f589:\\n+bravo. Supported operations: SWAP, DEL, INS.PRE, INS.POST, INS.HEAD, INS.TAIL, block forms, REM, or MV."
+                    "description": patch_operations_description()
                 },
                 "dry_run": {
                     "type": "boolean",
