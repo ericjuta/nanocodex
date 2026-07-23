@@ -288,12 +288,14 @@ struct PatchRequestWire {
     patch: Option<String>,
     header: Option<String>,
     operations: Option<String>,
+    root: Option<String>,
     #[serde(default)]
     dry_run: bool,
 }
 
 struct PatchRequest {
     patch: String,
+    root: Option<String>,
     dry_run: bool,
 }
 
@@ -324,6 +326,7 @@ fn decode_patch_request(raw: &str) -> Result<PatchRequest, FunctionCallError> {
         _ => return model_error("provide either `patch` or both `header` and `operations`"),
     };
     Ok(PatchRequest {
+        root: request.root,
         patch,
         dry_run: request.dry_run,
     })
@@ -335,7 +338,7 @@ fn validate_patch_request_types(value: &Value) -> Result<(), FunctionCallError> 
             "invalid Hashline arguments: expected a JSON object".to_owned(),
         )
     })?;
-    for field in ["patch", "header", "operations"] {
+    for field in ["patch", "header", "operations", "root"] {
         if let Some(value) = object.get(field)
             && !value.is_string()
         {
@@ -422,6 +425,7 @@ fn execute_patch(workspace: &Path, request: &PatchRequest) -> Result<Value, Func
             json!({"success": true, "operation": "abort", "aborted": true, "dry_run": request.dry_run}),
         );
     }
+    let (patch_root, rooted) = select_patch_root(workspace, request.root.as_deref())?;
     let sections = split_hashline_patch_sections(&request.patch)?;
     if sections.len() > MAX_MUTATIONS {
         return model_error(format!(
@@ -431,27 +435,16 @@ fn execute_patch(workspace: &Path, request: &PatchRequest) -> Result<Value, Func
     let mut prepared = Vec::with_capacity(sections.len());
     let mut details = Vec::with_capacity(sections.len());
     for section in sections {
-        let mutation = prepare_patch_section(workspace, &section)?;
+        let mutation = prepare_patch_section(&patch_root, &section, rooted)?;
         details.push(preview_mutation(&mutation)?);
         prepared.push(mutation);
     }
-    reject_conflicts(&prepared)?;
+    reject_patch_conflicts(&patch_root, &prepared)?;
     if !request.dry_run {
-        commit_prepared_patch(workspace, &prepared)?;
+        commit_prepared_patch(&patch_root, &prepared)?;
     }
     let total_files = details.len();
-    let mut bounded_details = Vec::new();
-    let mut detail_bytes = 2_usize;
-    for detail in details {
-        let bytes = serde_json::to_vec(&detail)
-            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
-        if detail_bytes.saturating_add(bytes.len()).saturating_add(1) > READ_OUTPUT_BYTES {
-            break;
-        }
-        detail_bytes = detail_bytes.saturating_add(bytes.len()).saturating_add(1);
-        bounded_details.push(detail);
-    }
-    let files_truncated = bounded_details.len() < total_files;
+    let (bounded_details, files_truncated) = bound_patch_details(details)?;
     Ok(json!({
         "success": true,
         "dry_run": request.dry_run,
@@ -465,8 +458,9 @@ fn execute_patch(workspace: &Path, request: &PatchRequest) -> Result<Value, Func
 fn prepare_patch_section(
     workspace: &Path,
     section: &HashlinePatchSection,
+    rooted: bool,
 ) -> Result<PreparedMutation, FunctionCallError> {
-    validate_model_path_field(&section.path, "path", Some(section.header_line))?;
+    validate_patch_path_field(&section.path, "path", Some(section.header_line), rooted)?;
     if section.expected_hash.is_none() {
         ensure_missing(workspace, &section.path)?;
         let after = if section.patch.trim().is_empty() {
@@ -493,7 +487,7 @@ fn prepare_patch_section(
             metadata: observed.metadata,
         }),
         Some(HashlinePatchFileOperation::Rename { new_path }) => {
-            validate_model_path(&new_path)?;
+            validate_patch_path_field(&new_path, "destination", Some(section.header_line), rooted)?;
             ensure_missing(workspace, &new_path)?;
             let after = if hashline_patch_has_line_operations(&section.patch)? {
                 apply_hashline_patch(&section.path, &observed.text, &section.patch)?.into_bytes()
@@ -545,26 +539,75 @@ fn preview_mutation(mutation: &PreparedMutation) -> Result<Value, FunctionCallEr
                 "preview": preview,
             }))
         }
-        PreparedMutation::Delete { path, before, .. } => Ok(json!({
-            "path": path,
-            "operation": "delete",
-            "old_exact_digest": exact_digest(before),
-        })),
+        PreparedMutation::Delete { path, before, .. } => {
+            let old = str_from_bytes(before)?;
+            let normalized = normalize_file_text(old);
+            Ok(json!({
+                "path": path,
+                "operation": "delete",
+                "old_exact_digest": exact_digest(before),
+                "old_hash": hash_hex(old),
+                "old_bytes": before.len(),
+                "old_lines": split_lines_preserve(&normalized).len(),
+            }))
+        }
         PreparedMutation::Move {
             source,
             destination,
             before,
             after,
             ..
-        } => Ok(json!({
-            "path": source,
-            "new_path": destination,
-            "operation": "move",
-            "old_exact_digest": exact_digest(before),
-            "new_exact_digest": exact_digest(after),
-            "new_hash": hash_hex(str_from_bytes(after)?),
-        })),
+        } => {
+            let old = str_from_bytes(before)?;
+            let new = str_from_bytes(after)?;
+            let mut detail = json!({
+                "path": source,
+                "new_path": destination,
+                "operation": "move",
+                "old_exact_digest": exact_digest(before),
+                "new_exact_digest": exact_digest(after),
+                "new_hash": hash_hex(new),
+            });
+            if before != after {
+                let preview = serde_json::to_value(build_hashline_patch_preview(old, new)?)
+                    .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+                detail
+                    .as_object_mut()
+                    .ok_or_else(|| {
+                        FunctionCallError::RespondToModel(
+                            "internal Hashline preview shape error".to_owned(),
+                        )
+                    })?
+                    .insert("preview".to_owned(), preview);
+            }
+            Ok(detail)
+        }
     }
+}
+
+fn bound_patch_details(details: Vec<Value>) -> Result<(Vec<Value>, bool), FunctionCallError> {
+    let total = details.len();
+    let mut bounded = Vec::new();
+    let mut used = 2_usize;
+    let mut removed_preview = false;
+    for mut detail in details {
+        let mut encoded = serde_json::to_vec(&detail)
+            .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+        if used.saturating_add(encoded.len()).saturating_add(1) > READ_OUTPUT_BYTES {
+            if let Some(object) = detail.as_object_mut() {
+                removed_preview |= object.remove("preview").is_some();
+            }
+            encoded = serde_json::to_vec(&detail)
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+        }
+        if used.saturating_add(encoded.len()).saturating_add(1) > READ_OUTPUT_BYTES {
+            break;
+        }
+        used = used.saturating_add(encoded.len()).saturating_add(1);
+        bounded.push(detail);
+    }
+    let truncated = removed_preview || bounded.len() != total;
+    Ok((bounded, truncated))
 }
 
 fn bound_transaction_previews(
@@ -578,6 +621,7 @@ fn bound_transaction_previews(
     for mut preview in previews {
         let mut encoded = serde_json::to_vec(&preview)
             .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
+
         if used.saturating_add(encoded.len()).saturating_add(1) > PREVIEW_BUDGET {
             if let Some(object) = preview.as_object_mut() {
                 removed_preview |= object.remove("preview").is_some();
@@ -958,6 +1002,77 @@ fn validate_model_path_field(
     Ok(())
 }
 
+fn validate_patch_path_field(
+    model_path: &str,
+    field: &'static str,
+    line: Option<usize>,
+    rooted: bool,
+) -> Result<(), FunctionCallError> {
+    validate_model_path_field(model_path, field, line)?;
+    if !rooted {
+        return Ok(());
+    }
+    let path = Path::new(model_path);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(FunctionCallError::Path {
+            field,
+            line,
+            message: "must be root-relative without `..` or an absolute prefix".to_owned(),
+        });
+    }
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(component) => component.to_str(),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if components.starts_with(&[".nanocodex", "hashline-transactions"]) {
+        return Err(FunctionCallError::Path {
+            field,
+            line,
+            message: "must not address reserved .nanocodex/hashline-transactions recovery storage"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn select_patch_root(
+    workspace: &Path,
+    requested_root: Option<&str>,
+) -> Result<(PathBuf, bool), FunctionCallError> {
+    let Some(requested_root) = requested_root else {
+        return Ok((workspace.to_path_buf(), false));
+    };
+    if requested_root.is_empty() {
+        return model_error("Hashline patch root must be a non-empty directory path");
+    }
+    let selected = resolve_model_path(workspace, requested_root)?;
+    let canonical = selected
+        .canonicalize()
+        .map_err(|error| io_error("resolve patch root", &selected, error))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| io_error("inspect patch root", &canonical, error))?;
+    if !metadata.is_dir() {
+        return model_error(format!(
+            "Hashline patch root {} is not a directory",
+            selected.display()
+        ));
+    }
+    Ok((canonical, true))
+}
+
 fn resolve_model_path(root: &Path, model_path: &str) -> Result<PathBuf, FunctionCallError> {
     let path = Path::new(model_path);
     let unresolved = if path.is_absolute() {
@@ -1037,6 +1152,37 @@ fn ensure_missing(root: &Path, model_path: &str) -> Result<(), FunctionCallError
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error("inspect", &target, error)),
     }
+}
+
+fn reject_patch_conflicts(
+    root: &Path,
+    prepared: &[PreparedMutation],
+) -> Result<(), FunctionCallError> {
+    let mut paths = BTreeSet::new();
+    for mutation in prepared {
+        let mut insert = |path: &str| {
+            let conflict_key = resolve_model_path(root, path)?;
+            if paths.insert(conflict_key) {
+                Ok(())
+            } else {
+                model_error(format!("Hashline request uses path {path} more than once"))
+            }
+        };
+        match mutation {
+            PreparedMutation::Write { path, .. } | PreparedMutation::Delete { path, .. } => {
+                insert(path)?;
+            }
+            PreparedMutation::Move {
+                source,
+                destination,
+                ..
+            } => {
+                insert(source)?;
+                insert(destination)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reject_conflicts(prepared: &[PreparedMutation]) -> Result<(), FunctionCallError> {
@@ -1363,6 +1509,10 @@ fn patch_definition() -> ToolDefinition {
                 "operations": {
                     "type": "string",
                     "description": patch_operations_description()
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Optional patch root. Relative roots resolve from the configured workspace; absolute roots are accepted. When set, section and MV paths must be root-relative without parent traversal or reserved transaction storage. This is lexical scoping, not transaction-grade symlink or race containment."
                 },
                 "dry_run": {
                     "type": "boolean",

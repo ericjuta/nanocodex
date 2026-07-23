@@ -172,6 +172,7 @@ fn read_anchors_feed_patch_and_stale_guards_fail_without_writing() {
     execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch: patch.clone(),
             dry_run: false,
         },
@@ -184,6 +185,7 @@ fn read_anchors_feed_patch_and_stale_guards_fail_without_writing() {
     let error = execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch,
             dry_run: false,
         },
@@ -313,6 +315,7 @@ fn block_anchor_round_trips_and_rejects_stale_evidence() {
     fs::remove_dir_all(root).expect("workspace should be removed");
 }
 
+#[allow(clippy::too_many_lines)]
 #[test]
 fn tool_schemas_explain_external_paths_and_patch_grammar() {
     let read =
@@ -341,10 +344,16 @@ fn tool_schemas_explain_external_paths_and_patch_grammar() {
     let properties = patch["parameters"]["properties"]
         .as_object()
         .expect("patch properties should be an object");
-    assert_eq!(properties.len(), 4);
-    for property in ["patch", "header", "operations", "dry_run"] {
+    assert_eq!(properties.len(), 5);
+    for property in ["patch", "header", "operations", "root", "dry_run"] {
         assert!(properties.contains_key(property));
     }
+    assert!(
+        properties["root"]["description"]
+            .as_str()
+            .expect("patch root description should be text")
+            .contains("lexical scoping")
+    );
     assert_eq!(
         patch["parameters"]["oneOf"],
         json!([
@@ -426,25 +435,29 @@ fn tool_schemas_explain_external_paths_and_patch_grammar() {
 
 #[test]
 fn one_patch_mixes_create_update_move_and_delete_sections() {
-    let root = workspace("mixed-patch");
+    let workspace_root = workspace("mixed-patch");
+    let root = workspace_root.join("project");
+    fs::create_dir(&root).expect("patch root should be created");
     fs::write(root.join("update.txt"), b"old\n").expect("update fixture should write");
-    fs::write(root.join("move.txt"), b"move\n").expect("move fixture should write");
+    fs::write(root.join("move.txt"), b"move\nkeep\n").expect("move fixture should write");
     fs::write(root.join("delete.txt"), b"delete\n").expect("delete fixture should write");
     let program = format!(
-        "[update.txt]#{}\nSWAP 1:{}:\n+new\n[new.txt]\nINS.HEAD:\n+created\n[move.txt]#{}\nMV moved.txt\n[delete.txt]#{}\nREM",
+        "[update.txt]#{}\nSWAP 1:{}:\n+new\n[new.txt]\nINS.HEAD:\n+created\n[move.txt]#{}\nSWAP 1:{}:\n+moved\nMV moved.txt\n[delete.txt]#{}\nREM",
         hash_hex("old\n"),
         line_hash("old"),
-        hash_hex("move\n"),
+        hash_hex("move\nkeep\n"),
+        line_hash("move"),
         hash_hex("delete\n")
     );
-    execute_patch(
-        &root,
+    let result = execute_patch(
+        &workspace_root,
         &PatchRequest {
+            root: Some("project".to_owned()),
             patch: program,
             dry_run: false,
         },
     )
-    .expect("mixed patch should commit");
+    .expect("rooted mixed patch should commit");
     assert_eq!(
         fs::read(root.join("update.txt")).expect("update should read"),
         b"new\n"
@@ -455,14 +468,33 @@ fn one_patch_mixes_create_update_move_and_delete_sections() {
     );
     assert_eq!(
         fs::read(root.join("moved.txt")).expect("move should read"),
-        b"move\n"
+        b"moved\nkeep\n"
     );
     assert!(!root.join("move.txt").exists());
     assert!(!root.join("delete.txt").exists());
+    let files = result["files"]
+        .as_array()
+        .expect("files should be an array");
+    let moved = files
+        .iter()
+        .find(|detail| detail["operation"] == "move")
+        .expect("move detail should exist");
+    assert_eq!(moved["path"], "move.txt");
+    assert_eq!(moved["new_path"], "moved.txt");
+    assert!(moved.get("preview").is_some());
+    assert_eq!(moved["new_exact_digest"], exact_digest(b"moved\nkeep\n"));
+    let deleted = files
+        .iter()
+        .find(|detail| detail["operation"] == "delete")
+        .expect("delete detail should exist");
+    assert_eq!(deleted["old_hash"], hash_hex("delete\n"));
+    assert_eq!(deleted["old_bytes"], 7);
+    assert_eq!(deleted["old_lines"], 1);
 
     let existing_create = execute_patch(
-        &root,
+        &workspace_root,
         &PatchRequest {
+            root: Some("project".to_owned()),
             patch: "[new.txt]\nINS.TAIL:\n+again".to_owned(),
             dry_run: true,
         },
@@ -471,8 +503,9 @@ fn one_patch_mixes_create_update_move_and_delete_sections() {
     .to_string();
     assert!(existing_create.contains("already exists"));
     let guarded_missing = execute_patch(
-        &root,
+        &workspace_root,
         &PatchRequest {
+            root: Some("project".to_owned()),
             patch: "[missing.txt]#0123abcd\nREM".to_owned(),
             dry_run: true,
         },
@@ -480,6 +513,102 @@ fn one_patch_mixes_create_update_move_and_delete_sections() {
     .expect_err("[path]#HASH should reject a missing target")
     .to_string();
     assert!(guarded_missing.contains("missing.txt"));
+    fs::remove_dir_all(workspace_root).expect("workspace should be removed");
+}
+
+#[test]
+fn rooted_patch_rejects_unscoped_and_reserved_paths() {
+    let workspace_root = workspace("rooted-rejections");
+    let root = workspace_root.join("project");
+    fs::create_dir(&root).expect("patch root should be created");
+    fs::write(root.join("root-file"), b"not a directory").expect("root file should write");
+    fs::write(root.join("move.txt"), b"move\n").expect("move fixture should write");
+    let root_name = "project".to_owned();
+    let rejected = [
+        format!(
+            "[{}]\nINS.HEAD:\n+x",
+            workspace_root.join("absolute.txt").display()
+        ),
+        "[../outside.txt]\nINS.HEAD:\n+x".to_owned(),
+        "[.nanocodex/hashline-transactions/receipt]\nINS.HEAD:\n+x".to_owned(),
+        format!("[move.txt]#{}\nMV ../moved.txt", hash_hex("move\n")),
+    ];
+    for patch in rejected {
+        let error = execute_patch(
+            &workspace_root,
+            &PatchRequest {
+                root: Some(root_name.clone()),
+                patch,
+                dry_run: true,
+            },
+        )
+        .expect_err("unscoped rooted path should fail")
+        .to_string();
+        assert!(
+            error.contains("root-relative")
+                || error.contains("reserved .nanocodex/hashline-transactions"),
+            "unexpected rooted-path error: {error}"
+        );
+    }
+    for selected in ["missing", "project/root-file"] {
+        let error = execute_patch(
+            &workspace_root,
+            &PatchRequest {
+                root: Some(selected.to_owned()),
+                patch: "[new.txt]\nINS.HEAD:\n+x".to_owned(),
+                dry_run: true,
+            },
+        )
+        .expect_err("invalid patch root should fail")
+        .to_string();
+        assert!(
+            error.contains("patch root") || error.contains("resolve patch root"),
+            "unexpected patch-root error: {error}"
+        );
+    }
+    assert!(!workspace_root.join("outside.txt").exists());
+    fs::remove_dir_all(workspace_root).expect("workspace should be removed");
+}
+
+#[test]
+fn patch_preview_includes_result_context_and_matches_applied_digest() {
+    let root = workspace("preview-context");
+    let before = "fn work() {\n    first();\n}\n";
+    fs::write(root.join("lib.rs"), before).expect("fixture should write");
+    let patch = format!(
+        "[lib.rs]#{}\nINS.PRE 3:{}:\n+    second();",
+        hash_hex(before),
+        line_hash("}")
+    );
+    let preview = execute_patch(
+        &root,
+        &PatchRequest {
+            root: None,
+            patch: patch.clone(),
+            dry_run: true,
+        },
+    )
+    .expect("preview should succeed");
+    let detail = &preview["files"][0];
+    let expected = b"fn work() {\n    first();\n    second();\n}\n";
+    assert_eq!(detail["new_exact_digest"], exact_digest(expected));
+    let content = detail["preview"]["content"]
+        .as_str()
+        .expect("preview content should be text");
+    assert!(content.contains(&format!(" 4:{}|}}", line_hash("}"))));
+    execute_patch(
+        &root,
+        &PatchRequest {
+            root: None,
+            patch,
+            dry_run: false,
+        },
+    )
+    .expect("patch should apply");
+    assert_eq!(
+        fs::read(root.join("lib.rs")).expect("result should read"),
+        expected
+    );
     fs::remove_dir_all(root).expect("workspace should be removed");
 }
 
@@ -491,6 +620,7 @@ fn wrong_dialect_and_format_staleness_never_write() {
     let dialect = execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch: "*** Begin Patch\n*** Update File: notes.txt\n@@\n*** End Patch".to_owned(),
             dry_run: false,
         },
@@ -526,6 +656,7 @@ fn wrong_dialect_and_format_staleness_never_write() {
     execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch: stale_program,
             dry_run: false,
         },
@@ -548,6 +679,7 @@ fn wrong_dialect_and_format_staleness_never_write() {
     execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch: format!(
                 "{}\nSWAP 2:{}:\n+bravo",
                 fresh["patchHeader"]
@@ -574,6 +706,7 @@ fn patch_rejections_explain_a_valid_hashline_retry() {
     let missing_header = execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch: format!("SWAP 1:{}:\n+omega", line_hash("alpha")),
             dry_run: true,
         },
@@ -604,6 +737,7 @@ fn patch_rejections_explain_a_valid_hashline_retry() {
     let unified_diff = execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch: format!(
                 "{}\n@@ -1 +1 @@\n-alpha\n+omega",
                 read_result["patchHeader"]
@@ -670,6 +804,7 @@ fn paths_and_transaction_roots_may_resolve_outside_the_workspace() {
     execute_patch(
         &root,
         &PatchRequest {
+            root: None,
             patch: format!("[{}]\nINS.HEAD:\n+created", absolute_created.display()),
             dry_run: false,
         },

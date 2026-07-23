@@ -581,9 +581,53 @@ pub(super) fn build_hashline_patch_preview(
 
     let total_changed_lines = bounds.old_end.saturating_sub(bounds.old_start)
         + bounds.new_end.saturating_sub(bounds.new_start);
+    let leading_context = bounds
+        .new_start
+        .checked_sub(1)
+        .map(|index| (index + 1, new_lines[index]));
+    let trailing_context =
+        (bounds.new_end < new_lines.len()).then(|| (bounds.new_end + 1, new_lines[bounds.new_end]));
+    let context_lines = [leading_context, trailing_context]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let changed_cost = old_lines[bounds.old_start..bounds.old_end]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| (bounds.old_start + offset + 1, *line))
+        .chain(
+            new_lines[bounds.new_start..bounds.new_end]
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| (bounds.new_start + offset + 1, *line)),
+        )
+        .fold(0_usize, |total, (line_number, line)| {
+            total.saturating_add(
+                preview_line_serialized_cost(line_number, &line_hash(line), line, usize::MAX)
+                    .unwrap_or(usize::MAX),
+            )
+        });
+    let context_cost = context_lines
+        .iter()
+        .fold(0_usize, |total, (line_number, line)| {
+            total.saturating_add(
+                preview_line_serialized_cost(*line_number, &line_hash(line), line, usize::MAX)
+                    .unwrap_or(usize::MAX),
+            )
+        });
+    let include_context = total_changed_lines.saturating_add(context_lines.len())
+        <= PATCH_PREVIEW_MAX_LINES
+        && changed_cost.saturating_add(context_cost) <= PATCH_PREVIEW_MAX_SERIALIZED_BYTES;
+    let context_truncated = !context_lines.is_empty() && !include_context;
+
     let mut content = Vec::new();
     let mut serialized_bytes = 0;
+    let mut rendered_changed_lines = 0;
     let mut byte_truncated = false;
+    if include_context && let Some((line_number, line)) = leading_context {
+        let pushed = push_preview_line(&mut content, &mut serialized_bytes, ' ', line_number, line);
+        debug_assert!(pushed, "preflighted context should fit");
+    }
     for (line_number, line) in old_lines[bounds.old_start..bounds.old_end]
         .iter()
         .enumerate()
@@ -592,10 +636,13 @@ pub(super) fn build_hashline_patch_preview(
             break;
         }
         let line_number = bounds.old_start + line_number + 1;
+        let before_len = content.len();
         if !push_preview_line(&mut content, &mut serialized_bytes, '-', line_number, line) {
+            rendered_changed_lines += usize::from(content.len() > before_len);
             byte_truncated = true;
             break;
         }
+        rendered_changed_lines += 1;
     }
     if !byte_truncated && content.len() < PATCH_PREVIEW_MAX_LINES {
         for (line_number, line) in new_lines[bounds.new_start..bounds.new_end]
@@ -606,11 +653,22 @@ pub(super) fn build_hashline_patch_preview(
                 break;
             }
             let line_number = bounds.new_start + line_number + 1;
+            let before_len = content.len();
             if !push_preview_line(&mut content, &mut serialized_bytes, '+', line_number, line) {
+                rendered_changed_lines += usize::from(content.len() > before_len);
                 byte_truncated = true;
                 break;
             }
+            rendered_changed_lines += 1;
         }
+    }
+    if include_context
+        && !byte_truncated
+        && content.len() < PATCH_PREVIEW_MAX_LINES
+        && let Some((line_number, line)) = trailing_context
+    {
+        let pushed = push_preview_line(&mut content, &mut serialized_bytes, ' ', line_number, line);
+        debug_assert!(pushed, "preflighted context should fit");
     }
 
     Ok(HashlinePatchPreview {
@@ -618,7 +676,9 @@ pub(super) fn build_hashline_patch_preview(
         old_end_line: span_end(bounds.old_start, bounds.old_end),
         new_start_line: span_start(bounds.new_start, bounds.new_end),
         new_end_line: span_end(bounds.new_start, bounds.new_end),
-        truncated: byte_truncated || total_changed_lines > content.len(),
+        truncated: byte_truncated
+            || context_truncated
+            || total_changed_lines > rendered_changed_lines,
         content: content.join("\n"),
     })
 }

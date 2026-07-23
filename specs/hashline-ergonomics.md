@@ -56,7 +56,9 @@ tool output or deterministic tests.
   and acceptance gates in this spec.
 - [x] (2026-07-23 12:15Z) Implement Milestone 1: canonical grammar/schema names,
   unsupported-operation guidance, and independent read `has_more` metadata.
-- [ ] Implement Milestone 2: rooted patches and clearer previews.
+- [x] (2026-07-23 13:05Z) Implement Milestone 2: optional rooted patches,
+  root-relative lexical validation, contextual/edited-move previews, delete
+  metadata, and structural-first routine output bounding.
 - [ ] Implement Milestone 3: transaction receipt observability and actionable
   parent errors.
 - [ ] Review Milestone 4's directory journal design; implement it only after the
@@ -84,6 +86,14 @@ tool output or deterministic tests.
   Evidence: `build_hashline_patch_preview` in `patch.rs`. A newly inserted
   closing brace matching neighboring context was omitted as unchanged, although
   the applied bytes and digest were correct.
+  Implementation evidence: the matching delimiter now appears as resulting-file
+  context, and the preview digest matched applied bytes in the focused
+  regression.
+
+- Observation: raw caller spellings are not sufficient conflict keys in rooted
+  mode because `a/./b` and `a/b` address the same target.
+  Evidence: rooted routine conflict checks now use normalized resolved path keys
+  while response details retain the caller's root-relative spelling.
 
 - Observation: routine patches create missing destination parents, but durable
   transactions lease existing parent directory identities.
