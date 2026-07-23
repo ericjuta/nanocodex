@@ -8,6 +8,7 @@ use nanocodex_service::{
     CodeCall, CodeCallKind, ResponsesAttempt, ResponsesAttemptFactory, ResponsesClient,
     ResponsesOutput, ResponsesServiceResponse, TRANSPORT, TransportStats, TurnResult,
 };
+use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::sync::watch;
 use tower::Service;
@@ -677,7 +678,9 @@ where
         steers: &mut tokio::sync::mpsc::Receiver<Prompt>,
     ) -> Result<()> {
         while let Ok(steer) = steers.try_recv() {
-            if let Ok(content) = serde_json::to_string(&steer) {
+            if trace_content_enabled()
+                && let Ok(content) = serde_json::to_string(&steer)
+            {
                 info!(
                     target: "nanocodex",
                     content_kind = "steer",
@@ -769,7 +772,7 @@ where
                 .await
         };
         prepare_output_images(&mut execution.output).await;
-        if let Ok(content) = serde_json::to_string(&execution.output) {
+        if let Some(content) = serialize_trace_content(&execution.output) {
             record_span_content(&tool_span, "tool.output", &content);
         }
         self.active_tool_call = None;
@@ -922,7 +925,7 @@ where
             status = tracing::field::Empty,
             duration_ns = tracing::field::Empty,
         );
-        if let Ok(content) = serde_json::to_string(factory.profile().prefix()) {
+        if let Some(content) = serialize_trace_content(factory.profile().prefix()) {
             record_span_content(&span, "model.input", &content);
         }
         let shared_prompt_cache = self.prompt_cache.shared().cloned();
@@ -1202,7 +1205,7 @@ where
         };
         let duration_ns = elapsed_ns(started_at);
         span.record("model.response.id", response.id.as_str());
-        if let Ok(content) = serde_json::to_string(&response.item) {
+        if let Some(content) = serialize_trace_content(&response.item) {
             record_span_content(&span, "model.output_item", &content);
         }
         span.record("status", "completed");
@@ -1285,10 +1288,23 @@ fn unsupported_tool_message(call: &CodeCall) -> Option<String> {
 
 fn trace_model_input(request: &ResponsesAttempt) -> (usize, usize, Option<String>) {
     let item_count = request.input_item_count();
+    if !trace_content_enabled() {
+        return (item_count, 0, None);
+    }
     let items = request.input_items().collect::<Vec<_>>();
     let content = serde_json::to_string(&items).ok();
     let bytes = content.as_ref().map_or(0, String::len);
     (item_count, bytes, content)
+}
+
+fn trace_content_enabled() -> bool {
+    tracing::enabled!(target: "nanocodex", tracing::Level::INFO)
+}
+
+fn serialize_trace_content<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+    trace_content_enabled()
+        .then(|| serde_json::to_string(value).ok())
+        .flatten()
 }
 
 fn model_tool_span(call: &CodeCall, call_index: u32) -> tracing::Span {
@@ -1404,9 +1420,9 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
     }
     span.record("model.output.item_count", response.output_items.len());
     span.record("model.tool_call_count", response.code_calls.len());
-    let output_content = serde_json::to_string(&response.output_items).ok();
-    let output_bytes = output_content.as_ref().map_or(0, String::len);
-    span.record("model.output.bytes", output_bytes);
+    let trace_content = trace_content_enabled();
+    let mut output_bytes = usize::from(trace_content).saturating_mul(2);
+    let mut serialized_items = 0_usize;
     let mut summary_count = 0_usize;
     for (index, item) in response.output_items.iter().enumerate() {
         let kind = if let ResponseItem::Reasoning { summary, .. } = item {
@@ -1415,10 +1431,15 @@ fn record_model_response(span: &tracing::Span, response: &TurnResult) {
         } else {
             "model.output_item"
         };
-        if let Ok(content) = serde_json::to_string(item) {
+        if trace_content && let Ok(content) = serde_json::to_string(item) {
+            output_bytes = output_bytes
+                .saturating_add(usize::from(serialized_items != 0))
+                .saturating_add(content.len());
+            serialized_items = serialized_items.saturating_add(1);
             record_indexed_span_content(span, kind, index, &content);
         }
     }
+    span.record("model.output.bytes", output_bytes);
     if let Some(message) = &response.final_message {
         span.record("assistant.output.bytes", message.len());
     }

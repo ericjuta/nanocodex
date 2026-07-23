@@ -114,7 +114,7 @@ impl PatchPresentation {
             }
             lines.extend(render_body(
                 file,
-                usize::from(width).saturating_sub(4).max(1),
+                usize::from(width).saturating_sub(2).max(1),
             ));
         }
         lines
@@ -316,45 +316,52 @@ fn wrap_diff_line(
     let prefix_columns = line_number_width.max(1) + 2;
     let available = width.saturating_sub(prefix_columns).max(1);
     let chunks = wrap_styled_spans(spans, available);
-    let (sign, sign_style, line_style) = match kind {
-        DiffLineKind::Insert => (
-            '+',
-            Style::default().fg(Color::Green),
-            Style::default().bg(ADD_BACKGROUND),
-        ),
+    let (sign, sign_style, background) = match kind {
+        DiffLineKind::Insert => ('+', Style::default().fg(Color::Green), Some(ADD_BACKGROUND)),
         DiffLineKind::Delete => (
             '-',
             Style::default().fg(Color::Red),
-            Style::default().bg(DELETE_BACKGROUND),
+            Some(DELETE_BACKGROUND),
         ),
-        DiffLineKind::Context => (' ', Style::default(), Style::default()),
+        DiffLineKind::Context => (' ', Style::default(), None),
     };
 
     chunks
         .into_iter()
         .enumerate()
         .map(|(index, mut chunk)| {
-            let mut row = if index == 0 {
-                vec![
-                    Span::styled(
-                        format!("{line_number:>line_number_width$} "),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ),
-                    Span::styled(sign.to_string(), sign_style),
-                ]
+            let gutter = if index == 0 {
+                format!("{line_number:>line_number_width$} ")
             } else {
-                vec![Span::styled(
-                    format!("{:line_number_width$}  ", ""),
-                    Style::default().add_modifier(Modifier::DIM),
-                )]
+                format!("{:line_number_width$} ", "")
             };
+            let marker = if index == 0 { sign } else { ' ' };
+            let marker_style = background.map_or(sign_style, |color| sign_style.bg(color));
             if matches!(kind, DiffLineKind::Delete) {
                 for span in &mut chunk {
                     span.style = span.style.add_modifier(Modifier::DIM);
                 }
             }
+            if let Some(color) = background {
+                for span in &mut chunk {
+                    span.style = span.style.bg(color);
+                }
+            }
+            let mut row = vec![
+                Span::styled(gutter, Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(marker.to_string(), marker_style),
+            ];
             row.extend(chunk);
-            Line::from(row).style(line_style)
+            let rendered_width = row.iter().map(Span::width).sum::<usize>();
+            if let Some(color) = background
+                && rendered_width < width
+            {
+                row.push(Span::styled(
+                    " ".repeat(width - rendered_width),
+                    Style::default().bg(color),
+                ));
+            }
+            Line::from(row)
         })
         .collect()
 }
@@ -416,7 +423,7 @@ fn wrap_styled_spans(spans: &[Span<'static>], max_columns: usize) -> Vec<Vec<Spa
 }
 
 fn prefix_line(mut line: Line<'static>) -> Line<'static> {
-    line.spans.insert(0, Span::raw("    "));
+    line.spans.insert(0, Span::raw("  "));
     line
 }
 
@@ -453,7 +460,7 @@ fn line_counts(added: usize, removed: usize) -> String {
 mod tests {
     use ratatui::style::Color;
 
-    use super::present_apply_patch;
+    use super::{ADD_BACKGROUND, DELETE_BACKGROUND, present_apply_patch};
 
     #[test]
     fn presents_paths_counts_moves_and_styled_hunks() {
@@ -490,7 +497,39 @@ mod tests {
 
         assert!(lines.len() > 2);
         assert!(lines.iter().all(|line| line.width() <= 32));
-        assert!(lines[2].to_string().starts_with("       "));
+        assert!(lines[2].to_string().starts_with("     "));
+    }
+
+    #[test]
+    fn change_background_starts_at_the_diff_marker_after_the_gutter() {
+        let patch =
+            "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old();\n+new();\n*** End Patch";
+        let presentation = present_apply_patch(patch).unwrap();
+        let lines = presentation.lines(32);
+
+        for (marker, background) in [("-", DELETE_BACKGROUND), ("+", ADD_BACKGROUND)] {
+            let line = lines
+                .iter()
+                .find(|line| line.spans.iter().any(|span| span.content == marker))
+                .unwrap();
+            let marker_index = line
+                .spans
+                .iter()
+                .position(|span| span.content == marker)
+                .unwrap();
+            assert!(
+                line.spans[..marker_index]
+                    .iter()
+                    .all(|span| span.style.bg.is_none())
+            );
+            assert!(
+                line.spans[marker_index..]
+                    .iter()
+                    .all(|span| span.style.bg == Some(background))
+            );
+            assert_eq!(line.style.bg, None);
+            assert_eq!(line.width(), 32);
+        }
     }
 
     #[test]

@@ -53,6 +53,7 @@ BTW question:
 const DEFAULT_JAEGER_UI_URL: &str = "http://127.0.0.1:16686";
 const JAEGER_UI_URL_ENV: &str = "NANOCODEX_JAEGER_UI_URL";
 const MOUSE_SCROLL_ROWS: usize = 3;
+const MAX_AGENT_EVENTS_PER_BATCH: usize = 256;
 
 enum WorkerCommand {
     Prompt {
@@ -498,20 +499,14 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
                 }
             }
             event = agent_events.recv_timed(), if ui.agent_events_open => {
-                let received = event
-                    .as_ref()
-                    .map(|event| stream_telemetry.event_received(PaneId::Main, event));
-                let action = event.map_or(UiAction::AgentStreamClosed, |event| {
-                    UiAction::Agent(event.event)
-                });
-                let update = ui.update(action, &worker_tx)?;
-                if let Some(received) = received {
-                    stream_telemetry.event_applied(
-                        received,
-                        matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-                    );
-                }
-                if apply_update(update, &mut scheduler) {
+                if apply_main_agent_event_batch(
+                    &mut ui,
+                    &worker_tx,
+                    &mut stream_telemetry,
+                    &mut scheduler,
+                    &mut agent_events,
+                    event,
+                )? {
                     return Ok(());
                 }
             }
@@ -538,13 +533,61 @@ pub(crate) async fn run(config: AgentArgs, initial_prompt: Option<String>) -> Re
             }
             _ = ticker.tick(), if ui.app.main.running
                 || ui.app.btw.as_ref().is_some_and(|btw| btw.conversation.running)
-                || markdown::markdown_images_need_redraw() => {
+                || ui.app.mouse_selection_needs_redraw() => {
                 if apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler) {
                     return Ok(());
                 }
             }
         }
     }
+}
+
+fn apply_main_agent_event_batch(
+    ui: &mut UiModel,
+    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
+    stream_telemetry: &mut StreamTelemetry,
+    scheduler: &mut RenderScheduler,
+    agent_events: &mut AgentEvents,
+    first: Option<TimedAgentEvent>,
+) -> Result<bool> {
+    if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, first)? {
+        return Ok(true);
+    }
+    for _ in 1..MAX_AGENT_EVENTS_PER_BATCH {
+        if scheduler.is_due(Instant::now()) {
+            break;
+        }
+        let Some(event) = agent_events.try_recv_timed() else {
+            break;
+        };
+        if apply_main_agent_event(ui, worker_tx, stream_telemetry, scheduler, Some(event))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn apply_main_agent_event(
+    ui: &mut UiModel,
+    worker_tx: &mpsc::UnboundedSender<WorkerCommand>,
+    stream_telemetry: &mut StreamTelemetry,
+    scheduler: &mut RenderScheduler,
+    event: Option<TimedAgentEvent>,
+) -> Result<bool> {
+    let received = event
+        .as_ref()
+        .map(|event| stream_telemetry.event_received(PaneId::Main, event));
+    let action = event.map_or(UiAction::AgentStreamClosed, |event| {
+        UiAction::Agent(event.event)
+    });
+    let update = ui.update(action, worker_tx)?;
+    if let Some(received) = received {
+        stream_telemetry.event_applied(
+            received,
+            matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
+        );
+    }
+    Ok(apply_update(update, scheduler))
 }
 
 fn render_due_frame(
@@ -560,14 +603,19 @@ fn render_due_frame(
     ui.apply_pending_mouse_scroll();
     ui.app.advance_smooth_scroll();
     let render_started = Instant::now();
-    markdown::begin_markdown_image_frame();
     let draw_metrics = terminal.draw(|frame| view::render(frame, &mut ui.app))?;
-    if let Some(text) = ui.app.take_pending_copy()
-        && let Err(error) = clipboard::copy_to_clipboard(&text)
-    {
-        tracing::warn!(%error, "failed to copy the mouse selection");
-        ui.app
-            .set_active_status(format!("Clipboard copy failed: {error}"));
+    if let Some(text) = ui.app.take_pending_copy() {
+        match clipboard::copy_to_clipboard(&text) {
+            Ok(()) => {
+                let _ = ui.app.complete_mouse_copy(true);
+            }
+            Err(error) => {
+                let _ = ui.app.complete_mouse_copy(false);
+                tracing::warn!(%error, "failed to copy the mouse selection");
+                ui.app
+                    .set_active_status(format!("Clipboard copy failed: {error}"));
+            }
+        }
     }
     let presented_at = Instant::now();
     scheduler.presented(presented_at);
@@ -1099,6 +1147,21 @@ impl AgentWorker {
             }));
             return;
         };
+        if !self.main.turns.is_empty()
+            && !cancel_turn(
+                Some(&self.main.turns),
+                &self.main.request_id,
+                PaneId::Main,
+                &self.updates,
+            )
+            .await
+        {
+            drop(self.updates.send(WorkerEvent::MainBranchOpenFailed {
+                id: new_branch_id,
+                error: "the active turn could not be cancelled before editing".to_owned(),
+            }));
+            return;
+        }
         let parent = self.main.prompt_order[..position]
             .iter()
             .rev()
@@ -1603,6 +1666,9 @@ fn handle_key(
         match key.code {
             KeyCode::Char('c') => return Ok(TerminalAction::Quit),
             KeyCode::Char('g') => return Ok(TerminalAction::ExternalEditor),
+            KeyCode::Char('o') => {
+                let _ = app.toggle_tool_details();
+            }
             KeyCode::Char('d') if app.input.is_empty() => return Ok(TerminalAction::Quit),
             KeyCode::Char('d') => app.delete(),
             KeyCode::Char('h') => app.backspace(),
@@ -1815,9 +1881,13 @@ fn request_historical_edit(
     app: &mut App,
     commands: &mpsc::UnboundedSender<WorkerCommand>,
 ) -> Result<()> {
+    let cancel_source = app.main.running || app.main.pending_turns > 0;
     let Some(request) = app.commit_historical_edit() else {
         return Ok(());
     };
+    if cancel_source {
+        app.cancel_pending(PaneId::Main);
+    }
     send_command(
         commands,
         WorkerCommand::EditHistorical {
@@ -2472,7 +2542,7 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn historical_edit_forks_before_the_selected_prompt_and_keeps_the_parent_branch()
+    async fn historical_edit_cancels_the_active_turn_and_keeps_the_parent_branch()
     -> eyre::Result<()> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -2511,7 +2581,7 @@ mod tests {
                 "revised second prompt"
             );
             send_completed(&mut branch, "resp-edited", "edited answer").await?;
-            send_completed(&mut root, "resp-second", "second answer").await
+            Ok::<_, eyre::Report>(())
         });
 
         let workspace = temporary_workspace("tui-historical-edit")?;
@@ -2569,16 +2639,22 @@ mod tests {
             prompt_id: 2,
         })?;
         timeout(Duration::from_secs(5), async {
+            let mut cancellation_accepted = false;
+            let mut branch_opened = false;
             loop {
-                if matches!(
-                    update_rx.recv().await,
+                match update_rx.recv().await {
+                    Some(WorkerEvent::CancelAccepted {
+                        target: PaneId::Main,
+                    }) => cancellation_accepted = true,
                     Some(WorkerEvent::MainBranchOpened {
                         id: 1,
                         parent_id: 0,
                         prompt_id: 2,
                         ..
-                    })
-                ) {
+                    }) => branch_opened = true,
+                    _ => {}
+                }
+                if cancellation_accepted && branch_opened {
                     break;
                 }
             }
@@ -2614,7 +2690,7 @@ mod tests {
             }
         })
         .await
-        .map_err(|_| eyre::eyre!("concurrent parent and edited branch turns did not finish"))?;
+        .map_err(|_| eyre::eyre!("parent cancellation or edited branch did not finish"))?;
 
         commands.send(WorkerCommand::SwitchMainBranch { id: 0 })?;
         timeout(Duration::from_secs(5), async {
@@ -2722,7 +2798,21 @@ mod tests {
     }
 
     #[test]
-    fn up_selects_a_just_submitted_prompt_before_worker_events_arrive() {
+    fn control_o_toggles_tool_detail_density() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into());
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+
+        assert!(app.tool_details_expanded());
+        assert_eq!(
+            handle_key(key, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
+        assert!(!app.tool_details_expanded());
+    }
+
+    #[test]
+    fn running_generation_continues_while_its_prompt_is_selected_and_edited() {
         let (commands, mut worker) = mpsc::unbounded_channel();
         let mut app = App::new("/workspace".into());
         app.input = "message with typo".to_owned();
@@ -2742,6 +2832,7 @@ mod tests {
             worker.try_recv(),
             Ok(WorkerCommand::Prompt { prompt, .. }) if prompt == "message with typo"
         ));
+        app.main.running = true;
         assert_eq!(
             handle_key(
                 KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
@@ -2753,8 +2844,50 @@ mod tests {
             TerminalAction::Redraw
         );
         assert!(app.transcript_selection_active());
-        assert!(app.start_historical_edit());
+        assert!(worker.try_recv().is_err());
+
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
         assert_eq!(app.input, "message with typo");
+        assert!(app.historical_editor_active());
+        assert!(app.main.running);
+        assert!(worker.try_recv().is_err());
+
+        app.main.push_assistant_delta("generation continues");
+        assert!(app.historical_editor_active());
+        assert_eq!(app.input, "message with typo");
+        assert!(app.main.running);
+        assert!(worker.try_recv().is_err());
+
+        app.replace_input("message without typo".to_owned());
+        assert_eq!(
+            handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut app,
+                "main-session",
+                &commands,
+            )
+            .unwrap(),
+            TerminalAction::Redraw
+        );
+        assert!(matches!(
+            worker.try_recv(),
+            Ok(WorkerCommand::EditHistorical {
+                source_branch_id: 0,
+                new_branch_id: 1,
+                prompt_id: 1,
+            })
+        ));
+        assert_eq!(app.main.status, "Cancelling");
+        assert!(!app.historical_editor_active());
     }
 
     #[test]
@@ -2825,6 +2958,7 @@ mod tests {
         app.input = "preserved draft".to_owned();
         app.cursor = app.input.len();
         app.move_up();
+        app.move_up();
         assert!(app.start_historical_edit());
         app.replace_input("discard this revision".to_owned());
 
@@ -2839,7 +2973,7 @@ mod tests {
             TerminalAction::Redraw
         );
         assert_eq!(app.input, "preserved draft");
-        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.cursor, 0);
         assert!(!app.historical_editor_active());
         assert!(!app.transcript_selection_active());
         assert!(worker.try_recv().is_err());

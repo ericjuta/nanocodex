@@ -181,14 +181,20 @@ struct ActiveTurn {
     assistant_delta_count: u64,
     payload_bytes: u64,
     frame_count: u64,
+    render_sum_ns: u64,
+    render_max_ns: u64,
     changed_cells: u64,
+    changed_cells_max_frame: u64,
     output_bytes: u64,
+    output_bytes_max_frame: u64,
     source_to_emit_sum_ns: u64,
     source_to_emit_max_ns: u64,
     emit_to_receive_sum_ns: u64,
     emit_to_receive_max_ns: u64,
     receive_to_apply_sum_ns: u64,
     receive_to_apply_max_ns: u64,
+    receive_to_apply_max_kind: Option<AgentEventKind>,
+    receive_to_apply_max_seq: u64,
     source_to_present_max_ns: u64,
     first_source_to_present_ns: Option<u64>,
     last_source_to_present_ns: Option<u64>,
@@ -209,14 +215,20 @@ impl ActiveTurn {
             assistant_delta_count: 0,
             payload_bytes: 0,
             frame_count: 0,
+            render_sum_ns: 0,
+            render_max_ns: 0,
             changed_cells: 0,
+            changed_cells_max_frame: 0,
             output_bytes: 0,
+            output_bytes_max_frame: 0,
             source_to_emit_sum_ns: 0,
             source_to_emit_max_ns: 0,
             emit_to_receive_sum_ns: 0,
             emit_to_receive_max_ns: 0,
             receive_to_apply_sum_ns: 0,
             receive_to_apply_max_ns: 0,
+            receive_to_apply_max_kind: None,
+            receive_to_apply_max_seq: 0,
             source_to_present_max_ns: 0,
             first_source_to_present_ns: None,
             last_source_to_present_ns: None,
@@ -248,7 +260,11 @@ impl ActiveTurn {
         self.receive_to_apply_sum_ns = self
             .receive_to_apply_sum_ns
             .saturating_add(receive_to_apply_ns);
-        self.receive_to_apply_max_ns = self.receive_to_apply_max_ns.max(receive_to_apply_ns);
+        if receive_to_apply_ns > self.receive_to_apply_max_ns {
+            self.receive_to_apply_max_ns = receive_to_apply_ns;
+            self.receive_to_apply_max_kind = Some(event.kind);
+            self.receive_to_apply_max_seq = event.seq;
+        }
         if schedules_frame {
             if self.pending_first_source_ns.is_none() {
                 self.pending_first_source_ns = event.source_received_ns;
@@ -260,10 +276,14 @@ impl ActiveTurn {
         }
     }
 
-    fn record_frame(&mut self, presented_ns: u64, draw: DrawMetrics) {
+    fn record_frame(&mut self, presented_ns: u64, render_ns: u64, draw: DrawMetrics) {
         self.frame_count = self.frame_count.saturating_add(1);
+        self.render_sum_ns = self.render_sum_ns.saturating_add(render_ns);
+        self.render_max_ns = self.render_max_ns.max(render_ns);
         self.changed_cells = self.changed_cells.saturating_add(draw.changed_cells);
+        self.changed_cells_max_frame = self.changed_cells_max_frame.max(draw.changed_cells);
         self.output_bytes = self.output_bytes.saturating_add(draw.output_bytes);
+        self.output_bytes_max_frame = self.output_bytes_max_frame.max(draw.output_bytes);
         if let Some(source_ns) = self.pending_first_source_ns.take() {
             let duration = presented_ns.saturating_sub(source_ns);
             self.first_source_to_present_ns.get_or_insert(duration);
@@ -562,7 +582,7 @@ impl StreamTelemetry {
             }
 
             if let Some(active) = self.active_turns.get_mut(&pane) {
-                active.record_frame(presented_ns, draw);
+                active.record_frame(presented_ns, render_ns, draw);
             }
             if self
                 .active_turns
@@ -573,7 +593,7 @@ impl StreamTelemetry {
             }
             if let Some(finishing) = self.finishing_turns.remove(&pane) {
                 for mut turn in finishing {
-                    turn.record_frame(presented_ns, draw);
+                    turn.record_frame(presented_ns, render_ns, draw);
                     Self::log_finished_turn(pane, &turn);
                 }
             }
@@ -600,18 +620,24 @@ impl StreamTelemetry {
                 assistant.delta.count = active.assistant_delta_count,
                 payload.bytes = active.payload_bytes,
                 frame.count = active.frame_count,
+                render.sum_ns = active.render_sum_ns,
+                render.max_ns = active.render_max_ns,
                 frame.events_per_frame_milli = active
                     .event_count
                     .saturating_mul(1_000)
                     / active.frame_count.max(1),
                 terminal.changed_cells = active.changed_cells,
+                terminal.changed_cells.max_frame = active.changed_cells_max_frame,
                 terminal.output_bytes = active.output_bytes,
+                terminal.output_bytes.max_frame = active.output_bytes_max_frame,
                 source_to_agent_emit.sum_ns = active.source_to_emit_sum_ns,
                 source_to_agent_emit.max_ns = active.source_to_emit_max_ns,
                 agent_emit_to_tui_receive.sum_ns = active.emit_to_receive_sum_ns,
                 agent_emit_to_tui_receive.max_ns = active.emit_to_receive_max_ns,
                 tui_receive_to_apply.sum_ns = active.receive_to_apply_sum_ns,
                 tui_receive_to_apply.max_ns = active.receive_to_apply_max_ns,
+                tui_receive_to_apply.max_kind = ?active.receive_to_apply_max_kind,
+                tui_receive_to_apply.max_seq = active.receive_to_apply_max_seq,
                 source_to_present.first_ns = active.first_source_to_present_ns.unwrap_or_default(),
                 source_to_present.last_ns = active.last_source_to_present_ns.unwrap_or_default(),
                 source_to_present.max_ns = active.source_to_present_max_ns,
@@ -700,6 +726,11 @@ mod tests {
         assert_eq!(active.source_to_emit_max_ns, 10);
         assert_eq!(active.emit_to_receive_max_ns, 10);
         assert_eq!(active.receive_to_apply_max_ns, 20);
+        assert_eq!(
+            active.receive_to_apply_max_kind,
+            Some(AgentEventKind::AssistantDelta)
+        );
+        assert_eq!(active.receive_to_apply_max_seq, 2);
         assert_eq!(active.source_to_present_max_ns, 98);
     }
 

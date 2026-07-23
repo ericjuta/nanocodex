@@ -804,7 +804,12 @@ where
                             result,
                         } => {
                             turn_index += 1;
-                            let prompt_content = serde_json::to_string(&prompt).ok();
+                            let prompt_content = tracing::enabled!(
+                                target: "nanocodex",
+                                tracing::Level::INFO
+                            )
+                            .then(|| serde_json::to_string(&prompt).ok())
+                            .flatten();
                             let turn_span = agent_turn_span(
                                 parent.as_ref(),
                                 session_id.as_str(),
@@ -861,7 +866,12 @@ where
                 continue;
             };
             turn_index += 1;
-            let prompt_content = serde_json::to_string(&prompt).ok();
+            let prompt_content = tracing::enabled!(
+                target: "nanocodex",
+                tracing::Level::INFO
+            )
+            .then(|| serde_json::to_string(&prompt).ok())
+            .flatten();
             let turn_span = agent_turn_span(
                 parent.as_ref(),
                 session_id.as_str(),

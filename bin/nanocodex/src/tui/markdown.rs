@@ -1,21 +1,9 @@
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    io::{Cursor, Read},
-    path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
 };
+use std::{borrow::Cow, sync::OnceLock};
 use syntect::{
     easy::HighlightLines,
     highlighting::{FontStyle, Theme, ThemeSet},
@@ -37,17 +25,112 @@ pub(super) fn render_agent_markdown(source: &str, width: u16) -> Text<'static> {
     writer.finish()
 }
 
-pub(super) fn markdown_image_generation() -> u64 {
-    REMOTE_IMAGE_GENERATION.load(Ordering::Acquire)
+#[cfg(test)]
+pub(super) fn restore_markdown_links(selected: String, source: &str) -> String {
+    restore_markdown_links_from_sources(selected, std::iter::once(source))
 }
 
-pub(super) fn markdown_images_need_redraw() -> bool {
-    PENDING_REMOTE_IMAGES.load(Ordering::Acquire) != 0
-        || REMOTE_IMAGE_REDRAW.load(Ordering::Acquire)
+pub(super) fn restore_markdown_links_from_sources<'a>(
+    mut selected: String,
+    sources: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut links = sources
+        .into_iter()
+        .flat_map(markdown_links)
+        .collect::<Vec<_>>();
+    links.sort_unstable_by(|left, right| {
+        right
+            .0
+            .len()
+            .cmp(&left.0.len())
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    links.dedup_by(|left, right| left.0 == right.0);
+    let mut replacements = Vec::<(usize, usize, String)>::new();
+    for (label, destination) in links {
+        if label.is_empty() || destination.is_empty() || label == destination {
+            continue;
+        }
+        for (start, _) in selected.match_indices(&label) {
+            let end = start.saturating_add(label.len());
+            if match_is_inside_url(&selected, start)
+                || !link_label_boundary(&selected, &label, start, end)
+                || replacements
+                    .iter()
+                    .any(|(existing_start, existing_end, _)| {
+                        start < *existing_end && end > *existing_start
+                    })
+            {
+                continue;
+            }
+            replacements.push((start, end, format!("[{label}]({destination})")));
+        }
+    }
+    replacements.sort_unstable_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    for (start, end, replacement) in replacements {
+        selected.replace_range(start..end, &replacement);
+    }
+    selected
 }
 
-pub(super) fn begin_markdown_image_frame() {
-    REMOTE_IMAGE_REDRAW.store(false, Ordering::Release);
+fn match_is_inside_url(selected: &str, start: usize) -> bool {
+    let token_start = selected[..start]
+        .rfind(char::is_whitespace)
+        .map_or(0, |index| index.saturating_add(1));
+    selected[token_start..].starts_with("https://")
+        || selected[token_start..].starts_with("http://")
+}
+
+fn link_label_boundary(selected: &str, label: &str, start: usize, end: usize) -> bool {
+    if selected[..start].ends_with('[') && selected[end..].starts_with("](") {
+        return false;
+    }
+    let begins_with_word = label
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_alphanumeric() || character == '_');
+    let ends_with_word = label
+        .chars()
+        .next_back()
+        .is_some_and(|character| character.is_alphanumeric() || character == '_');
+    let before_is_word = selected[..start]
+        .chars()
+        .next_back()
+        .is_some_and(|character| character.is_alphanumeric() || character == '_');
+    let after_is_word = selected[end..]
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_alphanumeric() || character == '_');
+    (!begins_with_word || !before_is_word) && (!ends_with_word || !after_is_word)
+}
+
+fn markdown_links(source: &str) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    let mut active: Option<(String, String)> = None;
+    for event in Parser::new_ext(source, Options::all()) {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                active = Some((String::new(), dest_url.into_string()));
+            }
+            Event::Text(text) | Event::Code(text) if active.is_some() => {
+                if let Some((label, _)) = &mut active {
+                    label.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak if active.is_some() => {
+                if let Some((label, _)) = &mut active {
+                    label.push(' ');
+                }
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some(link) = active.take() {
+                    links.push(link);
+                }
+            }
+            _ => {}
+        }
+    }
+    links
 }
 
 pub(super) fn heal_streaming_markdown(source: &str) -> Cow<'_, str> {
@@ -396,7 +479,6 @@ struct CodeBlock {
 }
 
 struct MarkdownImage {
-    destination: String,
     title: String,
     alt: String,
 }
@@ -496,7 +578,9 @@ impl MarkdownWriter {
             Event::End(TagEnd::List(_)) => {
                 self.flush_current();
                 let _ = self.lists.pop();
-                self.blank_line();
+                if self.lists.is_empty() {
+                    self.blank_line();
+                }
             }
             Event::Start(Tag::Item) => {
                 self.flush_current();
@@ -533,12 +617,9 @@ impl MarkdownWriter {
                     .fg(Color::Blue)
                     .add_modifier(Modifier::UNDERLINED),
             ),
-            Event::Start(Tag::Image {
-                dest_url, title, ..
-            }) => {
+            Event::Start(Tag::Image { title, .. }) => {
                 self.flush_current();
                 self.image = Some(MarkdownImage {
-                    destination: dest_url.into_string(),
                     title: title.into_string(),
                     alt: String::new(),
                 });
@@ -722,30 +803,11 @@ impl MarkdownWriter {
         } else {
             image.alt.trim()
         };
-        if let Some(lines) = inline_image_lines(&image.destination, self.width) {
-            self.lines.extend(lines);
-            if !label.is_empty() {
-                self.lines.push(Line::styled(
-                    format!("  {label}"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                ));
-            }
-        } else {
-            let label = if label.is_empty() { "image" } else { label };
-            self.lines.push(Line::from(vec![
-                Span::styled("  🖼 ", Style::default().fg(Color::DarkGray)),
-                Span::styled(label.to_owned(), Style::default().fg(Color::White)),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    image.destination,
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::UNDERLINED),
-                ),
-            ]));
-        }
+        let label = if label.is_empty() { "image" } else { label };
+        self.lines.push(Line::from(vec![
+            Span::styled("  🖼 ", Style::default().fg(Color::DarkGray)),
+            Span::styled(label.to_owned(), Style::default().fg(Color::White)),
+        ]));
         self.blank_line();
     }
 
@@ -870,209 +932,6 @@ impl MarkdownWriter {
     }
 }
 
-fn inline_image_lines(destination: &str, width: u16) -> Option<Vec<Line<'static>>> {
-    const MAX_SOURCE_BYTES: u64 = 64 * 1_024 * 1_024;
-    const MAX_COLUMNS: u32 = 60;
-    const MAX_PIXEL_ROWS: u32 = 40;
-
-    let image = if let Some(path) = local_image_path(destination) {
-        if std::fs::metadata(&path).ok()?.len() > MAX_SOURCE_BYTES {
-            return None;
-        }
-        let dimensions = image::image_dimensions(&path).ok()?;
-        valid_image_dimensions(dimensions)?;
-        Arc::new(image::open(path).ok()?)
-    } else if destination.starts_with("data:") {
-        Arc::new(decode_data_image(destination)?)
-    } else {
-        remote_image(destination)?
-    };
-    let (source_width, source_height) = (image.width(), image.height());
-    let max_columns = u32::from(width.saturating_sub(4).max(1)).min(MAX_COLUMNS);
-    let pixels = image
-        .thumbnail(
-            max_columns.min(source_width),
-            MAX_PIXEL_ROWS.min(source_height),
-        )
-        .into_rgba8();
-    let (columns, pixel_rows) = pixels.dimensions();
-    let terminal_rows = pixel_rows.saturating_add(1) / 2;
-    let mut lines = Vec::with_capacity(usize::try_from(terminal_rows).unwrap_or(usize::MAX));
-    for row in 0..terminal_rows {
-        let top_y = row.saturating_mul(2);
-        let bottom_y = top_y.saturating_add(1).min(pixel_rows.saturating_sub(1));
-        let mut spans = Vec::with_capacity(usize::try_from(columns).unwrap_or(usize::MAX) + 1);
-        spans.push(Span::raw("  "));
-        for column in 0..columns {
-            let top = composite_over_black(pixels.get_pixel(column, top_y).0);
-            let bottom = composite_over_black(pixels.get_pixel(column, bottom_y).0);
-            spans.push(Span::styled(
-                "▀",
-                Style::default()
-                    .fg(Color::Rgb(top[0], top[1], top[2]))
-                    .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    Some(lines)
-}
-
-fn local_image_path(destination: &str) -> Option<PathBuf> {
-    if destination.starts_with("file://") {
-        return reqwest::Url::parse(destination).ok()?.to_file_path().ok();
-    }
-    if destination.contains("://") || destination.starts_with("data:") {
-        return None;
-    }
-    let destination = destination.strip_prefix("sandbox:").unwrap_or(destination);
-    let path = Path::new(destination);
-    (!destination.is_empty()).then(|| path.to_owned())
-}
-
-const MAX_SOURCE_PIXELS: u64 = 40_000_000;
-const MAX_REMOTE_IMAGE_BYTES: usize = 8 * 1_024 * 1_024;
-const MAX_REMOTE_IMAGES: usize = 16;
-
-static REMOTE_IMAGE_GENERATION: AtomicU64 = AtomicU64::new(0);
-static PENDING_REMOTE_IMAGES: AtomicUsize = AtomicUsize::new(0);
-static REMOTE_IMAGE_REDRAW: AtomicBool = AtomicBool::new(false);
-
-enum RemoteImage {
-    Fetching,
-    Ready(Arc<image::DynamicImage>),
-    Failed,
-}
-
-fn remote_image_cache() -> &'static Mutex<HashMap<String, RemoteImage>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, RemoteImage>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn remote_image(destination: &str) -> Option<Arc<image::DynamicImage>> {
-    let url = reqwest::Url::parse(destination).ok()?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return None;
-    }
-    let key = url.to_string();
-    let mut cache = remote_image_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    match cache.get(&key) {
-        Some(RemoteImage::Ready(image)) => return Some(Arc::clone(image)),
-        Some(RemoteImage::Fetching | RemoteImage::Failed) => return None,
-        None => {}
-    }
-    if cache.len() >= MAX_REMOTE_IMAGES
-        && let Some(expired) = cache
-            .iter()
-            .find_map(|(key, state)| (!matches!(state, RemoteImage::Fetching)).then(|| key.clone()))
-    {
-        cache.remove(&expired);
-    }
-    if cache.len() >= MAX_REMOTE_IMAGES {
-        return None;
-    }
-    cache.insert(key.clone(), RemoteImage::Fetching);
-    PENDING_REMOTE_IMAGES.fetch_add(1, Ordering::AcqRel);
-    drop(cache);
-
-    let thread_key = key.clone();
-    if std::thread::Builder::new()
-        .name("nanocodex-image".to_owned())
-        .spawn(move || complete_remote_image(thread_key))
-        .is_err()
-    {
-        remote_image_cache()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, RemoteImage::Failed);
-        PENDING_REMOTE_IMAGES.fetch_sub(1, Ordering::AcqRel);
-    }
-    None
-}
-
-fn complete_remote_image(key: String) {
-    let fetched = fetch_remote_image(&key);
-    remote_image_cache()
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(
-            key,
-            fetched.map_or(RemoteImage::Failed, |image| {
-                RemoteImage::Ready(Arc::new(image))
-            }),
-        );
-    REMOTE_IMAGE_GENERATION.fetch_add(1, Ordering::AcqRel);
-    REMOTE_IMAGE_REDRAW.store(true, Ordering::Release);
-    PENDING_REMOTE_IMAGES.fetch_sub(1, Ordering::AcqRel);
-}
-
-fn fetch_remote_image(url: &str) -> Option<image::DynamicImage> {
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(8))
-        .build()
-        .ok()?;
-    let response = client.get(url).send().ok()?.error_for_status().ok()?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_REMOTE_IMAGE_BYTES as u64)
-    {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    response
-        .take((MAX_REMOTE_IMAGE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() <= MAX_REMOTE_IMAGE_BYTES).then_some(())?;
-    decode_image_bytes(&bytes)
-}
-
-fn decode_data_image(destination: &str) -> Option<image::DynamicImage> {
-    let (metadata, payload) = destination.strip_prefix("data:")?.split_once(',')?;
-    if !metadata
-        .split(';')
-        .next()
-        .is_some_and(|mime_type| mime_type.starts_with("image/"))
-        || !metadata
-            .split(';')
-            .skip(1)
-            .any(|parameter| parameter.eq_ignore_ascii_case("base64"))
-        || payload.len() > MAX_REMOTE_IMAGE_BYTES.saturating_mul(4).div_ceil(3)
-    {
-        return None;
-    }
-    let bytes = BASE64_STANDARD.decode(payload).ok()?;
-    (bytes.len() <= MAX_REMOTE_IMAGE_BYTES).then_some(())?;
-    decode_image_bytes(&bytes)
-}
-
-fn decode_image_bytes(bytes: &[u8]) -> Option<image::DynamicImage> {
-    let dimensions = image::ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .into_dimensions()
-        .ok()?;
-    valid_image_dimensions(dimensions)?;
-    image::load_from_memory(bytes).ok()
-}
-
-fn valid_image_dimensions((width, height): (u32, u32)) -> Option<()> {
-    (width != 0
-        && height != 0
-        && u64::from(width).saturating_mul(u64::from(height)) <= MAX_SOURCE_PIXELS)
-        .then_some(())
-}
-
-fn composite_over_black([red, green, blue, alpha]: [u8; 4]) -> [u8; 3] {
-    let alpha = u16::from(alpha);
-    [red, green, blue].map(|channel| {
-        u8::try_from(u16::from(channel).saturating_mul(alpha) / 255).unwrap_or(u8::MAX)
-    })
-}
-
 fn table_card_field(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
@@ -1152,17 +1011,13 @@ fn strip_html(html: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashSet,
-        io::{Read as _, Write as _},
-        net::TcpListener,
-        time::{Duration, Instant},
-    };
+    use std::collections::HashSet;
 
-    use ratatui::{Terminal, backend::TestBackend, style::Color, widgets::Paragraph};
+    use ratatui::{Terminal, backend::TestBackend, widgets::Paragraph};
 
     use super::{
         code_line_count, heal_streaming_markdown, highlighted_code_lines, render_agent_markdown,
+        restore_markdown_links,
     };
 
     fn render(markdown: &str, width: u16, height: u16) -> String {
@@ -1193,97 +1048,96 @@ mod tests {
     }
 
     #[test]
-    fn renders_local_markdown_images_inline_with_true_color_pixels() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("inline.png");
-        let mut image = image::RgbaImage::new(2, 2);
-        image.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
-        image.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
-        image.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
-        image.put_pixel(1, 1, image::Rgba([255, 255, 255, 255]));
-        image.save(&path).unwrap();
+    fn nested_lists_do_not_insert_blank_rows_between_tiers() {
+        let rendered =
+            render_agent_markdown("- parent\n  - child\n    - grandchild\n- sibling", 60);
+        let lines = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let parent = lines
+            .iter()
+            .position(|line| line.contains("• parent"))
+            .unwrap();
+        let child = lines
+            .iter()
+            .position(|line| line.contains("• child"))
+            .unwrap();
+        let grandchild = lines
+            .iter()
+            .position(|line| line.contains("• grandchild"))
+            .unwrap();
+        let sibling = lines
+            .iter()
+            .position(|line| line.contains("• sibling"))
+            .unwrap();
 
-        let markdown = format!("before\n\n![sample image]({})\n\nafter", path.display());
-        let rendered = render_agent_markdown(&markdown, 30);
+        assert_eq!(child, parent + 1);
+        assert_eq!(grandchild, child + 1);
+        assert_eq!(sibling, grandchild + 1);
+    }
+
+    #[test]
+    fn semantic_copy_restores_markdown_link_destinations() {
+        assert_eq!(
+            restore_markdown_links(
+                "Read the docs and API reference".to_owned(),
+                "Read the **[docs](https://example.com/docs)** and [API `reference`](https://example.com/api)",
+            ),
+            "Read the [docs](https://example.com/docs) and [API reference](https://example.com/api)"
+        );
+        assert_eq!(
+            restore_markdown_links(
+                "docsify docs [docs](https://existing.example)".to_owned(),
+                "[docs](https://example.com/docs)",
+            ),
+            "docsify [docs](https://example.com/docs) [docs](https://existing.example)"
+        );
+    }
+
+    #[test]
+    fn semantic_copy_keeps_literal_urls_raw() {
+        assert_eq!(
+            restore_markdown_links(
+                "https://example.com/docs and docs".to_owned(),
+                "Read [docs](https://example.com/documentation)",
+            ),
+            "https://example.com/docs and [docs](https://example.com/documentation)"
+        );
+        assert_eq!(
+            restore_markdown_links(
+                "https://example.com".to_owned(),
+                "[https://example.com](https://redirect.example)",
+            ),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn markdown_images_render_a_bounded_placeholder() {
+        let destination = format!("data:image/png;base64,{}", "A".repeat(100_000));
+        let rendered = render_agent_markdown(
+            &format!("before\n\n![deployment chart]({destination})\n\nafter"),
+            80,
+        );
         let content = rendered
             .lines
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        let pixel = rendered
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .find(|span| span.content == "▀")
-            .expect("inline image pixel");
 
         assert!(content.contains("before"));
-        assert!(content.contains("sample image"));
+        assert!(content.contains("🖼 deployment chart"));
         assert!(content.contains("after"));
-        assert_eq!(pixel.style.fg, Some(Color::Rgb(255, 0, 0)));
-        assert_eq!(pixel.style.bg, Some(Color::Rgb(0, 0, 255)));
-    }
-
-    #[test]
-    fn remote_markdown_images_keep_an_explicit_fallback() {
-        let rendered = render("![deployment chart](ftp://example.com/chart.png)", 80, 4);
-
-        assert!(rendered.contains("🖼 deployment chart"));
-        assert!(rendered.contains("ftp://example.com/chart.png"));
-    }
-
-    #[test]
-    fn fetches_remote_markdown_images_without_blocking_rendering() {
-        let mut source = image::RgbaImage::new(1, 2);
-        source.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
-        source.put_pixel(0, 1, image::Rgba([0, 0, 255, 255]));
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(source)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let png = png.into_inner();
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1_024];
-            let _ = stream.read(&mut request).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                png.len()
-            )
-            .unwrap();
-            stream.write_all(&png).unwrap();
-        });
-
-        let markdown = format!("![remote](http://{address}/image.png)");
-        let first = render_agent_markdown(&markdown, 30);
-        assert!(first.lines.iter().any(|line| {
-            line.spans
-                .iter()
-                .any(|span| span.content.contains("remote"))
-        }));
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let pixel = loop {
-            if let Some(pixel) = render_agent_markdown(&markdown, 30)
-                .lines
-                .into_iter()
-                .flat_map(|line| line.spans)
-                .find(|span| span.content == "▀")
-            {
-                break pixel;
-            }
-            assert!(Instant::now() < deadline, "remote image did not load");
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        server.join().unwrap();
-
-        assert_eq!(pixel.style.fg, Some(Color::Rgb(255, 0, 0)));
-        assert_eq!(pixel.style.bg, Some(Color::Rgb(0, 0, 255)));
+        assert!(!content.contains("base64"));
+        assert!(content.len() < 200);
     }
 
     #[test]

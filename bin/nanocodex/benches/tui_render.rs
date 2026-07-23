@@ -71,13 +71,19 @@ mod tui {
         user_chars: usize,
         assistant_messages: usize,
         assistant_chars: usize,
+        reasoning_messages: usize,
+        reasoning_chars: usize,
         tool_calls: usize,
         tool_argument_chars: usize,
+        tool_results: usize,
+        tool_result_chars: usize,
     }
 
     // Sanitized structural summaries derived from a long local Codex rollout and
     // the longest Amp thread returned by `amp threads list --include-archived` on
-    // 2026-07-20. No prompt, tool argument, result, or user content is retained.
+    // 2026-07-22. Amp reasoning and tool-result totals are retained structurally;
+    // the observed 269 KiB maximum result is isolated below. No prompt, tool
+    // argument, result, or user content is retained.
     const TRACE_SHAPES: [TraceShape; 2] = [
         TraceShape {
             name: "codex_long",
@@ -85,17 +91,25 @@ mod tui {
             user_chars: 30_486,
             assistant_messages: 964,
             assistant_chars: 308_701,
+            reasoning_messages: 0,
+            reasoning_chars: 0,
             tool_calls: 3_471,
             tool_argument_chars: 1_438_038,
+            tool_results: 0,
+            tool_result_chars: 0,
         },
         TraceShape {
             name: "amp_long",
-            user_messages: 38,
-            user_chars: 4_716,
-            assistant_messages: 199,
-            assistant_chars: 69_676,
-            tool_calls: 241,
-            tool_argument_chars: 162_209,
+            user_messages: 22,
+            user_chars: 3_763,
+            assistant_messages: 72,
+            assistant_chars: 56_681,
+            reasoning_messages: 201,
+            reasoning_chars: 610_004,
+            tool_calls: 255,
+            tool_argument_chars: 261_830,
+            tool_results: 255,
+            tool_result_chars: 1_718_915,
         },
     ];
 
@@ -141,6 +155,7 @@ mod tui {
         let turns = shape
             .user_messages
             .max(shape.assistant_messages)
+            .max(shape.reasoning_messages)
             .max(shape.tool_calls);
 
         for index in 0..turns {
@@ -161,16 +176,36 @@ mod tui {
                         index + 1,
                     )));
             }
+            if index < shape.reasoning_messages {
+                app.main
+                    .transcript
+                    .push(TranscriptItem::Reasoning(sized_text(
+                        distribute(shape.reasoning_chars, shape.reasoning_messages, index),
+                        index + 2,
+                    )));
+            }
             if index < shape.tool_calls {
+                let call_id = format!("call-{index}");
                 app.main.transcript.push(TranscriptItem::Tool {
-                    call_id: format!("call-{index}"),
+                    call_id: call_id.clone(),
                     name: "exec_command".to_owned(),
                     arguments: sized_text(
-                        distribute(shape.tool_argument_chars, shape.tool_calls, index).min(180),
-                        index + 2,
+                        distribute(shape.tool_argument_chars, shape.tool_calls, index),
+                        index + 3,
                     ),
                     status: ToolStatus::Completed,
                 });
+                if index < shape.tool_results {
+                    assert!(app.main.transcript.set_tool_result(
+                        &call_id,
+                        ToolStatus::Completed,
+                        Some(1_000_000),
+                        Some(sized_text(
+                            distribute(shape.tool_result_chars, shape.tool_results, index),
+                            index + 4,
+                        )),
+                    ));
+                }
             }
         }
         // The benchmark models a partially streamed tail after retained history.
@@ -242,7 +277,10 @@ mod tui {
     pub(super) fn render_benchmarks(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("tui_trace_render");
         for shape in TRACE_SHAPES {
-            let item_count = shape.user_messages + shape.assistant_messages + shape.tool_calls;
+            let item_count = shape.user_messages
+                + shape.assistant_messages
+                + shape.reasoning_messages
+                + shape.tool_calls;
             group.throughput(Throughput::Elements(item_count as u64));
             for (scroll_name, scroll_from_bottom) in [("tail", 0), ("scrolled_4k", 4_000)] {
                 for (width, height) in TERMINAL_SIZES {
@@ -277,7 +315,10 @@ mod tui {
     pub(super) fn resize_benchmarks(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("tui_trace_resize");
         for shape in TRACE_SHAPES {
-            let item_count = shape.user_messages + shape.assistant_messages + shape.tool_calls;
+            let item_count = shape.user_messages
+                + shape.assistant_messages
+                + shape.reasoning_messages
+                + shape.tool_calls;
             group.throughput(Throughput::Elements(item_count as u64));
             group.bench_function(BenchmarkId::new(shape.name, "80x24_to_200x60"), |bencher| {
                 let mut app = trace_app(shape);
@@ -633,6 +674,45 @@ mod tui {
                     .expect("mouse-selection benchmark frame should render");
             });
         });
+
+        criterion.bench_function(
+            "tui_mouse_selection/edge_auto_scroll_tick/120x40",
+            |bencher| {
+                bencher.iter_batched(
+                    || {
+                        let mut app = App::new("/workspace/nanocodex".into());
+                        for index in 0..80 {
+                            app.main
+                                .transcript
+                                .push(TranscriptItem::User(sized_text(160, index)));
+                        }
+                        let mut terminal = Terminal::new(TestBackend::new(120, 40))
+                            .expect("edge-selection benchmark terminal should initialize");
+                        terminal
+                            .draw(|frame| view::render(frame, &mut app))
+                            .expect("initial edge-selection frame should render");
+                        app.main.scroll_from_bottom = 80;
+                        terminal
+                            .draw(|frame| view::render(frame, &mut app))
+                            .expect("scrolled edge-selection frame should render");
+                        assert!(app.begin_mouse_selection((2, 10).into()));
+                        assert!(app.drag_mouse_selection((118, 34).into()));
+                        terminal
+                            .draw(|frame| view::render(frame, &mut app))
+                            .expect("edge drag frame should render");
+                        (app, terminal)
+                    },
+                    |(mut app, mut terminal)| {
+                        app.on_tick();
+                        terminal
+                            .draw(|frame| view::render(frame, &mut app))
+                            .expect("auto-scroll selection frame should render");
+                        black_box((app, terminal));
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
     }
 
     pub(super) fn stream_telemetry_benchmark(criterion: &mut Criterion) {
@@ -681,7 +761,10 @@ mod tui {
     pub(super) fn first_frame_benchmarks(criterion: &mut Criterion) {
         let mut group = criterion.benchmark_group("tui_trace_first_frame");
         for shape in TRACE_SHAPES {
-            let item_count = shape.user_messages + shape.assistant_messages + shape.tool_calls;
+            let item_count = shape.user_messages
+                + shape.assistant_messages
+                + shape.reasoning_messages
+                + shape.tool_calls;
             group.throughput(Throughput::Elements(item_count as u64));
             group.bench_function(BenchmarkId::new(shape.name, "120x40"), |bencher| {
                 bencher.iter_batched(
@@ -985,8 +1068,31 @@ mod tui {
                 BatchSize::SmallInput,
             );
         });
+
+        let mut linked = Transcript::default();
+        let linked_source = (0..64)
+            .map(|index| format!("Read [reference {index}](https://example.com/{index})."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let linked_copy = (0..64)
+            .map(|index| format!("Read reference {index}."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        linked.push(TranscriptItem::Assistant(linked_source.clone()));
+        criterion.bench_function("tui_markdown/semantic_link_copy_64", |bencher| {
+            bencher.iter(|| linked.semanticize_copy(black_box(linked_copy.clone())));
+        });
+
+        let image = format!(
+            "before\n\n![deployment chart](data:image/png;base64,{})\n\nafter",
+            "A".repeat(100_000)
+        );
+        criterion.bench_function("tui_markdown/image_placeholder_100k", |bencher| {
+            bencher.iter(|| markdown::render_agent_markdown(black_box(&image), 120));
+        });
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn tool_tree_benchmark(criterion: &mut Criterion) {
         criterion.bench_function("tui_tool_tree/update_and_frame/120x40", |bencher| {
             bencher.iter_batched(
@@ -1069,6 +1175,121 @@ mod tui {
                 );
             },
         );
+
+        let large_result = sized_text(269 * 1_024, 17);
+        criterion.bench_function("tui_tool_tree/result_269k_first_frame/120x40", |bencher| {
+            bencher.iter_batched(
+                || {
+                    let mut transcript = Transcript::default();
+                    transcript.push(TranscriptItem::Tool {
+                        call_id: "result-1".to_owned(),
+                        name: "exec_command".to_owned(),
+                        arguments: "render report".to_owned(),
+                        status: ToolStatus::Completed,
+                    });
+                    assert!(transcript.set_tool_result(
+                        "result-1",
+                        ToolStatus::Completed,
+                        Some(1_000_000),
+                        Some(large_result.clone()),
+                    ));
+                    let terminal = Terminal::new(TestBackend::new(120, 40))
+                        .expect("large-result benchmark terminal should initialize");
+                    (transcript, terminal)
+                },
+                |(transcript, mut terminal)| {
+                    terminal
+                        .draw(|frame| {
+                            frame.render_widget(
+                                transcript.widget(0, None, None, "empty"),
+                                frame.area(),
+                            );
+                        })
+                        .expect("large-result benchmark frame should render");
+                    black_box((transcript, terminal));
+                },
+                BatchSize::SmallInput,
+            );
+        });
+
+        let mut transcript = Transcript::default();
+        transcript.push(TranscriptItem::Tool {
+            call_id: "result-1".to_owned(),
+            name: "exec_command".to_owned(),
+            arguments: "render report".to_owned(),
+            status: ToolStatus::Completed,
+        });
+        assert!(transcript.set_tool_result(
+            "result-1",
+            ToolStatus::Completed,
+            Some(1_000_000),
+            Some(large_result),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))
+            .expect("cached large-result benchmark terminal should initialize");
+        terminal
+            .draw(|frame| {
+                frame.render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+            })
+            .expect("initial large-result benchmark frame should render");
+        criterion.bench_function("tui_tool_tree/result_269k_cached_frame/120x40", |bencher| {
+            bencher.iter(|| {
+                terminal
+                    .draw(|frame| {
+                        frame
+                            .render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+                    })
+                    .expect("cached large-result benchmark frame should render");
+            });
+        });
+    }
+
+    pub(super) fn folded_tool_benchmarks(criterion: &mut Criterion) {
+        criterion.bench_function("tui_tool_tree/fold_3471_activities", |bencher| {
+            bencher.iter_batched_ref(
+                || {
+                    let mut transcript = Transcript::default();
+                    for index in 0..3_471 {
+                        transcript.push(TranscriptItem::Tool {
+                            call_id: format!("call-{index}"),
+                            name: "exec_command".to_owned(),
+                            arguments: format!("cargo test package-{index}"),
+                            status: ToolStatus::Completed,
+                        });
+                    }
+                    let shared = transcript.clone();
+                    (transcript, shared)
+                },
+                |(transcript, shared)| {
+                    transcript.set_tool_details_expanded(false);
+                    black_box((transcript.len(), shared.len()));
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        criterion.bench_function("tui_tool_tree/folded_tail_frame/120x40", |bencher| {
+            let mut transcript = Transcript::default();
+            for index in 0..3_471 {
+                transcript.push(TranscriptItem::Tool {
+                    call_id: format!("call-{index}"),
+                    name: "exec_command".to_owned(),
+                    arguments: format!("cargo test package-{index}"),
+                    status: ToolStatus::Completed,
+                });
+            }
+            transcript.set_tool_details_expanded(false);
+            let mut terminal = Terminal::new(TestBackend::new(120, 40))
+                .expect("folded tool terminal should initialize");
+            bencher.iter(|| {
+                terminal
+                    .draw(|frame| {
+                        frame
+                            .render_widget(transcript.widget(0, None, None, "empty"), frame.area());
+                    })
+                    .expect("folded tool frame should render");
+            });
+        });
     }
 }
 
@@ -1090,6 +1311,7 @@ criterion_group!(
     tui::history_navigation_benchmarks,
     tui::branch_state_benchmarks,
     tui::markdown_benchmarks,
-    tui::tool_tree_benchmark
+    tui::tool_tree_benchmark,
+    tui::folded_tool_benchmarks
 );
 criterion_main!(benches);

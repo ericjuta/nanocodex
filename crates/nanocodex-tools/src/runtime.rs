@@ -882,8 +882,14 @@ impl ToolRegistry {
         input: Value,
         context: ToolContext<'_>,
     ) -> ToolExecution {
-        let arguments_content = serde_json::to_string(&input).ok();
-        let arguments_bytes = serde_json::to_vec(&input).map_or(0, |encoded| encoded.len());
+        let trace_content = tracing::enabled!(
+            target: "nanocodex_tools",
+            tracing::Level::INFO
+        );
+        let arguments_content = trace_content
+            .then(|| serde_json::to_string(&input).ok())
+            .flatten();
+        let arguments_bytes = arguments_content.as_ref().map_or(0, String::len);
         let arguments_kind = match &input {
             Value::Null => "null",
             Value::Bool(_) => "boolean",
@@ -896,15 +902,17 @@ impl ToolRegistry {
             || input.as_array().map_or(1, Vec::len),
             serde_json::Map::len,
         );
-        let argument_keys = input
-            .as_object()
-            .map(|object| {
-                object
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(",")
+        let argument_keys = trace_content
+            .then(|| {
+                input.as_object().map(|object| {
+                    object
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
             })
+            .flatten()
             .unwrap_or_default();
         let span = info_span!(
             target: "nanocodex_tools",
@@ -935,7 +943,7 @@ impl ToolRegistry {
             .execute_nested_inner(name, input, context)
             .instrument(span.clone())
             .await;
-        if let Ok(content) = serde_json::to_string(&execution.output) {
+        if trace_content && let Ok(content) = serde_json::to_string(&execution.output) {
             record_tool_content(&span, "tool.output", &content);
         }
         span.record(

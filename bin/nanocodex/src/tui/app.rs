@@ -14,7 +14,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::composer::ComposerLayout;
-use super::selection::ScreenSelection;
+use super::selection::{
+    ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
+};
 use super::transcript::{ToolStatus, Transcript, TranscriptItem};
 
 const MAX_TOOL_ARGUMENT_CHARS: usize = 180;
@@ -913,6 +915,7 @@ pub(super) struct App {
     next_input_id: u64,
     cancel_confirmation: Option<CancelConfirmation>,
     screen_selection: ScreenSelection,
+    tool_details_expanded: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -960,6 +963,7 @@ impl App {
             next_input_id: 1,
             cancel_confirmation: None,
             screen_selection: ScreenSelection::default(),
+            tool_details_expanded: true,
         }
     }
 
@@ -1153,14 +1157,36 @@ impl App {
         let layout = ComposerLayout::new(&self.input, self.composer_width);
         let position = layout.cursor_position(&self.input, self.cursor);
         let Some(target_row) = position.row.checked_add_signed(direction) else {
-            return false;
+            return self.move_to_visual_row_boundary(&layout, position.row, direction);
         };
         if target_row >= layout.row_count() {
-            return false;
+            return self.move_to_visual_row_boundary(&layout, position.row, direction);
         }
         let column = self.preferred_column.unwrap_or(position.column);
         self.cursor = layout.byte_at_column(&self.input, target_row, column);
         self.preferred_column = Some(column);
+        true
+    }
+
+    fn move_to_visual_row_boundary(
+        &mut self,
+        layout: &ComposerLayout,
+        row: usize,
+        direction: isize,
+    ) -> bool {
+        let Some(range) = layout.row(row) else {
+            return false;
+        };
+        let boundary = if direction.is_negative() {
+            range.start
+        } else {
+            range.end
+        };
+        if boundary == self.cursor {
+            return false;
+        }
+        self.cursor = boundary;
+        self.preferred_column = None;
         true
     }
 
@@ -1349,6 +1375,12 @@ impl App {
 
     pub(super) fn historical_editor_active(&self) -> bool {
         self.historical_editor.is_some()
+    }
+
+    pub(super) fn historical_editor_source_branch(&self) -> Option<u64> {
+        self.historical_editor
+            .as_ref()
+            .map(|editor| editor.source_branch_id)
     }
 
     pub(super) fn start_historical_edit(&mut self) -> bool {
@@ -1725,8 +1757,35 @@ impl App {
             request_id: None,
             conversation: Conversation::new("Forking latest checkpoint"),
         });
+        if !self.tool_details_expanded
+            && let Some(btw) = &mut self.btw
+        {
+            btw.conversation.transcript.set_tool_details_expanded(false);
+        }
         self.focus = PaneId::Btw(id);
         id
+    }
+
+    pub(super) fn toggle_tool_details(&mut self) -> bool {
+        self.tool_details_expanded = !self.tool_details_expanded;
+        let expanded = self.tool_details_expanded;
+        self.main.transcript.set_tool_details_expanded(expanded);
+        for branch in &mut self.main_branches {
+            branch
+                .conversation
+                .transcript
+                .set_tool_details_expanded(expanded);
+        }
+        if let Some(btw) = &mut self.btw {
+            btw.conversation
+                .transcript
+                .set_tool_details_expanded(expanded);
+        }
+        expanded
+    }
+
+    pub(super) fn tool_details_expanded(&self) -> bool {
+        self.tool_details_expanded
     }
 
     pub(super) fn btw_id(&self) -> Option<u64> {
@@ -2015,7 +2074,12 @@ impl App {
 
     pub(super) fn on_tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
-        self.expire_cancel_confirmation(Instant::now());
+        let now = Instant::now();
+        self.expire_cancel_confirmation(now);
+        let _ = self.screen_selection.advance(now);
+        if let Some(request) = self.screen_selection.scroll_request() {
+            self.auto_scroll_mouse_selection(request);
+        }
     }
 
     pub(super) fn begin_mouse_selection(&mut self, position: Position) -> bool {
@@ -2034,7 +2098,12 @@ impl App {
     }
 
     pub(super) fn finish_mouse_selection(&mut self, position: Position) -> bool {
-        self.screen_selection.finish(position)
+        let changed = self.screen_selection.finish(position);
+        let clicked = self
+            .screen_selection
+            .take_pending_click()
+            .is_some_and(|click| self.place_composer_cursor(click));
+        changed || clicked
     }
 
     pub(super) fn clear_mouse_selection(&mut self) -> bool {
@@ -2050,7 +2119,104 @@ impl App {
     }
 
     pub(super) fn take_pending_copy(&mut self) -> Option<String> {
-        self.screen_selection.take_pending_copy()
+        let text = self.screen_selection.take_pending_copy()?;
+        Some(self.semanticize_mouse_copy(text))
+    }
+
+    pub(super) fn complete_mouse_copy(&mut self, copied: bool) -> bool {
+        self.screen_selection.copy_finished(copied)
+    }
+
+    pub(super) fn mouse_selection_needs_redraw(&self) -> bool {
+        self.screen_selection.needs_tick()
+    }
+
+    fn place_composer_cursor(&mut self, click: SelectionClick) -> bool {
+        if self.historical_editor_active()
+            || self.branch_navigator_active()
+            || click.surface_index + 1 != self.screen_selection.selectable_area_count()
+        {
+            return false;
+        }
+        let row = self.composer_scroll.saturating_add(usize::from(
+            click.position.y.saturating_sub(click.surface.y),
+        ));
+        let column = usize::from(click.position.x.saturating_sub(click.surface.x));
+        let layout = ComposerLayout::new(&self.input, self.composer_width);
+        let cursor = layout.byte_at_column(
+            &self.input,
+            row.min(layout.row_count().saturating_sub(1)),
+            column,
+        );
+        let focus = self.focus;
+        let history_selected = self
+            .conversation(focus)
+            .is_some_and(|conversation| conversation.selected_user.is_some());
+        let changed = self.cursor != cursor || history_selected;
+        self.cursor = cursor;
+        self.preferred_column = None;
+        if let Some(conversation) = self.conversation_mut(focus) {
+            conversation.selected_user = None;
+        }
+        changed
+    }
+
+    fn auto_scroll_mouse_selection(&mut self, request: SelectionScrollRequest) {
+        let conversation = if request.surface_index == 0 {
+            if self.branch_navigator_active() {
+                self.branch_navigator_conversation_mut()
+            } else {
+                &mut self.main
+            }
+        } else if request.surface_index == 1 {
+            let Some(btw) = self.btw.as_mut() else {
+                let _ = self.screen_selection.scrolled(request.direction, 0);
+                return;
+            };
+            &mut btw.conversation
+        } else {
+            let _ = self.screen_selection.scrolled(request.direction, 0);
+            return;
+        };
+        let before = conversation.display_scroll_from_bottom();
+        match request.direction {
+            SelectionScrollDirection::Older => conversation.scroll_up(1),
+            SelectionScrollDirection::Newer => conversation.scroll_down(1),
+        }
+        let after = conversation.display_scroll_from_bottom();
+        let _ = self
+            .screen_selection
+            .scrolled(request.direction, before.abs_diff(after));
+    }
+
+    fn semanticize_mouse_copy(&self, text: String) -> String {
+        let Some(surface_index) = self.screen_selection.surface_index() else {
+            return text;
+        };
+        let transcript = if surface_index == 0 {
+            if let Some(selected) = self.branch_navigator {
+                if selected == self.main_branch_id {
+                    &self.main.transcript
+                } else {
+                    self.main_branches
+                        .iter()
+                        .find(|branch| branch.id == selected)
+                        .map_or(&self.main.transcript, |branch| {
+                            &branch.conversation.transcript
+                        })
+                }
+            } else {
+                &self.main.transcript
+            }
+        } else if surface_index == 1 {
+            let Some(btw) = self.btw.as_ref() else {
+                return text;
+            };
+            &btw.conversation.transcript
+        } else {
+            return text;
+        };
+        transcript.semanticize_copy(text)
     }
 
     pub(super) fn advance_smooth_scroll(&mut self) {
@@ -2996,6 +3162,10 @@ mod tests {
         assert!(!app.transcript_selection_active());
 
         app.move_up();
+        assert_eq!(app.cursor, 0);
+        assert!(!app.transcript_selection_active());
+
+        app.move_up();
         assert_eq!(app.input, "first row\nsecond row");
         assert_eq!(
             app.main
@@ -3025,7 +3195,31 @@ mod tests {
         app.move_down();
         assert!(!app.transcript_selection_active());
         assert_eq!(app.input, "first row\nsecond row");
-        assert_eq!(app.cursor, "first row".len());
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn vertical_motion_clamps_to_the_composer_edges_before_opening_history() {
+        let mut app = App::new(".".into());
+        app.main
+            .transcript
+            .push_editable_user("submitted prompt".to_owned(), 1);
+        app.input = "draft".to_owned();
+        app.cursor = app.input.len();
+
+        app.move_up();
+        assert_eq!(app.cursor, 0);
+        assert!(!app.transcript_selection_active());
+
+        app.move_up();
+        assert!(app.transcript_selection_active());
+
+        app.move_down();
+        assert!(!app.transcript_selection_active());
+        assert_eq!(app.cursor, 0);
+
+        app.move_down();
+        assert_eq!(app.cursor, app.input.len());
     }
 
     #[test]
