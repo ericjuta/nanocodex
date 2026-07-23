@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idempotent shutdown reliable.
 - [agent] Preserve safe fork and replay boundaries, including atomic multi-tool
   history, across compaction, cancellation, and reconnects.
+- [service] Treat upstream usage/quota exhaustion (`usage_limit_reached`,
+  `usage_not_included`, `insufficient_quota`, `quota_exceeded`) as retryable so
+  a multi-account proxy such as codex-lb can re-allocate the session to another
+  account on reconnect, ignoring the exhausted account's multi-day reset delay.
 
 ### Features
 

@@ -162,12 +162,25 @@ fn retryable_api_error(event: &str) -> Option<(&'static str, Option<Duration>)> 
             | "websocket_connection_limit_reached",
         ) => "api_server",
         Some("rate_limit_exceeded") => "api_rate_limit",
+        Some(
+            "usage_limit_reached"
+            | "usage_not_included"
+            | "insufficient_quota"
+            | "quota_exceeded",
+        ) => "api_usage_limit",
         _ => return None,
     };
-    let server_delay = error
-        .retry_after
-        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
-        .or_else(|| retry_after_header(&event.headers));
+    // A usage-limit reset describes the exhausted account, not the next one a
+    // multi-account proxy may select on reconnect, so retry promptly instead of
+    // honoring a reset delay that can span days.
+    let server_delay = if class == "api_usage_limit" {
+        None
+    } else {
+        error
+            .retry_after
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+            .or_else(|| retry_after_header(&event.headers))
+    };
     Some((class, server_delay))
 }
 
@@ -269,5 +282,32 @@ mod tests {
         let error = api_error("previous_response_not_found");
         assert!(error.is_checkpoint_missing());
         assert!(!error.is_context_overflow());
+    }
+
+    #[test]
+    fn usage_limit_reached_is_retryable_without_server_delay() {
+        for code in [
+            "usage_limit_reached",
+            "usage_not_included",
+            "insufficient_quota",
+            "quota_exceeded",
+        ] {
+            let error = api_error(code);
+            let advice = error
+                .retry_advice()
+                .unwrap_or_else(|| panic!("{code} should be retryable"));
+            assert_eq!(advice.class, "api_usage_limit");
+            assert!(advice.server_delay.is_none());
+        }
+    }
+
+    #[test]
+    fn usage_limit_ignores_multi_day_reset_delay() {
+        let error = ResponsesError::Api {
+            event: r#"{"type":"error","error":{"code":"usage_limit_reached","message":"m","retry_after":454434.0},"headers":{"Retry-After":"454434"}}"#.to_owned(),
+        };
+        let advice = error.retry_advice().expect("retryable");
+        assert_eq!(advice.class, "api_usage_limit");
+        assert!(advice.server_delay.is_none());
     }
 }
