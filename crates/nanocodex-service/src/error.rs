@@ -163,10 +163,7 @@ fn retryable_api_error(event: &str) -> Option<(&'static str, Option<Duration>)> 
         ) => "api_server",
         Some("rate_limit_exceeded") => "api_rate_limit",
         Some(
-            "usage_limit_reached"
-            | "usage_not_included"
-            | "insufficient_quota"
-            | "quota_exceeded",
+            "usage_limit_reached" | "usage_not_included" | "insufficient_quota" | "quota_exceeded",
         ) => "api_usage_limit",
         _ => return None,
     };
