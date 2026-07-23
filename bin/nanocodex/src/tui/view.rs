@@ -405,12 +405,12 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     let help = if app.btw.is_some() {
         format!(
-            "  Thinking: {} · BackTab switch · Ctrl+V image · /trace inspect · /close dismiss · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
+            "  Thinking: {} · BackTab switch · Ctrl+V image · Ctrl+O copy · /close dismiss · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
             app.thinking,
         )
     } else {
         format!(
-            "  Thinking: {} · /btw <question> side fork · Ctrl+V image · /trace inspect · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
+            "  Thinking: {} · /btw <question> side fork · Ctrl+V image · Ctrl+O copy · Enter send/steer · Tab queue · {escape_help} · Ctrl+C quit",
             app.thinking,
         )
     };
@@ -910,6 +910,7 @@ mod tests {
 
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Thinking: xhigh · /btw <question> side fork"));
+        assert!(rendered.contains("Ctrl+O copy"));
         assert!(rendered.contains("Enter send/steer · Tab queue"));
     }
 }

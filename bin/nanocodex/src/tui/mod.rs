@@ -646,7 +646,7 @@ fn render_due_frame(
     if let Some(text) = ui.app.take_pending_copy()
         && let Err(error) = clipboard::copy_to_clipboard(&text)
     {
-        tracing::warn!(%error, "failed to copy the mouse selection");
+        tracing::warn!(%error, "failed to copy text to the clipboard");
         ui.app
             .set_active_status(format!("Clipboard copy failed: {error}"));
     }
@@ -1666,6 +1666,12 @@ fn handle_key(
         return Ok(TerminalAction::Redraw);
     }
 
+    if matches!(key.code, KeyCode::Char('o' | 'O')) && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.copy_last_assistant_message();
+        return Ok(TerminalAction::Redraw);
+    }
+
     if let Some(action) = handle_inline_historical_editor_key(key, app, commands)? {
         return Ok(action);
     }
@@ -2227,7 +2233,7 @@ mod tests {
         handle_worker_update, paste_clipboard_image, prepare_btw_prompt, restore_before_shutdown,
         session_trace_url, spawn_agent_worker,
     };
-    use crate::tui::app::App;
+    use crate::tui::{app::App, transcript::TranscriptItem};
 
     #[tokio::test]
     async fn tui_restores_terminal_before_awaiting_child_shutdown() -> eyre::Result<()> {
@@ -2896,6 +2902,41 @@ mod tests {
         );
         assert_eq!(app.input, "multiline\ndraft");
         assert_eq!(app.cursor, 4);
+    }
+
+    #[test]
+    fn control_o_queues_the_exact_latest_assistant_message_for_copy() {
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut app = App::new("/workspace".into(), Thinking::Medium);
+        app.input = "preserved draft".to_owned();
+        app.cursor = app.input.len();
+        app.main
+            .transcript
+            .push(TranscriptItem::Assistant("first answer".to_owned()));
+        app.main
+            .transcript
+            .push(TranscriptItem::Reasoning("between answers".to_owned()));
+        app.main.transcript.push(TranscriptItem::Assistant(
+            "## Latest\n\n`exact markdown`".to_owned(),
+        ));
+
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(
+            handle_key(key, &mut app, "main-session", &commands).unwrap(),
+            TerminalAction::Redraw
+        );
+        assert_eq!(
+            app.take_pending_copy().as_deref(),
+            Some("## Latest\n\n`exact markdown`")
+        );
+        assert_eq!(app.main.status, "Copied last assistant message");
+        assert_eq!(app.input, "preserved draft");
+        assert_eq!(app.cursor, app.input.len());
+
+        let mut empty = App::new("/workspace".into(), Thinking::Medium);
+        handle_key(key, &mut empty, "main-session", &commands).unwrap();
+        assert!(empty.take_pending_copy().is_none());
+        assert_eq!(empty.main.status, "No assistant message to copy");
     }
 
     #[test]

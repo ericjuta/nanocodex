@@ -253,6 +253,13 @@ impl Transcript {
             .find_map(|entry| entry.user_message())
     }
 
+    pub(super) fn latest_assistant_message(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| entry.assistant_message())
+    }
+
     pub(super) fn prefix_before(&self, index: usize) -> Self {
         let end = index.min(self.entries.len());
         Self {
@@ -864,6 +871,13 @@ impl TranscriptEntry {
 
     fn user_message(&self) -> Option<&str> {
         self.user_message.as_deref()
+    }
+
+    fn assistant_message(&self) -> Option<&str> {
+        match (&self.kind, &self.content) {
+            (EntryKind::Assistant, EntryContent::Markdown(markdown)) => Some(&markdown.source),
+            _ => None,
+        }
     }
 
     fn height(&self, width: u16) -> usize {

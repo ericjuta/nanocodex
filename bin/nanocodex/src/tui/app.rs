@@ -913,6 +913,7 @@ pub(super) struct App {
     next_input_id: u64,
     cancel_confirmation: Option<CancelConfirmation>,
     screen_selection: ScreenSelection,
+    pending_clipboard_copy: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -961,6 +962,7 @@ impl App {
             next_input_id: 1,
             cancel_confirmation: None,
             screen_selection: ScreenSelection::default(),
+            pending_clipboard_copy: None,
         }
     }
 
@@ -2099,8 +2101,24 @@ impl App {
         self.screen_selection.render(buffer, areas);
     }
 
+    pub(super) fn copy_last_assistant_message(&mut self) {
+        let message = self
+            .active_conversation()
+            .transcript
+            .latest_assistant_message()
+            .map(str::to_owned);
+        if let Some(message) = message {
+            self.pending_clipboard_copy = Some(message);
+            self.set_active_status("Copied last assistant message");
+        } else {
+            self.set_active_status("No assistant message to copy");
+        }
+    }
+
     pub(super) fn take_pending_copy(&mut self) -> Option<String> {
-        self.screen_selection.take_pending_copy()
+        self.pending_clipboard_copy
+            .take()
+            .or_else(|| self.screen_selection.take_pending_copy())
     }
 
     pub(super) fn advance_smooth_scroll(&mut self) {
