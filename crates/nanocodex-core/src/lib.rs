@@ -370,6 +370,9 @@ mod tests {
         assert!(prompt.contains("Use Hashline as the default"));
         assert!(prompt.contains("`hashline__transaction`"));
         assert!(prompt.contains("paths may be absolute"));
+        assert!(prompt.contains("equal deserialized typed semantics"));
+        assert!(prompt.contains("For a routine patch outside it"));
+        assert!(prompt.contains("lexical scoping only"));
         assert!(!prompt.contains("`apply_patch`"));
     }
 

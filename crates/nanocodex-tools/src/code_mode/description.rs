@@ -10,7 +10,7 @@ const EXEC_DESCRIPTION: &str = r#"Run JavaScript code to orchestrate/compose too
 - Nested tools return either an object or a string, based on the description.
 - Node.js globals and modules such as `process`, `require`, and dynamic `import()` are unavailable. Use the provided tools for file-system, process, and network access.
 - For normal UTF-8 file edits, prefer `hashline__read`/`hashline__find_block` plus `hashline__patch`; use `hashline__transaction` for recoverable multi-file batches.
-- Hashline file paths may be absolute or relative to the configured workspace. For transactions outside it, select that directory with `root` and keep mutations relative to that root.
+- Hashline paths may be absolute or relative to the configured workspace. For routine patches outside it, set `root` and keep section and `MV` paths root-relative; this is lexical scoping only. For transactions outside it, set `root` and keep mutations root-relative.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
 - `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
@@ -293,7 +293,7 @@ fn render_literal(value: &Value) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::render_json_schema_to_typescript;
+    use super::{EXEC_DESCRIPTION, render_json_schema_to_typescript};
 
     #[test]
     fn renders_described_object_as_typescript() {
@@ -331,5 +331,12 @@ mod tests {
             render_json_schema_to_typescript(&schema),
             "{ header?: string; operations?: string; patch: string; } | { header: string; operations: string; patch?: string; }"
         );
+    }
+
+    #[test]
+    fn hashline_guidance_covers_routine_patch_roots() {
+        assert!(EXEC_DESCRIPTION.contains("For routine patches outside it"));
+        assert!(EXEC_DESCRIPTION.contains("section and `MV` paths root-relative"));
+        assert!(EXEC_DESCRIPTION.contains("lexical scoping only"));
     }
 }
