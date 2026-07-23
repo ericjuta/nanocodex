@@ -3,8 +3,7 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import WebSocket, { WebSocketServer } from "ws";
 
-import { browser } from "../browser/index.mjs";
-import { Agent } from "../index.mjs";
+import { Agent } from "../browser/index.mjs";
 
 test("web-target WASM runs the shared model loop through the browser host", async () => {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
@@ -16,12 +15,16 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
   const events = [];
   const wasm = await readFile(new URL("../pkg-web/nanocodex_bg.wasm", import.meta.url));
   const endpoint = `ws://127.0.0.1:${server.address().port}`;
-  const engine = browser({
+  const agent = await Agent.create({
+    apiKey: "test-key",
     WebSocketImpl: WebSocket,
     module: wasm,
     websocketUrl: endpoint,
-    onEvent: (event) => events.push(event),
+    thinking: "low",
+    sessionId: "web-session",
   });
+  const watch = agent.events.watch({ includeAllSessions: true });
+  watch.onEvent((event) => events.push(event));
 
   const scenario = (async () => {
     const socket = await connection;
@@ -45,16 +48,11 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
     });
   })();
 
-  const agent = await Agent.create({
-    engine,
-    thinking: "low",
-    sessionId: "web-session",
-  });
-  assert.equal(await agent.turn.prompt("Reply with WEB_WASM_OK.").result(), "WEB_WASM_OK");
+  assert.equal(await agent.turn.prompt({ input: "Reply with WEB_WASM_OK." }).result(), "WEB_WASM_OK");
   await scenario;
 
   const branchConnection = new Promise((resolve) => server.once("connection", resolve));
-  const branch = await agent.fork.latest();
+  const branch = await agent.session.fork();
   assert.notEqual(branch.sessionId, agent.sessionId);
   const branchTurn = branch.turn.prompt({ input: [
     { type: "image", image_url: "data:image/png;base64,iVBORw0KGgo=" },
@@ -83,6 +81,7 @@ test("web-target WASM runs the shared model loop through the browser host", asyn
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(events.filter((event) => event.type === "run.completed").length, 2);
 
+  watch.off();
   branch.dispose();
   agent.dispose();
   for (const socket of server.clients) socket.terminate();

@@ -19,20 +19,27 @@
     }
   },
   "files": [
+    "actions",
     "browser",
     "node",
     "pkg-node",
     "pkg-web",
     "runtime",
+    "internal.mjs",
     "index.d.mts",
     "index.mjs",
+    "types.d.mts",
     "README.md"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs && npm run test:typecheck",
+    "test:typecheck": "tsc -p test/tsconfig.json"
   },
   "dependencies": {
     "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=22.13.0"

@@ -2,8 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
 
-import { Actions } from "../index.mjs";
-import { Agent } from "../node/index.mjs";
+import { Actions, Agent } from "../node/index.mjs";
 
 test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom tools", async () => {
   const server = await startServer();
@@ -14,7 +13,6 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
     thinking: "none",
     reasoningMode: "pro",
     sessionId: "wasm-session",
-    onEvent: (event) => events.push(event),
     tools: {
       multiply: {
         description: "Multiply two integers.",
@@ -28,6 +26,8 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
       },
     },
   });
+  const watch = agent.events.watch();
+  watch.onEvent((event) => events.push(event));
 
   const scenario = (async () => {
     const socket = await server.connection;
@@ -66,15 +66,82 @@ test("Node-hosted WASM preserves follow-ons, cache identity, events, and custom 
   const first = agent.turn.prompt({ input: "Use multiply for 6 × 7." });
   assert.equal(await first.result(), "42");
   const second = Actions.turn.prompt(agent, { input: "Add one to that result." });
-  assert.equal(await Actions.turn.result(second), "43");
+  assert.equal(await Actions.turn.getResult(second), "43");
   await scenario;
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(server.connections, 1);
   assert.equal(events.filter((event) => event.type === "run.completed").length, 2);
   assert.ok(events.some((event) => event.type === "tool.call" && event.payload.tool === "multiply"));
+  watch.off();
   agent.dispose();
   await server.close();
+});
+
+test("independent agents keep their host connections isolated", async () => {
+  const leftServer = await startServer();
+  const rightServer = await startServer();
+  const left = await Agent.create({
+    apiKey: "left-key",
+    websocketUrl: leftServer.url,
+    thinking: "none",
+    sessionId: "left-session",
+    tools: {
+      leftTool: {
+        description: "Only the left agent can see this tool.",
+        parameters: { type: "object" },
+        handler: async () => "left",
+      },
+    },
+  });
+  const right = await Agent.create({
+    apiKey: "right-key",
+    websocketUrl: rightServer.url,
+    thinking: "none",
+    sessionId: "right-session",
+    tools: {
+      rightTool: {
+        description: "Only the right agent can see this tool.",
+        parameters: { type: "object" },
+        handler: async () => "right",
+      },
+    },
+  });
+
+  const leftTools = globalThis.nanocodexHost.toolDefinitions("left-session");
+  const rightTools = globalThis.nanocodexHost.toolDefinitions("right-session");
+  assert.match(leftTools, /leftTool/);
+  assert.doesNotMatch(leftTools, /rightTool/);
+  assert.match(rightTools, /rightTool/);
+  assert.doesNotMatch(rightTools, /leftTool/);
+
+  const serve = async (server, sessionId, message) => {
+    const socket = await server.connection;
+    assert.equal(socket.request.headers["session-id"], sessionId);
+    const reader = messageReader(socket);
+    await reader.next();
+    sendWarmup(socket, `${sessionId}-warmup`);
+    await reader.next();
+    sendFinal(socket, `${sessionId}-final`, message);
+  };
+  const scenarios = Promise.all([
+    serve(leftServer, "left-session", "LEFT"),
+    serve(rightServer, "right-session", "RIGHT"),
+  ]);
+
+  // Prompt the first agent only after the second factory has installed its
+  // host. This regresses the old realm-global host overwrite.
+  const [leftResult, rightResult] = await Promise.all([
+    left.turn.prompt({ input: "left" }).result(),
+    right.turn.prompt({ input: "right" }).result(),
+  ]);
+  assert.equal(leftResult, "LEFT");
+  assert.equal(rightResult, "RIGHT");
+  await scenarios;
+
+  left.dispose();
+  right.dispose();
+  await Promise.all([leftServer.close(), rightServer.close()]);
 });
 
 async function startServer() {
