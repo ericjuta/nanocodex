@@ -4,21 +4,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cljrs_gc::GcPtr;
-use cljrs_value::{CljxFuture, FutureState};
-use tokio::task::JoinHandle;
+use cljrs_value::CljxFuture;
+
+use crate::cancel;
 
 thread_local! {
     static ACTIVE_SCOPES: RefCell<Vec<Rc<ScopeInner>>> = const { RefCell::new(Vec::new()) };
 }
 
-struct ScopedTask {
-    future: GcPtr<CljxFuture>,
-    handle: JoinHandle<()>,
-}
-
 #[derive(Default)]
 struct ScopeInner {
-    tasks: RefCell<Vec<ScopedTask>>,
+    futures: RefCell<Vec<GcPtr<CljxFuture>>>,
 }
 
 /// Owns every local task spawned while a Code Mode cell is evaluating.
@@ -42,34 +38,17 @@ impl FutureTaskScope {
     }
 
     pub fn cancel_all(&self) {
-        for task in self.inner.tasks.borrow().iter() {
-            {
-                let mut state = task
-                    .future
-                    .get()
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if matches!(*state, FutureState::Running) {
-                    *state = FutureState::Cancelled;
-                }
-            }
-            task.future.get().cond.notify_all();
-            task.handle.abort();
+        let futures = self.inner.futures.borrow().clone();
+        for future in futures {
+            cancel::cancel_future(&future);
         }
     }
 
     pub async fn join_all(&self) {
-        let handles = self
-            .inner
-            .tasks
-            .borrow_mut()
-            .drain(..)
-            .map(|task| task.handle)
-            .collect::<Vec<_>>();
-        for handle in handles {
-            let _ = handle.await;
-        }
+        // Cancellation aborts JoinHandles; give the LocalSet a chance to drop
+        // aborted tasks before the next cell starts.
+        tokio::task::yield_now().await;
+        self.inner.futures.borrow_mut().clear();
     }
 }
 
@@ -83,11 +62,11 @@ impl Drop for FutureTaskScopeGuard {
     }
 }
 
-pub(crate) fn register(future: GcPtr<CljxFuture>, handle: JoinHandle<()>) {
+pub(crate) fn register(future: GcPtr<CljxFuture>) {
     ACTIVE_SCOPES.with(|scopes| {
         let Some(scope) = scopes.borrow().last().cloned() else {
             return;
         };
-        scope.tasks.borrow_mut().push(ScopedTask { future, handle });
+        scope.futures.borrow_mut().push(future);
     });
 }

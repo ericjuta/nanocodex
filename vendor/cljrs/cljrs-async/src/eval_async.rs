@@ -1,12 +1,11 @@
 //! Asynchronous tree-walking evaluation for `^:async` function bodies.
 //!
-//! [`eval_async`] mirrors the synchronous [`cljrs_interp::eval::eval`] for the
-//! handful of forms where an `await` can legitimately appear — `await` itself,
-//! `do`, `if`, `let`/`let*`, and function-call arguments — and delegates every
-//! other form to the synchronous evaluator. When it reaches an `(await x)` it
-//! cooperatively yields to the Tokio `LocalSet` executor until the awaited
-//! `Future`/`Promise` resolves, instead of blocking the OS thread the way the
-//! sync `await` fallback does.
+//! [`eval_async`] yields at every `(await …)` and at every subtree that may
+//! contain one: control specials (`do`/`if`/`let`/`loop`/`try`/`binding`/
+//! `and`/`or`/`letfn`/`with-out-str`), collection literals, ordinary call
+//! arguments, and form-intercepted natives (`apply`, `swap!`, …). Sync-only
+//! specials that cannot safely contain `await` reject it with a located
+//! diagnostic instead of blocking the `LocalSet`.
 //!
 //! Forms that the sync evaluator macro-expands (`when`, `cond`, `->`, …) are
 //! expanded here first via [`cljrs_interp::macros::macroexpand`] so their
@@ -17,12 +16,18 @@
     reason = "EvalResult is the public cljrs async evaluator contract"
 )]
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 
 use cljrs_env::env::Env;
 use cljrs_env::error::{EvalError, EvalResult};
 use cljrs_gc::GcPtr;
-use cljrs_interp::apply::{bind_fn_params, select_arity};
+use cljrs_interp::apply::{
+    bind_fn_params, eval_alter_var_root, eval_reset_bang, eval_send_to_agent, eval_swap_bang,
+    eval_vary_meta, eval_volatile, eval_vreset_bang, eval_vswap_bang, eval_with_bindings_star,
+    make_delay_from_fn, make_lazy_seq_from_fn, select_arity,
+};
 use cljrs_interp::destructure::{bind_pattern, value_to_seq_vec};
 use cljrs_interp::eval::{eval, is_special_form};
 use cljrs_interp::macros::macroexpand;
@@ -30,7 +35,8 @@ use cljrs_reader::Form;
 use cljrs_reader::form::FormKind;
 use cljrs_value::value::SetValue;
 use cljrs_value::{
-    CljxFnArity, CljxFuture, FutureState, MapValue, PersistentHashSet, PersistentVector, Value,
+    Atom, BoundFn, CljxFnArity, CljxFuture, FutureState, MapValue, PersistentHashSet,
+    PersistentList, PersistentVector, Symbol, Value, Var,
 };
 
 /// Spawn `task` on the current `LocalSet` and return a `Value::Future` that the
@@ -70,13 +76,20 @@ where
         .await;
         settle_future(&task_future, result);
     });
-    crate::task_scope::register(future.clone(), handle);
+    crate::cancel::register_task(future.clone(), handle);
+    crate::task_scope::register(future.clone());
     Value::Future(future)
 }
 
 /// Write a completed result into a future and wake blocking `deref` waiters.
+/// The first terminal state wins; a racing cancel leaves the future cancelled.
 pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
     let mut state = future.get().state.lock().unwrap();
+    if !matches!(*state, FutureState::Running) {
+        drop(state);
+        crate::cancel::clear(future);
+        return;
+    }
     *state = match result {
         Ok(v) => FutureState::Done(v),
         // Preserve the thrown value (and any non-Thrown error as a fresh
@@ -86,6 +99,7 @@ pub(crate) fn settle_future(future: &GcPtr<CljxFuture>, result: EvalResult) {
     };
     drop(state);
     future.get().cond.notify_all();
+    crate::cancel::clear(future);
 }
 
 /// Run the body of an `^:async` function to completion, yielding at every
@@ -205,17 +219,25 @@ pub async fn eval_async(form: &Form, env: &mut Env) -> EvalResult {
             "do" => return eval_body_async(&forms[1..], env).await,
             "if" => return eval_if_async(&forms[1..], env).await,
             "let*" | "let" => return eval_let_async(&forms[1..], env).await,
-            // loop/loop* needs an async handler so that `await` inside the body
-            // yields correctly instead of falling back to blocking deref.
             "loop*" | "loop" => return eval_loop_async(&forms[1..], env).await,
-            // try/catch/finally must yield so `await`/`<?` inside the body (and
-            // inside catch bodies) cooperate with the executor instead of taking
-            // the blocking sync path.
             "try" => return eval_try_async(&forms[1..], env).await,
-            // Other special forms (binding/…) don't yield yet: run them
-            // synchronously. A `recur` that targets the enclosing async fn
-            // surfaces as `EvalError::Recur` and is caught by `run_async_fn`.
-            other if is_special_form(other) => return eval(&expanded, env),
+            "binding" => return eval_binding_async(&forms[1..], env).await,
+            "and" => return eval_and_async(&forms[1..], env).await,
+            "or" => return eval_or_async(&forms[1..], env).await,
+            "letfn" => return eval_letfn_async(&forms[1..], env).await,
+            "with-out-str" => return eval_with_out_str_async(&forms[1..], env).await,
+            // Definition forms that only *capture* bodies (`fn`/`defn`/…) may
+            // contain `await` textually without evaluating it. Sync-eval those.
+            // Forms that evaluate their arguments/body now must reject await
+            // rather than block the LocalSet on the sync condvar path.
+            other if is_special_form(other) => {
+                if !special_form_defers_body(other) && form_contains_await(&expanded) {
+                    return Err(EvalError::Runtime(format!(
+                        "await is not allowed inside special form `{other}`"
+                    )));
+                }
+                return eval(&expanded, env);
+            }
             _ => {}
         }
         return eval_call_async(&forms[0], &forms[1..], &expanded, env).await;
@@ -462,18 +484,30 @@ async fn eval_loop_async(args: &[Form], env: &mut Env) -> EvalResult {
 /// A function call whose arguments may contain `await`s. Arguments are
 /// evaluated with [`eval_async`] (so awaits yield), then the callee is applied.
 ///
-/// Calls whose head resolves to a form-intercepted native fn (`apply`, `swap!`,
-/// …) are delegated wholesale to the synchronous evaluator, which performs the
-/// special spreading/atom handling those builtins require. Such calls do not
-/// yield on awaits inside their arguments in Phase B.
+/// Form-intercepted natives (`apply`, `swap!`, …) evaluate arguments on the
+/// async path, then dispatch through value-level handlers that preserve their
+/// spreading/atom/dynamic-binding semantics.
 async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env) -> EvalResult {
     let callee = eval(head, env)?;
     match &callee {
         Value::NativeFunction(nf) if is_form_intercepted(&nf.get().name) => {
-            return eval(whole, env);
+            let name = nf.get().name.clone();
+            let mut argv: Vec<Value> = Vec::with_capacity(args.len());
+            for a in args {
+                let _args_root = cljrs_env::gc_roots::root_values(&argv);
+                argv.push(Box::pin(eval_async(a, env)).await?);
+            }
+            return dispatch_intercepted(&name, argv, env);
         }
         // A macro head should have been expanded already, but guard regardless.
-        Value::Macro(_) => return eval(whole, env),
+        Value::Macro(_) => {
+            if form_contains_await(whole) {
+                // Re-expand after async-capable evaluation of the expanded form.
+                let expanded = macroexpand(whole, env)?;
+                return Box::pin(eval_async(&expanded, env)).await;
+            }
+            return eval(whole, env);
+        }
         _ => {}
     }
 
@@ -486,9 +520,7 @@ async fn eval_call_async(head: &Form, args: &[Form], whole: &Form, env: &mut Env
     cljrs_env::apply::apply_value(&callee, argv, env)
 }
 
-/// Native functions that `cljrs_interp::eval_call` intercepts at the form level
-/// (they require unevaluated forms or env access) and that therefore cannot be
-/// driven through `apply_value` with pre-evaluated arguments.
+/// Native functions that `cljrs_interp::eval_call` intercepts at the form level.
 fn is_form_intercepted(name: &str) -> bool {
     matches!(
         name,
@@ -523,6 +555,597 @@ fn is_form_intercepted(name: &str) -> bool {
             | "intern"
             | "bound-fn*"
     )
+}
+
+fn dispatch_intercepted(name: &str, args: Vec<Value>, env: &mut Env) -> EvalResult {
+    match name {
+        "apply" => eval_apply_values(args, env),
+        "atom" => eval_atom_values(args, env),
+        "reset!" => eval_reset_bang(args, env),
+        "swap!" => eval_swap_bang(args, env),
+        "volatile!" => eval_volatile(args),
+        "vreset!" => eval_vreset_bang(args),
+        "vswap!" => eval_vswap_bang(args, env),
+        "agent" => Err(EvalError::Runtime("agent is not yet implemented".into())),
+        "make-lazy-seq" => {
+            let Some(f) = args.first() else {
+                return Err(EvalError::Arity {
+                    name: "make-lazy-seq".into(),
+                    expected: "1".into(),
+                    got: 0,
+                });
+            };
+            make_lazy_seq_from_fn(f, env.globals.clone(), env.current_ns.clone())
+        }
+        "make-delay" => {
+            let Some(f) = args.first() else {
+                return Err(EvalError::Arity {
+                    name: "make-delay".into(),
+                    expected: "1".into(),
+                    got: 0,
+                });
+            };
+            make_delay_from_fn(f, env.globals.clone(), env.current_ns.clone())
+        }
+        "send" | "send-off" => eval_send_to_agent(args, env),
+        "with-bindings*" => eval_with_bindings_star(args, env),
+        "alter-var-root" => eval_alter_var_root(args, env),
+        "vary-meta" => eval_vary_meta(args, env),
+        "find-ns" | "the-ns" => eval_find_ns_values(args, env),
+        "ns-interns" | "ns-publics" => eval_ns_interns_values(args, env),
+        "ns-refers" => eval_ns_refers_values(args, env),
+        "ns-map" => eval_ns_map_values(args, env),
+        "all-ns" => eval_all_ns_values(env),
+        "create-ns" => eval_create_ns_values(args, env),
+        "ns-aliases" => eval_ns_aliases_values(args, env),
+        "remove-ns" => eval_remove_ns_values(args, env),
+        "alter-meta!" => eval_alter_meta_values(args, env),
+        "ns-resolve" => eval_ns_resolve_values(args, env),
+        "resolve" => eval_resolve_values(args, env),
+        "intern" => eval_intern_values(args, env),
+        "bound-fn*" => eval_bound_fn_star_values(args),
+        other => Err(EvalError::Runtime(format!(
+            "async interceptor missing handler for `{other}`"
+        ))),
+    }
+}
+
+/// `(binding [sym val …] body…)` with yielding inits and body.
+async fn eval_binding_async(args: &[Form], env: &mut Env) -> EvalResult {
+    let pairs = match args.first().map(|f| &f.kind) {
+        Some(FormKind::Vector(v)) => v.clone(),
+        _ => return Err(EvalError::Runtime("binding requires a vector".into())),
+    };
+    if pairs.len() % 2 != 0 {
+        return Err(EvalError::Runtime(
+            "binding vector must have even count".into(),
+        ));
+    }
+
+    let mut frame: HashMap<usize, Value> = HashMap::new();
+    for pair in pairs.chunks(2) {
+        let sym_str = match &pair[0].kind {
+            FormKind::Symbol(s) => s.clone(),
+            _ => return Err(EvalError::Runtime("binding targets must be symbols".into())),
+        };
+        let parsed = Symbol::parse(&sym_str);
+        let ns_part: Arc<str> = match parsed.namespace.as_deref() {
+            Some(ns_part) => env
+                .globals
+                .resolve_alias(&env.current_ns, ns_part)
+                .unwrap_or_else(|| Arc::from(ns_part)),
+            None => env.current_ns.clone(),
+        };
+        let var_ptr = env
+            .globals
+            .lookup_var_in_ns(&ns_part, &parsed.name)
+            .ok_or_else(|| EvalError::UnboundSymbol(sym_str.clone()))?;
+        let val = Box::pin(eval_async(&pair[1], env)).await?;
+        frame.insert(cljrs_env::dynamics::var_key_of(&var_ptr), val);
+    }
+
+    let _guard = cljrs_env::dynamics::push_frame(frame);
+    eval_body_async(&args[1..], env).await
+}
+
+async fn eval_and_async(args: &[Form], env: &mut Env) -> EvalResult {
+    let mut result = Value::Bool(true);
+    for form in args {
+        result = Box::pin(eval_async(form, env)).await?;
+        if matches!(result, Value::Nil | Value::Bool(false)) {
+            return Ok(result);
+        }
+    }
+    Ok(result)
+}
+
+async fn eval_or_async(args: &[Form], env: &mut Env) -> EvalResult {
+    let mut last = Value::Nil;
+    for form in args {
+        last = Box::pin(eval_async(form, env)).await?;
+        if !matches!(last, Value::Nil | Value::Bool(false)) {
+            return Ok(last);
+        }
+    }
+    Ok(last)
+}
+
+/// `letfn` builds fn values synchronously (bodies are not executed), then
+/// evaluates the body with yielding.
+async fn eval_letfn_async(args: &[Form], env: &mut Env) -> EvalResult {
+    let bindings = match args.first().map(|f| &f.kind) {
+        Some(FormKind::Vector(v)) => v.clone(),
+        _ => return Err(EvalError::Runtime("letfn requires a binding vector".into())),
+    };
+
+    env.push_frame();
+    for binding in &bindings {
+        let FormKind::List(parts) = &binding.kind else {
+            continue;
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        let mut fn_forms = vec![Form::new(
+            FormKind::Symbol("fn".to_string()),
+            binding.span.clone(),
+        )];
+        fn_forms.extend(parts.iter().cloned());
+        let fn_form = Form::new(FormKind::List(fn_forms), binding.span.clone());
+        let fn_val = match eval(&fn_form, env) {
+            Ok(v) => v,
+            Err(e) => {
+                env.pop_frame();
+                return Err(e);
+            }
+        };
+        let name = match &parts[0].kind {
+            FormKind::Symbol(s) => s.clone(),
+            _ => {
+                env.pop_frame();
+                return Err(EvalError::Runtime(
+                    "letfn binding name must be a symbol".into(),
+                ));
+            }
+        };
+        env.bind(Arc::from(name.as_str()), fn_val);
+    }
+
+    let result = eval_body_async(&args[1..], env).await;
+    env.pop_frame();
+    result
+}
+
+async fn eval_with_out_str_async(body: &[Form], env: &mut Env) -> EvalResult {
+    cljrs_builtins::builtins::push_output_capture();
+    let result = eval_body_async(body, env).await;
+    let captured = cljrs_builtins::builtins::pop_output_capture().unwrap_or_default();
+    result?;
+    Ok(Value::string(captured))
+}
+
+/// Special forms whose nested forms are captured, not evaluated, at this call.
+fn special_form_defers_body(name: &str) -> bool {
+    matches!(
+        name,
+        "fn" | "fn*" | "defn" | "defn-" | "defmacro" | "quote" | "var"
+    )
+}
+
+fn form_contains_await(form: &Form) -> bool {
+    match &form.kind {
+        FormKind::List(forms) => {
+            if matches!(forms.first().map(|f| &f.kind), Some(FormKind::Symbol(s)) if s == "await") {
+                return true;
+            }
+            forms.iter().any(form_contains_await)
+        }
+        FormKind::Vector(forms)
+        | FormKind::Map(forms)
+        | FormKind::Set(forms)
+        | FormKind::AnonFn(forms) => forms.iter().any(form_contains_await),
+        FormKind::Quote(inner)
+        | FormKind::SyntaxQuote(inner)
+        | FormKind::Unquote(inner)
+        | FormKind::UnquoteSplice(inner)
+        | FormKind::Deref(inner)
+        | FormKind::Var(inner)
+        | FormKind::TaggedLiteral(_, inner) => form_contains_await(inner),
+        FormKind::Meta(a, b) => form_contains_await(a) || form_contains_await(b),
+        FormKind::ReaderCond { clauses, .. } => clauses.iter().any(form_contains_await),
+        _ => false,
+    }
+}
+
+fn eval_apply_values(mut evaled: Vec<Value>, env: &mut Env) -> EvalResult {
+    if evaled.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "apply".into(),
+            expected: "2+".into(),
+            got: evaled.len(),
+        });
+    }
+    let f = evaled.remove(0);
+    let last = evaled.pop().unwrap();
+    let _f_root = cljrs_env::gc_roots::root_value(&f);
+    let _last_root = cljrs_env::gc_roots::root_value(&last);
+    let _evaled_root = cljrs_env::gc_roots::root_values(&evaled);
+    evaled.extend(value_to_seq_vec(&last));
+    cljrs_env::apply::apply_value(&f, evaled, env)
+}
+
+fn eval_atom_values(args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "atom".into(),
+            expected: "1+".into(),
+            got: 0,
+        });
+    }
+    let initial = args[0].clone();
+    let options = &args[1..];
+    let mut meta_opt: Option<Value> = None;
+    let mut validator_opt: Option<Value> = None;
+    let mut i = 0;
+    while i + 1 < options.len() {
+        match &options[i] {
+            Value::Keyword(k) if k.get().name.as_ref() == "meta" => {
+                meta_opt = Some(options[i + 1].clone());
+                i += 2;
+            }
+            Value::Keyword(k) if k.get().name.as_ref() == "validator" => {
+                let vf = options[i + 1].clone();
+                validator_opt = if vf == Value::Nil { None } else { Some(vf) };
+                i += 2;
+            }
+            _ => {
+                i += 2;
+            }
+        }
+    }
+    if let Some(ref m) = meta_opt
+        && !matches!(m, Value::Nil | Value::Map(_))
+    {
+        return Err(EvalError::Thrown(Value::string(
+            "Atom metadata must be a map or nil".to_string(),
+        )));
+    }
+    if let Some(ref vf) = validator_opt {
+        let result = cljrs_env::apply::apply_value(vf, vec![initial.clone()], env)?;
+        if result == Value::Nil || result == Value::Bool(false) {
+            return Err(EvalError::Thrown(Value::string(
+                "Invalid initial value for atom".to_string(),
+            )));
+        }
+    }
+    let atom = GcPtr::new(Atom::new(initial));
+    if let Some(m) = meta_opt {
+        atom.get()
+            .set_meta(if m == Value::Nil { None } else { Some(m) });
+    }
+    if let Some(vf) = validator_opt {
+        atom.get().set_validator(Some(vf));
+    }
+    Ok(Value::Atom(atom))
+}
+
+fn ns_name_from_val(v: &Value) -> Result<String, EvalError> {
+    match v {
+        Value::Symbol(s) => Ok(s.get().name.as_ref().to_string()),
+        Value::Str(s) => Ok(s.get().clone()),
+        Value::Namespace(ns) => Ok(ns.get().name.as_ref().to_string()),
+        Value::Keyword(k) => Ok(k.get().name.as_ref().to_string()),
+        other => Err(EvalError::Runtime(format!(
+            "expected symbol, string, or namespace, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn the_ns_value(v: &Value, env: &Env) -> Result<GcPtr<cljrs_value::Namespace>, EvalError> {
+    if let Value::Namespace(ns) = v {
+        return Ok(ns.clone());
+    }
+    let name = ns_name_from_val(v)?;
+    let map = env.globals.namespaces.read().unwrap();
+    match map.get(name.as_str()) {
+        Some(ns) => Ok(ns.clone()),
+        None => Err(EvalError::Runtime(format!("No namespace: {name} found"))),
+    }
+}
+
+fn eval_find_ns_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "find-ns".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let name = ns_name_from_val(&args[0])?;
+    let map = env.globals.namespaces.read().unwrap();
+    match map.get(name.as_str()) {
+        Some(ns) => Ok(Value::Namespace(ns.clone())),
+        None => Ok(Value::Nil),
+    }
+}
+
+fn eval_ns_interns_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "ns-interns".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let ns = the_ns_value(&args[0], env)?;
+    cljrs_builtins::builtins::builtin_ns_interns(&[Value::Namespace(ns)])
+        .map_err(cljrs_env::error::value_error_to_eval_error)
+}
+
+fn eval_ns_refers_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "ns-refers".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let ns = the_ns_value(&args[0], env)?;
+    cljrs_builtins::builtins::builtin_ns_refers(&[Value::Namespace(ns)])
+        .map_err(cljrs_env::error::value_error_to_eval_error)
+}
+
+fn eval_ns_map_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "ns-map".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let ns = the_ns_value(&args[0], env)?;
+    cljrs_builtins::builtins::builtin_ns_map(&[Value::Namespace(ns)])
+        .map_err(cljrs_env::error::value_error_to_eval_error)
+}
+
+fn eval_all_ns_values(env: &Env) -> EvalResult {
+    let map = env.globals.namespaces.read().unwrap();
+    let items: Vec<Value> = map
+        .values()
+        .map(|ns| Value::Namespace(ns.clone()))
+        .collect();
+    drop(map);
+    Ok(Value::List(GcPtr::new(PersistentList::from_iter(items))))
+}
+
+fn eval_create_ns_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "create-ns".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let name = ns_name_from_val(&args[0])?;
+    Ok(Value::Namespace(env.globals.get_or_create_ns(&name)))
+}
+
+fn eval_ns_aliases_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "ns-aliases".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let ns_name = ns_name_from_val(&args[0])?;
+    let map = env.globals.namespaces.read().unwrap();
+    let Some(ns) = map.get(ns_name.as_str()).cloned() else {
+        return Ok(Value::Map(MapValue::empty()));
+    };
+    let aliases = ns.get().aliases.lock().unwrap().clone();
+    drop(map);
+    let mut m = MapValue::empty();
+    for (alias, full_ns_name) in &aliases {
+        let sym = Value::symbol(Symbol::simple(alias.clone()));
+        let nsmap = env.globals.namespaces.read().unwrap();
+        if let Some(target_ns) = nsmap.get(full_ns_name.as_ref()) {
+            m = m.assoc(sym, Value::Namespace(target_ns.clone()));
+        }
+    }
+    Ok(Value::Map(m))
+}
+
+fn eval_remove_ns_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.is_empty() {
+        return Err(EvalError::Arity {
+            name: "remove-ns".into(),
+            expected: "1".into(),
+            got: 0,
+        });
+    }
+    let name = ns_name_from_val(&args[0])?;
+    env.globals
+        .namespaces
+        .write()
+        .unwrap()
+        .remove(name.as_str());
+    Ok(Value::Nil)
+}
+
+fn eval_alter_meta_values(mut args: Vec<Value>, env: &mut Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "alter-meta!".into(),
+            expected: "2+".into(),
+            got: args.len(),
+        });
+    }
+    let obj = args.remove(0);
+    let f = args.remove(0);
+    let current_meta = match &obj {
+        Value::Var(vp) => vp.get().get_meta().unwrap_or(Value::Map(MapValue::empty())),
+        _ => Value::Map(MapValue::empty()),
+    };
+    let mut call_args = vec![current_meta];
+    call_args.extend(args);
+    let new_meta = cljrs_env::apply::apply_value(&f, call_args, env)?;
+    if let Value::Var(vp) = &obj {
+        vp.get().set_meta(new_meta.clone());
+    }
+    Ok(new_meta)
+}
+
+fn eval_ns_resolve_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.len() < 2 {
+        return Err(EvalError::Arity {
+            name: "ns-resolve".into(),
+            expected: "2".into(),
+            got: args.len(),
+        });
+    }
+    let ns_name = ns_name_from_val(&args[0])?;
+    let sym_name = match &args[1] {
+        Value::Symbol(s) => s.get().name.as_ref().to_string(),
+        Value::Str(s) => s.get().clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "ns-resolve: second arg must be symbol or string, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    Ok(match env.globals.lookup_var(&ns_name, &sym_name) {
+        Some(var_ptr) => Value::Var(var_ptr),
+        None => Value::Nil,
+    })
+}
+
+fn resolve_current_ns(env: &Env) -> Arc<str> {
+    if let Some(var) = env.globals.lookup_var("clojure.core", "*ns*") {
+        let val = cljrs_env::dynamics::deref_var(&var);
+        if let Some(Value::Namespace(ns_ptr)) = val {
+            return ns_ptr.get().name.clone();
+        }
+    }
+    env.current_ns.clone()
+}
+
+fn eval_resolve_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if args.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "resolve".into(),
+            expected: "1".into(),
+            got: args.len(),
+        });
+    }
+    let resolve_ns = resolve_current_ns(env);
+    match &args[0] {
+        Value::Symbol(s) => {
+            let sym = s.get();
+            if let Some(ns) = &sym.namespace {
+                let full_ns = env
+                    .globals
+                    .resolve_alias(&resolve_ns, ns.as_ref())
+                    .unwrap_or_else(|| ns.clone());
+                return Ok(
+                    match env.globals.lookup_var_in_ns(&full_ns, sym.name.as_ref()) {
+                        Some(var_ptr) => Value::Var(var_ptr),
+                        None => Value::Nil,
+                    },
+                );
+            }
+            Ok(
+                match env.globals.lookup_var_in_ns(&resolve_ns, sym.name.as_ref()) {
+                    Some(var_ptr) => Value::Var(var_ptr),
+                    None => Value::Nil,
+                },
+            )
+        }
+        Value::Str(s) => Ok(
+            match env.globals.lookup_var_in_ns(&resolve_ns, s.get().as_str()) {
+                Some(var_ptr) => Value::Var(var_ptr),
+                None => Value::Nil,
+            },
+        ),
+        other => Err(EvalError::Runtime(format!(
+            "resolve: arg must be symbol or string, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn eval_intern_values(args: Vec<Value>, env: &Env) -> EvalResult {
+    if !(2..=3).contains(&args.len()) {
+        return Err(EvalError::Runtime("intern expects 2 or 3 arguments".into()));
+    }
+    let ns_name: Arc<str> = match &args[0] {
+        Value::Symbol(s) => s.get().name.clone(),
+        Value::Namespace(ns) => ns.get().name.clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "intern: first arg must be namespace or symbol, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let var_name: Arc<str> = match &args[1] {
+        Value::Symbol(s) => s.get().name.clone(),
+        other => {
+            return Err(EvalError::Runtime(format!(
+                "intern: second arg must be symbol, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let ns = {
+        let map = env.globals.namespaces.read().unwrap();
+        map.get(ns_name.as_ref()).cloned()
+    };
+    let ns = ns.ok_or_else(|| EvalError::Runtime(format!("No namespace: {ns_name} found")))?;
+    let var = if args.len() == 3 {
+        let val = args[2].clone();
+        let mut interns = ns.get().interns.lock().unwrap();
+        if let Some(var) = interns.get(&var_name) {
+            var.get().bind(val);
+            var.clone()
+        } else {
+            let var = GcPtr::new(Var::new(ns_name.clone(), var_name.clone()));
+            var.get().bind(val);
+            interns.insert(var_name, var.clone());
+            var
+        }
+    } else {
+        let mut interns = ns.get().interns.lock().unwrap();
+        if let Some(var) = interns.get(&var_name) {
+            var.clone()
+        } else {
+            let var = GcPtr::new(Var::new(ns_name.clone(), var_name.clone()));
+            interns.insert(var_name, var.clone());
+            var
+        }
+    };
+    Ok(Value::Var(var))
+}
+
+fn eval_bound_fn_star_values(args: Vec<Value>) -> EvalResult {
+    if args.len() != 1 {
+        return Err(EvalError::Arity {
+            name: "bound-fn*".into(),
+            expected: "1".into(),
+            got: args.len(),
+        });
+    }
+    let frames = cljrs_env::dynamics::capture_current();
+    let mut merged = HashMap::new();
+    for frame in &frames {
+        merged.extend(frame.iter().map(|(k, v)| (*k, v.clone())));
+    }
+    Ok(Value::BoundFn(GcPtr::new(BoundFn {
+        wrapped: args[0].clone(),
+        captured_bindings: merged,
+    })))
 }
 
 /// Flatten `recur` arguments for a variadic arity so the rest collection is

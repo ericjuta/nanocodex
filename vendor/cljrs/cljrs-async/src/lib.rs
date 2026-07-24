@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 mod builtins;
+pub mod cancel;
 pub mod channel;
 pub mod eval_async;
 pub mod isolate;
@@ -31,6 +32,7 @@ use runtime::AsyncRuntimeImpl;
 // Re-exported so sibling native crates (e.g. `cljrs-io`) can spawn work onto the
 // shared `LocalSet` executor and await Clojure futures/promises without reaching
 // into private modules.
+pub use cancel::{cancel_future, set_cancel_hook};
 pub use eval_async::{await_value, spawn_future};
 
 /// Clojure-level `clojure.core.async` definitions (the `alt` macro), evaluated

@@ -896,3 +896,149 @@ fn put_blocking_errors_inside_async_fn() {
         );
     });
 }
+
+// ── Phase 4.1: await-position conformance matrix ─────────────────────────────
+
+#[test]
+fn await_inside_binding_yields() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(def ^:dynamic *x* 0)", &mut env);
+        eval_sync("(defn ^:async plus1 [x] (+ x 1))", &mut env);
+        let r = eval_async(
+            &parse_one("(await (binding [*x* (await (plus1 40))] (+ *x* 1)))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Value::Long(42));
+    });
+}
+
+#[test]
+fn await_inside_and_or_short_circuits() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(defn ^:async t [] :ok)", &mut env);
+        let and_r = eval_async(&parse_one("(await (and true (await (t))))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(and_r, Value::keyword(cljrs_value::Keyword::simple("ok")));
+        let or_r = eval_async(&parse_one("(await (or false (await (t))))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(or_r, Value::keyword(cljrs_value::Keyword::simple("ok")));
+    });
+}
+
+#[test]
+fn await_inside_apply_and_swap_yields() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(defn ^:async one [] 1)", &mut env);
+        eval_sync("(def a (atom 10))", &mut env);
+        let apply_r = eval_async(
+            &parse_one("(await (apply + [(await (one)) 2 3]))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(apply_r, Value::Long(6));
+        let swap_r = eval_async(&parse_one("(await (swap! a + (await (one))))"), &mut env)
+            .await
+            .unwrap();
+        assert_eq!(swap_r, Value::Long(11));
+    });
+}
+
+#[test]
+fn await_inside_letfn_body_yields() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(defn ^:async plus1 [x] (+ x 1))", &mut env);
+        let r = eval_async(
+            &parse_one("(await (letfn [(add1 [x] (+ x 1))] (await (plus1 (add1 40)))))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Value::Long(42));
+    });
+}
+
+#[test]
+fn await_inside_collection_literals_yields() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(defn ^:async v [x] x)", &mut env);
+        let r = eval_async(
+            &parse_one("(await [(await (v 1)) {:k (await (v 2))} #{(await (v 3))}])"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(pr(&r), "[1 {:k 2} #{3}]");
+    });
+}
+
+#[test]
+fn await_rejected_inside_def_value() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync("(defn ^:async one [] 1)", &mut env);
+        let err = eval_async(
+            &parse_one("(await (do (def bad (await (one))) bad))"),
+            &mut env,
+        )
+        .await
+        .expect_err("def must reject await");
+        assert!(
+            format!("{err:?}").contains("await is not allowed"),
+            "unexpected error: {err:?}"
+        );
+    });
+}
+
+#[test]
+fn await_position_watchdog_does_not_block_localset() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals.clone(), "user");
+        eval_sync(REQUIRE_ASYNC, &mut env);
+        eval_sync(
+            "(defn ^:async slow [] (await (timeout 50)) :done)",
+            &mut env,
+        );
+        let started = std::time::Instant::now();
+        let form = parse_one("(await (slow))");
+        let work = eval_async(&form, &mut env);
+        let watchdog = async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            true
+        };
+        tokio::pin!(work);
+        tokio::pin!(watchdog);
+        let mut saw_watchdog = false;
+        loop {
+            tokio::select! {
+                biased;
+                flag = &mut watchdog, if !saw_watchdog => {
+                    saw_watchdog = flag;
+                }
+                result = &mut work => {
+                    assert_eq!(result.unwrap(), Value::keyword(cljrs_value::Keyword::simple("done")));
+                    break;
+                }
+            }
+        }
+        assert!(saw_watchdog, "LocalSet must stay responsive while awaiting");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(40));
+    });
+}
+
