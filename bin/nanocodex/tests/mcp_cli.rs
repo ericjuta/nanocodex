@@ -95,9 +95,10 @@ async fn serve_responses(listener: TcpListener) -> Result<()> {
                 "call_id": format!("call-exec-{turn}"),
                 "name": "exec",
                 "input": format!(
-                    "const found = await tools.tool_search({{query: \"echo message\"}}); \
-                     const called = await tools[found.tools[0].name]({{message: \"turn-{turn}\"}}); \
-                     text(called);"
+                    "(let [found (await (nanocodex.tools/call \"tool_search\" {{:query \"echo message\"}})) \
+                     remote (:name (first (:tools found))) \
+                     called (await (nanocodex.tools/call remote {{:message \"turn-{turn}\"}}))] \
+                     (text called))"
                 )
             })],
         )

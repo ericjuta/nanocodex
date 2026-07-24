@@ -311,7 +311,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_names_are_stable_and_javascript_safe() {
+    fn canonical_names_are_stable_and_code_mode_safe() {
         assert_eq!(
             canonical_tool_name("Google Drive", "files/search"),
             "mcp__Google_Drive__files_search"

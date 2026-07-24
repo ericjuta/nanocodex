@@ -1011,7 +1011,7 @@ impl ToolRegistry {
                     return execution;
                 }
             }
-            return ToolExecution::error(format!("unsupported nested tool call: {name}"));
+            return ToolExecution::error(self.unknown_nested_tool_message(name));
         };
         let input = match definition {
             ToolDefinition::Function { .. } if !input.is_object() => {
@@ -1043,16 +1043,53 @@ impl ToolRegistry {
     pub(crate) fn nested_tool_metadata(&self) -> Vec<Value> {
         let mut metadata = self
             .entries()
-            .map(|(handler, definition)| definition_metadata(handler.name(), definition))
+            .map(|(handler, definition)| definition_metadata(handler.name(), definition, false))
             .collect::<Vec<_>>();
         for definition in self
             .providers
             .iter()
             .flat_map(|provider| provider.available_definitions())
         {
-            metadata.push(definition_metadata(definition.name(), &definition));
+            metadata.push(definition_metadata(definition.name(), &definition, true));
         }
         metadata
+    }
+
+    fn unknown_nested_tool_message(&self, name: &str) -> String {
+        let mut names = self
+            .entries()
+            .map(|(handler, _)| handler.name().to_owned())
+            .chain(
+                self.providers
+                    .iter()
+                    .flat_map(|provider| provider.available_definitions())
+                    .map(|definition| definition.name().to_owned()),
+            )
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        let mut ranked = names
+            .into_iter()
+            .map(|candidate| (edit_distance(name, &candidate), candidate))
+            .collect::<Vec<_>>();
+        ranked.sort_unstable();
+        let maximum_distance = 2.max(name.chars().count() / 3);
+        let suggestions = ranked
+            .into_iter()
+            .take(3)
+            .filter(|(distance, _)| *distance <= maximum_distance)
+            .map(|(_, candidate)| format!("`{candidate}`"))
+            .collect::<Vec<_>>();
+        if suggestions.is_empty() {
+            format!(
+                "unsupported nested tool call: {name}. Use (all-tools) to inspect enabled tools"
+            )
+        } else {
+            format!(
+                "unsupported nested tool call: {name}. Did you mean {}? Use (all-tools) to inspect enabled tools",
+                suggestions.join(", ")
+            )
+        }
     }
     fn from_ordered(ordered: Vec<Arc<dyn Tool>>) -> Self {
         let definitions = ordered.iter().map(|tool| tool.definition()).collect();
@@ -1103,7 +1140,7 @@ fn record_tool_content(span: &tracing::Span, kind: &'static str, content: &str) 
     });
 }
 
-fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
+fn definition_metadata(name: &str, definition: &ToolDefinition, dynamic: bool) -> Value {
     let kind = match definition {
         ToolDefinition::Function { .. } => "function",
         ToolDefinition::Custom { .. } => "freeform",
@@ -1112,7 +1149,32 @@ fn definition_metadata(name: &str, definition: &ToolDefinition) -> Value {
         "name": name,
         "description": definition.description(),
         "kind": kind,
+        "input_schema": definition
+            .parameters()
+            .map(nanocodex_core::JsonSchema::as_value),
+        "output_schema": definition
+            .output_schema()
+            .map(nanocodex_core::JsonSchema::as_value),
+        "dynamic": dynamic,
     })
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+    for (left_index, left_character) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_character) in right.iter().enumerate() {
+            let substitution =
+                previous[right_index] + usize::from(left_character != *right_character);
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right.len()]
 }
 
 /// Produces the compact JSON Schema shape used for macro-generated tools.
@@ -1448,17 +1510,15 @@ mod tests {
         assert!(
             description[0]["description"]
                 .as_str()
-                .is_some_and(|description| description.contains(
-                    "declare const tools: { double(args: { value: number; }): Promise<unknown>; };"
-                ))
+                .is_some_and(|description| {
+                    description.contains(r#"(tool-call "double" {:value 0})"#)
+                })
         );
 
         let execution = runtime
             .execute_code(
-                r"
-const result = await tools.double({ value: 21 });
-text(result);
-",
+                r#"(let [result (await (nanocodex.tools/call "double" {:value 21}))]
+  (text result))"#,
                 ToolContext {
                     model: "test-model",
                     session_id: "test-session",
@@ -1483,6 +1543,36 @@ text(result);
                 .last(),
             Some(&json!({ "type": "input_text", "text": "42" }))
         );
+    }
+
+    #[test]
+    fn default_tool_examples_validate_against_their_schemas() {
+        let runtime = ToolRuntime::new(
+            ".",
+            Some(WebSearchConfig {
+                endpoint: "http://127.0.0.1:1/v1/alpha/search".to_owned(),
+                auth: OpenAiAuth::api_key("test-key"),
+            }),
+            Some(ImageGenerationConfig {
+                api_base_url: "http://127.0.0.1:1/v1".to_owned(),
+                auth: OpenAiAuth::api_key("test-key"),
+                save_root: std::path::PathBuf::from("."),
+            }),
+        );
+        for definition in runtime.registry.definitions() {
+            let ToolDefinition::Function {
+                name, parameters, ..
+            } = definition
+            else {
+                continue;
+            };
+            let schema = parameters.as_value();
+            let example = crate::code_mode::description::example_value(schema)
+                .unwrap_or_else(|| panic!("{name} should have a synthesizable example"));
+            jsonschema::validate(schema, &example).unwrap_or_else(|error| {
+                panic!("{name} generated invalid example {example}: {error}")
+            });
+        }
     }
 
     #[tokio::test]
@@ -1529,11 +1619,9 @@ text(result);
         let runtime = ToolRuntime::new(".", None, None).with_tools(&tools);
         let execution = runtime
             .execute_code(
-                r#"
-const found = await tools.tool_search({ query: "echo" });
-const result = await tools[found.name]({ value: 21 });
-text(result.value);
-"#,
+                r#"(let [found (await (nanocodex.tools/call "tool_search" {:query "echo"}))
+       result (await (nanocodex.tools/call (:name found) {:value 21}))]
+  (text (:value result)))"#,
                 ToolContext {
                     model: "test-model",
                     session_id: "test-session",

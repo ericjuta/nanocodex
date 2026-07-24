@@ -1165,7 +1165,7 @@ impl ToolActivity {
         details_expanded: Arc<AtomicBool>,
     ) -> Self {
         let highlighted_source = (name == "exec" && !arguments.is_empty())
-            .then(|| highlighted_code_lines(Some("javascript"), &arguments));
+            .then(|| highlighted_code_lines(Some("clojure"), &arguments));
         let patch = (name == "apply_patch")
             .then(|| present_apply_patch(&arguments))
             .flatten();
@@ -1371,7 +1371,7 @@ impl ToolActivity {
             && let Some(highlighted_source) = &self.highlighted_source
         {
             lines.push(Line::styled(
-                format!("  ┌─ javascript · {} LOC", code_line_count(&self.arguments)),
+                format!("  ┌─ clojure · {} LOC", code_line_count(&self.arguments)),
                 Style::default().fg(Color::DarkGray),
             ));
             for line in highlighted_source {
@@ -2509,7 +2509,8 @@ mod tests {
         let mut tool = ToolActivity::new(
             "code-mode-1".to_owned(),
             "exec".to_owned(),
-            "text(await tools.exec_command({ cmd: 'render report' }));".to_owned(),
+            "(text (await (nanocodex.tools/call \"exec_command\" {:cmd \"render report\"})))"
+                .to_owned(),
             ToolStatus::Completed,
             Arc::clone(&details_expanded),
         );
@@ -2605,7 +2606,9 @@ mod tests {
         transcript.push(TranscriptItem::Tool {
             call_id: "call-1".to_owned(),
             name: "exec".to_owned(),
-            arguments: "const tasks = [\"test\", \"patch\"];\nawait Promise.all(tasks);".to_owned(),
+            arguments:
+                "(let [tasks [\"test\" \"patch\"]] (await (clojure.core.async/join-all tasks)))"
+                    .to_owned(),
             status: ToolStatus::Running,
         });
         assert!(transcript.push_tool_child(
@@ -2648,8 +2651,8 @@ mod tests {
             .unwrap();
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("✓ Code Mode  2 calls · 120ms · overlapping"));
-        assert!(!rendered.contains("javascript"));
-        assert!(!rendered.contains("const tasks"));
+        assert!(!rendered.contains("clojure"));
+        assert!(!rendered.contains("(let [tasks"));
         assert!(rendered.contains("├─ ✓ Ran  90ms · exit 0"));
         assert!(rendered.contains("cargo test \\"));
         assert!(rendered.contains("--workspace"));

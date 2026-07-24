@@ -1589,6 +1589,10 @@ mod tests {
                 continue;
             }
             let input = request["input"].to_string();
+            let latest_user_input = request["input"]
+                .as_array()
+                .and_then(|items| items.iter().rev().find(|item| item["role"] == "user"))
+                .map_or_else(String::new, Value::to_string);
             tracker
                 .request_inputs
                 .lock()
@@ -1603,9 +1607,11 @@ mod tests {
                 .push(input.clone());
             if input.contains("function_call_output") || input.contains("custom_tool_call_output") {
                 send_final(&mut socket, &response_id).await?;
-            } else if input.contains("FAIL_INITIAL") || input.contains("FAIL_FOLLOWUP") {
+            } else if latest_user_input.contains("FAIL_INITIAL")
+                || latest_user_input.contains("FAIL_FOLLOWUP")
+            {
                 send_failed(&mut socket, &response_id).await?;
-            } else if input.contains("SPAWN_GRANDCHILD_BLOCK") {
+            } else if latest_user_input.contains("SPAWN_GRANDCHILD_BLOCK") {
                 send_completed(
                     &mut socket,
                     &response_id,
@@ -1613,11 +1619,11 @@ mod tests {
                         "type": "custom_tool_call",
                         "call_id": format!("call-{response_id}"),
                         "name": "exec",
-                        "input": r#"const report = await tools.spawn_agent({role: "grandchild", task: "BLOCK_GRANDCHILD"}); text(JSON.stringify(report));"#
+                        "input": r#"(let [report (await (nanocodex.tools/call "spawn_agent" {:role "grandchild" :task "BLOCK_GRANDCHILD"}))] (text report))"#
                     })],
                 )
                 .await?;
-            } else if input.contains("BLOCK_") || input.contains("GATE_") {
+            } else if latest_user_input.contains("BLOCK_") || latest_user_input.contains("GATE_") {
                 send_completed(
                     &mut socket,
                     &response_id,
@@ -1625,7 +1631,7 @@ mod tests {
                         "type": "custom_tool_call",
                         "call_id": format!("call-{response_id}"),
                         "name": "exec",
-                        "input": "const result = await tools.test_gate({}); text(result);"
+                        "input": "(let [result (await (nanocodex.tools/call \"test_gate\" {}))] (text result))"
                     })],
                 )
                 .await?;

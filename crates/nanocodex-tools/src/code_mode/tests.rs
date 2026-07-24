@@ -23,8 +23,8 @@ fn long_observer_yields_include_completion_grace() {
 }
 
 #[tokio::test]
-async fn prewarms_embedded_quickjs_host() -> Result<()> {
-    let workspace = temporary_workspace("prewarmed-quickjs-host")?;
+async fn prewarms_embedded_cljrs_host() -> Result<()> {
+    let workspace = temporary_workspace("prewarmed-cljrs-host")?;
     let runtime = super::CodeModeRuntime::new(workspace.clone());
 
     assert!(runtime.host.lock().await.host.is_some());
@@ -35,69 +35,96 @@ async fn prewarms_embedded_quickjs_host() -> Result<()> {
 }
 
 #[tokio::test]
-async fn execution_globals_do_not_leak_across_quickjs_contexts() -> Result<()> {
-    let workspace = temporary_workspace("isolated-quickjs-contexts")?;
+async fn execution_definitions_do_not_leak_across_cljrs_namespaces() -> Result<()> {
+    let workspace = temporary_workspace("isolated-cljrs-namespaces")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let context = test_context(&history);
+    let source = r"(do
+  (def generation 1)
+  (text {:previous nil :current generation}))";
 
-    let source = r"
-const previous = globalThis.__nanocodexContextGeneration;
-globalThis.__nanocodexContextGeneration = (previous || 0) + 1;
-text({ previous: previous ?? null, current: globalThis.__nanocodexContextGeneration });
-";
     let first = tools.execute_code(source, context).await;
     let second = tools.execute_code(source, context).await;
 
-    assert!(first.success);
-    assert!(second.success);
-    assert_eq!(emitted_text(&first)?, r#"{"previous":null,"current":1}"#);
-    assert_eq!(emitted_text(&second)?, r#"{"previous":null,"current":1}"#);
-    std::fs::remove_dir_all(workspace)?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn execution_prototype_mutations_do_not_leak_across_quickjs_contexts() -> Result<()> {
-    let workspace = temporary_workspace("isolated-quickjs-prototypes")?;
-    let tools = test_tools(&workspace);
-    let history = Vec::new();
-
-    let first = tools
-        .execute_code(
-            r#"
-Object.prototype.__nanocodexPoisoned = "yes";
-text(({}).__nanocodexPoisoned);
-"#,
-            test_context(&history),
-        )
-        .await;
-    let second = tools
-        .execute_code(
-            r#"text(({}).__nanocodexPoisoned ?? "clean");"#,
-            test_context(&history),
-        )
-        .await;
-
     assert!(first.success, "{}", execution_output(&first));
     assert!(second.success, "{}", execution_output(&second));
-    assert_eq!(emitted_text(&first)?, "yes");
-    assert_eq!(emitted_text(&second)?, "clean");
+    assert_eq!(
+        serde_json::from_str::<Value>(emitted_text(&first)?)?,
+        serde_json::json!({"previous": null, "current": 1})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(emitted_text(&second)?)?,
+        serde_json::json!({"previous": null, "current": 1})
+    );
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
 
 #[tokio::test]
-async fn execution_local_bindings_do_not_leak_across_quickjs_calls() -> Result<()> {
-    let workspace = temporary_workspace("scoped-quickjs-bindings")?;
+async fn restricted_cljrs_blocks_ambient_file_io() -> Result<()> {
+    let workspace = temporary_workspace("restricted-cljrs-file-io")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(r#"(slurp "/etc/passwd")"#, test_context(&history))
+        .await;
+
+    assert!(!execution.success);
+    assert!(execution_output(&execution).contains("forbidden"));
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_errors_report_exact_cell_locations() -> Result<()> {
+    let workspace = temporary_workspace("read-diagnostic")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code("(do\n  (text 1)\n", test_context(&history))
+        .await;
+
+    let output = execution_output(&execution);
+    assert!(!execution.success);
+    assert!(output.contains("read error:"), "{output}");
+    assert!(output.contains("at <nanocodex.cell.1>:"), "{output}");
+    assert!(output.contains("exact reader location"), "{output}");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn eval_errors_report_form_location_class_and_ex_data() -> Result<()> {
+    let workspace = temporary_workspace("eval-diagnostic")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            "(text \"before\")\n(throw (ex-info \"boom\" {:kind :diagnostic :n 7}))",
+            test_context(&history),
+        )
+        .await;
+
+    let output = execution_output(&execution);
+    assert!(!execution.success);
+    assert!(output.contains("thrown error:"), "{output}");
+    assert!(output.contains("top-level form: 2"), "{output}");
+    assert!(output.contains("enclosing top-level form"), "{output}");
+    assert!(output.contains("\"kind\":\"diagnostic\""), "{output}");
+    assert!(output.contains("\"n\":7"), "{output}");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn execution_local_bindings_do_not_leak_across_cljrs_calls() -> Result<()> {
+    let workspace = temporary_workspace("scoped-cljrs-bindings")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let context = test_context(&history);
+    let source = r"(let [execution-local 1] (text execution-local))";
 
-    let source = r"
-const executionLocal = 1;
-text(executionLocal);
-";
     let first = tools.execute_code(source, context).await;
     let second = tools.execute_code(source, context).await;
 
@@ -110,28 +137,16 @@ text(executionLocal);
 }
 
 #[tokio::test]
-async fn embedded_quickjs_does_not_expose_node_or_host_callback_globals() -> Result<()> {
-    let workspace = temporary_workspace("embedded-quickjs-globals")?;
+async fn restricted_cljrs_blocks_namespace_loading() -> Result<()> {
+    let workspace = temporary_workspace("restricted-cljrs-namespaces")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
-        .execute_code(
-            r"
-text({
-  process: typeof process,
-  require: typeof require,
-  hostCallback: typeof __nanocodexTool,
-});
-",
-            test_context(&history),
-        )
+        .execute_code(r"(require 'clojure.string)", test_context(&history))
         .await;
 
-    assert!(execution.success, "{}", execution_output(&execution));
-    assert_eq!(
-        emitted_text(&execution)?,
-        r#"{"process":"undefined","require":"undefined","hostCallback":"undefined"}"#
-    );
+    assert!(!execution.success);
+    assert!(execution_output(&execution).contains("forbidden"));
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -144,21 +159,21 @@ async fn multiple_yielded_cells_continue_and_complete_independently() -> Result<
     let history = Vec::new();
     let first = tools
         .execute_code(
-            r#"
-await yield_control();
-const result = await tools.exec_command({ cmd: "sleep 0.04; printf 'first done'", login: false });
-text(result.output);
-"#,
+            r#"(do
+  (await (yield-control))
+  (let [result (await (nanocodex.tools/call "exec_command"
+                  {:cmd "sleep 0.04; printf 'first done'" :login false}))]
+    (text (:output result))))"#,
             test_context_with_call(&history, "call-first"),
         )
         .await;
     let second = tools
         .execute_code(
-            r#"
-await yield_control();
-const result = await tools.exec_command({ cmd: "sleep 0.01; printf 'second done'", login: false });
-text(result.output);
-"#,
+            r#"(do
+  (await (yield-control))
+  (let [result (await (nanocodex.tools/call "exec_command"
+                  {:cmd "sleep 0.01; printf 'second done'" :login false}))]
+    (text (:output result))))"#,
             test_context_with_call(&history, "call-second"),
         )
         .await;
@@ -191,30 +206,26 @@ text(result.output);
 
 #[cfg(unix)]
 #[tokio::test]
-async fn promise_all_runs_nested_tools_concurrently() -> Result<()> {
+async fn join_all_runs_nested_tools_concurrently() -> Result<()> {
     let workspace = temporary_workspace("parallel-nested-tools")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-const [first, second] = await Promise.all([
-  tools.exec_command({
-    cmd: "touch first.started; i=0; while [ \"$i\" -lt 100 ]; do [ -f second.started ] && exit 0; i=$((i + 1)); sleep 0.01; done; exit 91",
-    login: false,
-  }),
-  tools.exec_command({
-    cmd: "touch second.started; i=0; while [ \"$i\" -lt 100 ]; do [ -f first.started ] && exit 0; i=$((i + 1)); sleep 0.01; done; exit 92",
-    login: false,
-  }),
-]);
-text({ first: first.exit_code, second: second.exit_code });
-"#,
+            r#"(let [first (nanocodex.tools/call "exec_command"
+                    {:cmd "touch first.started; i=0; while [ \"$i\" -lt 100 ]; do [ -f second.started ] && exit 0; i=$((i + 1)); sleep 0.01; done; exit 91"
+                     :login false})
+       second (nanocodex.tools/call "exec_command"
+                     {:cmd "touch second.started; i=0; while [ \"$i\" -lt 100 ]; do [ -f first.started ] && exit 0; i=$((i + 1)); sleep 0.01; done; exit 92"
+                      :login false})
+       results (await (clojure.core.async/join-all [first second]))]
+  (text {:first (:exit_code (nth results 0))
+         :second (:exit_code (nth results 1))}))"#,
             test_context(&history),
         )
         .await;
 
-    assert!(execution.success);
+    assert!(execution.success, "{}", execution_output(&execution));
     assert_eq!(
         call_ids(&execution.nested_calls),
         ["call-exec/code-1", "call-exec/code-2"]
@@ -226,28 +237,95 @@ text({ first: first.exit_code, second: second.exit_code });
 }
 
 #[tokio::test]
-async fn failed_nested_tool_rejects_its_javascript_promise() -> Result<()> {
+async fn failed_nested_tool_rejects_its_clojure_future() -> Result<()> {
     let workspace = temporary_workspace("nested-tool-rejection")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-try {
-  await tools.view_image({ path: "missing.png" });
-  text("unexpected success");
-} catch (error) {
-  text(error);
-}
-"#,
+            r#"(try
+  (await (tool-call "view_image" {:path "missing.png"}))
+  (text "unexpected success")
+  (catch :default error
+    (text {:message (ex-message error) :data (ex-data error)})))"#,
             test_context(&history),
         )
         .await;
 
-    assert!(execution.success);
-    assert!(emitted_text(&execution)?.contains("unable to locate image"));
+    assert!(execution.success, "{}", execution_output(&execution));
+    let failure = serde_json::from_str::<Value>(emitted_text(&execution)?)?;
+    assert!(
+        failure["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unable to locate image"))
+    );
+    assert_eq!(failure["data"]["type"], "nested-tool-failure");
+    assert_eq!(failure["data"]["tool"], "view_image");
+    assert_eq!(
+        failure["data"]["input"],
+        serde_json::json!({"path": "missing.png"})
+    );
+    assert_eq!(failure["data"]["call-id"], "call-exec/code-1");
+    assert!(
+        failure["data"]["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("unable to locate image"))
+    );
     assert_eq!(execution.nested_calls.len(), 1);
     assert!(!execution.nested_calls[0].success);
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_nested_tool_failure_suggests_close_names() -> Result<()> {
+    let workspace = temporary_workspace("nested-tool-suggestion")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"(try
+  (await (tool-call "exec_comand" {:cmd "pwd"}))
+  (text "unexpected success")
+  (catch :default error
+    (text (ex-message error))))"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let message = emitted_text(&execution)?;
+    assert!(
+        message.contains("Did you mean `exec_command`?"),
+        "{message}"
+    );
+    assert!(message.contains("(all-tools)"), "{message}");
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tool_call_alias_uses_the_standard_nested_call_lifecycle() -> Result<()> {
+    let workspace = temporary_workspace("tool-call-alias")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"(let [result (await (tool-call "exec_command" {:cmd "printf alias" :login false}))]
+  (text (:output result)))"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert_eq!(emitted_text(&execution)?, "alias");
+    assert_eq!(execution.nested_calls.len(), 1);
+    assert_eq!(execution.nested_calls[0].name, "exec_command");
+    assert_eq!(execution.nested_calls[0].call_id, "call-exec/code-1");
+    assert_eq!(
+        execution.nested_calls[0].input,
+        serde_json::json!({"cmd": "printf alias", "login": false})
+    );
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -260,26 +338,18 @@ async fn image_helper_requires_data_urls() -> Result<()> {
 
     let remote = tools
         .execute_code(
-            r#"image("https://example.com/image.png");"#,
+            r#"(image "https://example.com/image.png")"#,
             test_context(&history),
         )
         .await;
     assert!(!remote.success);
-    let remote_output = execution_output(&remote);
-    assert!(remote_output.contains(
-        "Script error:\nTool call failed: remote image URLs are not supported in tool outputs. Pass a base64 data URI instead"
-    ));
-    assert!(!remote_output.contains("at image"));
+    assert!(execution_output(&remote).contains("remote image URLs are not supported"));
 
     let invalid = tools
-        .execute_code(r#"image("not-an-image");"#, test_context(&history))
+        .execute_code(r#"(image "not-an-image")"#, test_context(&history))
         .await;
     assert!(!invalid.success);
-    let invalid_output = execution_output(&invalid);
-    assert!(invalid_output.contains(
-        "Script error:\nTool call failed: invalid image output. Pass a base64 data URI instead"
-    ));
-    assert!(!invalid_output.contains("at image"));
+    assert!(execution_output(&invalid).contains("invalid image output"));
 
     std::fs::remove_dir_all(workspace)?;
     Ok(())
@@ -292,11 +362,10 @@ async fn failed_cell_preserves_accumulated_output() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-text("before crash");
-image("data:image/png;base64,a", "original");
-throw new Error("boom");
-"#,
+            r#"(do
+  (text "before crash")
+  (image "data:image/png;base64,a" "original")
+  (throw (ex-info "boom" {})))"#,
             test_context(&history),
         )
         .await;
@@ -318,8 +387,7 @@ throw new Error("boom");
     ));
     assert!(matches!(
         content.get(3),
-        Some(ToolOutputContent::InputText { text })
-            if text.starts_with("Script error:\nError: boom\n")
+        Some(ToolOutputContent::InputText { text }) if text.contains("boom")
     ));
 
     std::fs::remove_dir_all(workspace)?;
@@ -333,7 +401,7 @@ async fn image_helper_normalizes_detail_and_honors_override() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"image({ image_url: "data:image/png;base64,a", detail: "low" }, "ORIGINAL");"#,
+            r#"(image {:image_url "data:image/png;base64,a" :detail "low"} "ORIGINAL")"#,
             test_context(&history),
         )
         .await;
@@ -361,12 +429,9 @@ async fn generated_image_helper_appends_high_detail_image_and_hint() -> Result<(
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-generatedImage({
-  image_url: "data:image/png;base64,a",
-  output_hint: "generated image save hint",
-});
-"#,
+            r#"(generated-image
+  {:image_url "data:image/png;base64,a"
+   :output_hint "generated image save hint"})"#,
             test_context(&history),
         )
         .await;
@@ -389,14 +454,14 @@ generatedImage({
 
     let invalid = tools
         .execute_code(
-            r#"generatedImage({ image_url: "data:image/png;base64,a", output_hint: 1 });"#,
+            r#"(generated-image {:image_url "data:image/png;base64,a" :output_hint 1})"#,
             test_context(&history),
         )
         .await;
     assert!(!invalid.success);
     assert!(
         execution_output(&invalid)
-            .contains("generatedImage output_hint must be a string when provided")
+            .contains("generated-image output_hint must be a string when provided")
     );
 
     std::fs::remove_dir_all(workspace)?;
@@ -410,7 +475,7 @@ async fn notify_serializes_values_and_rejects_empty_text() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"notify({ phase: "working" }); text("done");"#,
+            r#"(do (notify {:phase "working"}) (text "done"))"#,
             test_context(&history),
         )
         .await;
@@ -418,31 +483,29 @@ async fn notify_serializes_values_and_rejects_empty_text() -> Result<()> {
     assert!(execution.success, "{}", execution_output(&execution));
     assert_eq!(execution.notifications.len(), 1);
     assert_eq!(execution.notifications[0].call_id, "call-exec");
-    assert_eq!(execution.notifications[0].text, r#"{"phase":"working"}"#);
+    assert_eq!(
+        serde_json::from_str::<Value>(&execution.notifications[0].text)?,
+        serde_json::json!({"phase": "working"})
+    );
 
     let empty = tools
-        .execute_code(r#"notify("  ");"#, test_context(&history))
+        .execute_code(r#"(notify "  ")"#, test_context(&history))
         .await;
     assert!(!empty.success);
-    assert!(execution_output(&empty).contains("Script error:\nnotify expects non-empty text"));
-    assert!(!execution_output(&empty).contains("at notify"));
+    assert!(execution_output(&empty).contains("notify expects non-empty text"));
 
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
 
 #[tokio::test]
-async fn store_normalizes_json_values_and_coerces_keys() -> Result<()> {
+async fn store_round_trips_json_compatible_clojure_values() -> Result<()> {
     let workspace = temporary_workspace("code-mode-store-json")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let write = tools
         .execute_code(
-            r"
-const value = { kept: 1, dropped: undefined, array: [undefined, NaN] };
-store(42, value);
-value.kept = 99;
-",
+            r#"(store "candidate" {:kept 1 :array [nil nil]})"#,
             test_context(&history),
         )
         .await;
@@ -450,7 +513,7 @@ value.kept = 99;
 
     let read = tools
         .execute_code(
-            r"text(load(42));",
+            r#"(text (load "candidate"))"#,
             test_context_with_call(&history, "call-read"),
         )
         .await;
@@ -470,25 +533,79 @@ async fn store_rejects_non_serializable_values_at_the_call_boundary() -> Result<
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
-        .execute_code(r#"store("candidate", undefined);"#, test_context(&history))
+        .execute_code(r#"(store "candidate" (fn [] nil))"#, test_context(&history))
         .await;
 
     assert!(!execution.success);
-    let output = execution_output(&execution);
-    assert!(output.contains(
-        "Script error:\nUnable to store \"candidate\". Only plain serializable objects can be stored."
-    ));
-    assert!(!output.contains("at store"));
+    assert!(
+        execution_output(&execution).contains("unsupported Clojure value at the tool boundary")
+    );
 
     let read = tools
         .execute_code(
-            r#"text(load("candidate"));"#,
+            r#"(text (load "candidate"))"#,
             test_context_with_call(&history, "call-read"),
         )
         .await;
     assert!(read.success, "{}", execution_output(&read));
-    assert_eq!(emitted_text(&read)?, "undefined");
+    assert_eq!(emitted_text(&read)?, "null");
 
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn exit_completes_the_cell_successfully() -> Result<()> {
+    let workspace = temporary_workspace("code-mode-exit")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"(do
+  (text (count (all-tools)))
+  (exit)
+  (throw (ex-info "unreachable" {})))"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(
+        emitted_text(&execution)?.parse::<usize>()? > 0,
+        "all-tools should expose enabled tool metadata"
+    );
+    assert!(!execution_output(&execution).contains("unreachable"));
+
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tool_introspection_filters_and_returns_schemas() -> Result<()> {
+    let workspace = temporary_workspace("tool-introspection")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"(let [matches (all-tools "hashline__read")
+      info (tool-info :exec_command)]
+  (text {:count (count matches)
+         :name (:name info)
+         :input-type (:type (:input_schema info))
+         :dynamic (:dynamic info)}))"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let info = serde_json::from_str::<Value>(emitted_text(&execution)?)?;
+    assert!(
+        info["count"].as_u64().is_some_and(|count| count >= 1),
+        "filtered introspection should return at least the named tool: {info}"
+    );
+    assert_eq!(info["name"], "exec_command");
+    assert_eq!(info["input-type"], "object");
+    assert_eq!(info["dynamic"], false);
     std::fs::remove_dir_all(workspace)?;
     Ok(())
 }
@@ -500,12 +617,11 @@ async fn yielded_cell_completes_through_wait() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-text("before");
-await yield_control();
-await new Promise((resolve) => setTimeout(resolve, 10));
-text("after");
-"#,
+            r#"(do
+  (text "before")
+  (await (yield-control))
+  (await (clojure.core.async/timeout 10))
+  (text "after"))"#,
             test_context(&history),
         )
         .await;
@@ -520,7 +636,7 @@ text("after");
             test_context(&history),
         )
         .await;
-    assert!(completed.success);
+    assert!(completed.success, "{}", execution_output(&completed));
     assert!(execution_output(&completed).contains("Script completed"));
     assert!(execution_output(&completed).contains("after"));
     std::fs::remove_dir_all(workspace)?;
@@ -528,16 +644,98 @@ text("after");
 }
 
 #[tokio::test]
-async fn running_shell_session_survives_output_only_javascript() -> Result<()> {
+async fn explicit_yield_allows_pending_nested_tools() -> Result<()> {
+    let workspace = temporary_workspace("yield-pending-tool")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"(let [call (tool-call "exec_command"
+                         {:cmd "printf Cargo.toml" :login false})]
+  (text {:pending (count (pending-tools))})
+  (await (yield-control))
+  (text (:output (await call))))"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    assert!(execution_output(&execution).contains("Script running with cell ID 1"));
+    assert!(execution_output(&execution).contains(r#"{"pending":1}"#));
+    let completed = tools
+        .wait_for_code(
+            r#"{"cell_id":"1","yield_time_ms":3000}"#,
+            test_context(&history),
+        )
+        .await;
+    assert!(completed.success, "{}", execution_output(&completed));
+    assert!(
+        execution_output(&completed).contains("Cargo.toml"),
+        "{}",
+        execution_output(&completed)
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_tool_aborts_one_pending_branch_and_keeps_siblings() -> Result<()> {
+    let workspace = temporary_workspace("cancel-pending-tool")?;
+    let tools = test_tools(&workspace);
+    let history = Vec::new();
+    let execution = tools
+        .execute_code(
+            r#"(let [slow (tool-call "exec_command" {:cmd "sleep 5" :login false})
+      fast (tool-call "exec_command" {:cmd "printf fast" :login false})
+      pending (count (pending-tools))
+      cancelled (cancel-tool slow)
+      result (await fast)]
+  (text {:pending pending :cancelled cancelled :output (:output result)}))"#,
+            test_context(&history),
+        )
+        .await;
+
+    assert!(execution.success, "{}", execution_output(&execution));
+    let result = serde_json::from_str::<Value>(emitted_text(&execution)?)?;
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "pending": 2,
+            "cancelled": true,
+            "output": "fast"
+        })
+    );
+    assert_eq!(execution.nested_calls.len(), 2);
+    let cancelled = execution
+        .nested_calls
+        .iter()
+        .find(|call| call.call_id == "call-exec/code-1")
+        .expect("cancelled call should be recorded");
+    assert!(!cancelled.success);
+    assert!(matches!(
+        &cancelled.output,
+        ToolOutputBody::Text(output) if output.contains("cancelled")
+    ));
+    assert!(
+        execution
+            .nested_calls
+            .iter()
+            .any(|call| call.call_id == "call-exec/code-2" && call.success)
+    );
+    std::fs::remove_dir_all(workspace)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_shell_session_survives_output_only_clojure() -> Result<()> {
     let workspace = temporary_workspace("running-shell-session-output")?;
     let tools = test_tools(&workspace);
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-const result = await tools.exec_command({ cmd: "sleep 5", yield_time_ms: 250 });
-text(result.output);
-"#,
+            r#"(let [result (await (nanocodex.tools/call "exec_command"
+                         {:cmd "sleep 5" :yield_time_ms 250}))]
+  (text (:output result)))"#,
             test_context(&history),
         )
         .await;
@@ -559,10 +757,9 @@ async fn running_shell_session_notice_is_not_duplicated_for_full_results() -> Re
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-const result = await tools.exec_command({ cmd: "sleep 5", yield_time_ms: 250 });
-text(result);
-"#,
+            r#"(let [result (await (nanocodex.tools/call "exec_command"
+                         {:cmd "sleep 5" :yield_time_ms 250}))]
+  (text result))"#,
             test_context(&history),
         )
         .await;
@@ -584,10 +781,9 @@ async fn cancellation_terminates_yielded_code_cells() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r"
-await yield_control();
-await new Promise(() => {});
-",
+            r"(do
+  (await (yield-control))
+  (await (clojure.core.async/take! (clojure.core.async/chan))))",
             test_context(&history),
         )
         .await;
@@ -605,17 +801,16 @@ await new Promise(() => {});
 }
 
 #[tokio::test]
-async fn cancellation_interrupts_busy_javascript_and_recreates_the_host() -> Result<()> {
+async fn cancellation_interrupts_busy_clojure_and_recreates_the_host() -> Result<()> {
     let workspace = temporary_workspace("cancelled-busy-cell")?;
     let tools = test_tools(&workspace);
     let control = tools.control();
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r"
-await yield_control();
-while (true) {}
-",
+            r"(do
+  (await (yield-control))
+  (loop [] (recur)))",
             test_context(&history),
         )
         .await;
@@ -623,7 +818,7 @@ while (true) {}
 
     tokio::time::timeout(std::time::Duration::from_secs(2), control.cancel()).await?;
     let recovered = tools
-        .execute_code(r#"text("recovered")"#, test_context(&history))
+        .execute_code(r#"(text "recovered")"#, test_context(&history))
         .await;
 
     assert!(recovered.success, "{}", execution_output(&recovered));
@@ -634,16 +829,15 @@ while (true) {}
 
 #[cfg(unix)]
 #[tokio::test]
-async fn cancellation_drops_pending_tool_promises_before_recreating_the_host() -> Result<()> {
+async fn cancellation_drops_pending_tool_futures_before_recreating_the_host() -> Result<()> {
     let workspace = temporary_workspace("cancelled-pending-tool")?;
     let tools = test_tools(&workspace);
     let control = tools.control();
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"// @exec: {"yield_time_ms": 10}
-await tools.exec_command({ cmd: "sleep 5", login: false });
-"#,
+            r#";; @exec: {"yield_time_ms": 10}
+(await (nanocodex.tools/call "exec_command" {:cmd "sleep 5" :login false}))"#,
             test_context(&history),
         )
         .await;
@@ -651,7 +845,7 @@ await tools.exec_command({ cmd: "sleep 5", login: false });
 
     tokio::time::timeout(std::time::Duration::from_secs(2), control.cancel()).await?;
     let recovered = tools
-        .execute_code(r#"text("recovered")"#, test_context(&history))
+        .execute_code(r#"(text "recovered")"#, test_context(&history))
         .await;
 
     assert!(recovered.success, "{}", execution_output(&recovered));
@@ -668,11 +862,10 @@ async fn resumed_cell_notifications_keep_the_original_exec_call_id() -> Result<(
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-await yield_control();
-notify("after yield");
-text("done");
-"#,
+            r#"(do
+  (await (yield-control))
+  (notify "after yield")
+  (text "done"))"#,
             test_context_with_call(&history, "call-original-exec"),
         )
         .await;
@@ -703,20 +896,17 @@ async fn hashline_workspace_tools_are_callable_from_code_mode() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            r#"
-const read = await tools.hashline__read({ path: "notes.txt" });
-await tools.hashline__find_block({ path: "notes.txt", anchor: "1:93c8" });
-await tools.hashline__patch({
-  header: read.patchHeader,
-  operations: "SWAP 2:f589:\n+bravo",
-  dry_run: true,
-});
-await tools.hashline__transaction({
-  action: { type: "preview" },
-  mutations: [{ type: "create", path: "new.txt", contents: "new\n" }],
-});
-text("done");
-"#,
+            r#"(let [read (await (nanocodex.tools/call "hashline__read" {:path "notes.txt"}))]
+  (await (nanocodex.tools/call "hashline__find_block"
+           {:path "notes.txt" :anchor "1:93c8"}))
+  (await (nanocodex.tools/call "hashline__patch"
+           {:header (:patchHeader read)
+            :operations "SWAP 2:f589:\n+bravo"
+            :dry_run true}))
+  (await (nanocodex.tools/call "hashline__transaction"
+           {:action {:type "preview"}
+            :mutations [{:type "create" :path "new.txt" :contents "new\n"}]}))
+  (text "done"))"#,
             test_context(&history),
         )
         .await;
@@ -753,7 +943,7 @@ async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
     let history = Vec::new();
     let execution = tools
         .execute_code(
-            "// @exec: {\"max_output_tokens\": 2}\ntext(\"abcdefghijklmnop\")",
+            ";; @exec: {\"max_output_tokens\": 2}\n(text \"abcdefghijklmnop\")",
             test_context(&history),
         )
         .await;
@@ -762,10 +952,9 @@ async fn exec_pragma_and_wait_limit_direct_output() -> Result<()> {
 
     let yielded = tools
         .execute_code(
-            r#"
-await yield_control();
-text("abcdefghijklmnop");
-"#,
+            r#"(do
+  (await (yield-control))
+  (text "abcdefghijklmnop"))"#,
             test_context(&history),
         )
         .await;
@@ -784,7 +973,7 @@ text("abcdefghijklmnop");
 
 #[test]
 fn exec_pragma_rejects_unknown_fields() {
-    let error = parse_exec_source("// @exec: {\"unknown\": 1}\ntext('hi')")
+    let error = parse_exec_source(";; @exec: {\"unknown\": 1}\n(text \"hi\")")
         .err()
         .expect("unknown pragma fields should fail");
     assert!(error.contains("only supports"));
@@ -907,7 +1096,7 @@ async fn explicit_cell_yield_is_not_extended_by_a_nested_shell_wait() {
 }
 
 #[test]
-fn model_description_uses_codex_style_declarations() {
+fn model_description_uses_clojure_declarations() {
     let workspace = temporary_workspace("code-mode-description")
         .expect("temporary test workspace should be available");
     let tools = test_tools(&workspace);
@@ -919,12 +1108,38 @@ fn model_description_uses_codex_style_declarations() {
     let description = specs[0]["description"]
         .as_str()
         .expect("exec should have a description");
-    assert!(description.contains("// @exec:"));
-    assert!(description.contains("must be a base64-encoded `data:` URL"));
+    let static_guide_bytes = description
+        .split_once("\n\n### `")
+        .map_or(description.len(), |(guide, _)| guide.len());
+    let input_schema_bytes = description
+        .lines()
+        .filter_map(|line| line.strip_prefix("Detailed input schema (JSON): "))
+        .map(str::len)
+        .sum::<usize>();
+    let output_schema_bytes = description
+        .lines()
+        .filter_map(|line| line.strip_prefix("Detailed output schema (JSON): "))
+        .map(str::len)
+        .sum::<usize>();
+    assert!(
+        description.len() <= 39_000,
+        "Code Mode description exceeded its 39,000-byte budget: total={}, static_guide={static_guide_bytes}, input_schemas={input_schema_bytes}, output_schemas={output_schema_bytes}",
+        description.len()
+    );
+    assert!(description.contains(";; @exec:"));
+    assert!(description.contains("base64 `data:` URI"));
     assert!(!description.contains("apply_patch"));
-    assert!(description.contains("hashline__read(args: {"));
-    assert!(description.contains("exec_command(args: {"));
-    assert!(!description.contains("Input schema:"));
+    assert!(description.contains(r#"(tool-call "hashline__read""#));
+    assert!(description.contains(r#"(tool-call "exec_command""#));
+    assert!(description.contains("equivalent namespaced primitive"));
+    assert!(description.contains("(tool-info name)"));
+    assert!(description.contains("(pending-tools)"));
+    assert!(description.contains("(cancel-tool future)"));
+    assert!(description.contains(":nested-tool-failure"));
+    assert!(description.contains("Detailed input schema (JSON):"));
+    assert!(
+        !description.contains("Detailed output schema (JSON): unspecified JSON-compatible value")
+    );
     assert_eq!(
         specs[1]["parameters"]["properties"]["max_tokens"]["type"],
         "number"

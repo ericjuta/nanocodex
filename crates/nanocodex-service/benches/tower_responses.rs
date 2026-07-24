@@ -631,7 +631,7 @@ fn realistic_history(bytes: usize) -> (Vec<u8>, Vec<Value>, Vec<ResponseItem>) {
                 "status": "completed",
                 "call_id": format!("call-{index}"),
                 "name": "exec",
-                "input": "text(await tools.exec_command({cmd: \"rg --files\"}))",
+                "input": "(text (await (nanocodex.tools/call \"exec_command\" {:cmd \"rg --files\"})))",
                 "internal_chat_message_metadata_passthrough": {"turn_id": "turn-benchmark"}
             }),
             serde_json::json!({

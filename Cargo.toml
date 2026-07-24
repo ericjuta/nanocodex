@@ -1,5 +1,6 @@
 [workspace]
 members = ["bin/nanocodex", "crates/nanocodex", "crates/nanocodex-core", "crates/nanocodex-macros", "crates/nanocodex-mcp", "crates/nanocodex-observability", "crates/nanocodex-service", "crates/nanocodex-tools", "examples", "js/bindings", "py/bindings"]
+exclude = ["vendor/cljrs/cljrs-async", "vendor/cljrs/cljrs-env"]
 default-members = ["bin/nanocodex"]
 resolver = "2"
 
@@ -41,6 +42,8 @@ image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg
 iana-time-zone = "0.1.64"
 js-sys = "0.3.82"
 nix = { version = "0.30.1", default-features = false, features = ["process", "signal", "user"] }
+jsonschema = { version = "0.48.5", default-features = false }
+num-bigint = "0.4.8"
 portable-pty = "0.9.0"
 pulldown-cmark = { version = "0.10", default-features = false }
 syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
@@ -55,7 +58,14 @@ proc-macro2 = "1.0.106"
 quote = "1.0.46"
 ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
-rquickjs = "0.12.1"
+cljrs-async = "=0.1.228"
+cljrs-env = "=0.1.228"
+cljrs-gc = "=0.1.228"
+cljrs-interop = "=0.1.228"
+cljrs-reader = "=0.1.228"
+cljrs-types = "=0.1.228"
+cljrs-stdlib = "=0.1.228"
+cljrs-value = "=0.1.228"
 rmcp = { version = "1.8.0", default-features = false, features = ["client", "reqwest-tls-no-provider", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustix = { version = "1.1.4", features = ["fs"] }
@@ -124,3 +134,7 @@ codegen-units = 1
 lto = "fat"
 opt-level = "s"
 strip = "debuginfo"
+
+[patch.crates-io]
+cljrs-async = { path = "vendor/cljrs/cljrs-async" }
+cljrs-env = { path = "vendor/cljrs/cljrs-env" }

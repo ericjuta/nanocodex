@@ -372,7 +372,7 @@ fn search_description(servers: &[NamedServer]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "# MCP tool discovery\n\nSearches deferred MCP tool metadata with BM25 and activates matching tools for Code Mode. MCP handshakes and tools/list run in the background when the agent starts. Search before using an MCP tool; returned names can be called as `tools[name](arguments)` in the same or a later exec cell.\n\nConfigured sources:\n{sources}"
+        "# MCP tool discovery\n\nSearches deferred MCP tool metadata with BM25 and activates matching tools for Code Mode. MCP handshakes and tools/list run in the background when the agent starts. Search before using an MCP tool; pass a returned tool name to `(nanocodex.tools/call name arguments)` in the same or a later exec cell.\n\nConfigured sources:\n{sources}"
     )
 }
 

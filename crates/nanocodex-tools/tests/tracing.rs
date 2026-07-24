@@ -66,7 +66,7 @@ fn spawned_cell_preserves_the_parent_span_for_nested_tools() {
         runtime.block_on(
             tools
                 .execute_code(
-                    r#"await tools.exec_command({ cmd: "pwd", login: false });"#,
+                    r#"(await (nanocodex.tools/call "exec_command" {:cmd "pwd" :login false}))"#,
                     context,
                 )
                 .instrument(tracing::info_span!("test.tool_call")),

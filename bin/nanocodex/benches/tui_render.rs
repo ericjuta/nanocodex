@@ -1101,7 +1101,8 @@ mod tui {
                     transcript.push(TranscriptItem::Tool {
                         call_id: "call-1".to_owned(),
                         name: "exec".to_owned(),
-                        arguments: "const tasks = inputs.map(run);\nconst output = await Promise.all(tasks);\ntext(output);".to_owned(),
+                        arguments: "(let [tasks (mapv run inputs)\n      output (await (clojure.core.async/join-all tasks))]\n  (text output))"
+                            .to_owned(),
                         status: ToolStatus::Running,
                     });
                     for index in 0..16 {
@@ -1249,7 +1250,8 @@ mod tui {
             transcript.push(TranscriptItem::Tool {
                 call_id: "code-mode-1".to_owned(),
                 name: "exec".to_owned(),
-                arguments: "text(await tools.exec_command({ cmd: 'render report' }));".to_owned(),
+                arguments: "(text (await (nanocodex.tools/call \"exec_command\" {:cmd \"render report\"})))"
+                    .to_owned(),
                 status: ToolStatus::Completed,
             });
             assert!(transcript.push_tool_child(

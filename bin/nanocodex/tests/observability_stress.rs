@@ -215,11 +215,10 @@ async fn serve_subagent_responses(listener: TcpListener) -> Result<()> {
             "call_id": "subagent-code-call",
             "name": "exec",
             "input": r#"
-const reports = await Promise.all([
-  tools.spawn_agent({ role: "researcher", task: "inspect alpha" }),
-  tools.spawn_agent({ role: "reviewer", task: "inspect beta" })
-]);
-text(JSON.stringify(reports));
+(let [researcher (nanocodex.tools/call "spawn_agent" {:role "researcher" :task "inspect alpha"})
+      reviewer (nanocodex.tools/call "spawn_agent" {:role "reviewer" :task "inspect beta"})
+      reports (await (clojure.core.async/join-all [researcher reviewer]))]
+  (text reports))
 "#
         })],
     )
@@ -386,44 +385,45 @@ async fn serve_responses(listener: TcpListener, turns: usize, parallel_calls: us
 fn stress_source(turn: usize, parallel_calls: usize) -> String {
     format!(
         r#"
-const found = await tools.tool_search({{ query: "echo message", limit: 8 }});
-const remote = found.tools[0].name;
-const successful = await Promise.all(Array.from({{ length: {parallel_calls} }}, (_, index) =>
-  tools[remote]({{ message: "turn-{turn}-call-" + index, delay_ms: {PARALLEL_CALL_DELAY_MS} }})
-));
-const failures = await Promise.allSettled([
-  tools[remote]({{ message: "__fail__" }}),
-  tools.hashline__patch({{ patch: "definitely not a Hashline patch" }}),
-  tools.exec_command({{ cmd: "exit 23", login: false }}),
-  tools.exec_command({{ cmd: "yes x | head -c 65536", login: false, max_output_tokens: 256 }})
-]);
-const yielded = await tools.exec_command({{
-  cmd: "printf start; sleep 1; printf end",
-  login: false,
-  yield_time_ms: 250
-}});
-if (!yielded.session_id) {{
-  throw new Error("exec_command completed before exercising write_stdin");
-}}
-const resumed = await tools.write_stdin({{
-  session_id: yielded.session_id,
-  yield_time_ms: 1000
-}});
-if (resumed.exit_code !== 0) {{
-  throw new Error("write_stdin did not observe a clean process exit");
-}}
-let unknownRejected = false;
-try {{
-  await tools.__nanocodex_missing_tool__({{}});
-}} catch (_) {{
-  unknownRejected = true;
-}}
-text(JSON.stringify({{
-  successful: successful.length,
-  rejected: failures.filter((result) => result.status === "rejected").length,
-  resumed: resumed.exit_code ?? null,
-  unknownRejected
-}}));
+(let [found (await (nanocodex.tools/call "tool_search" {{:query "echo message" :limit 8}}))
+      remote (:name (first (:tools found)))
+      successful-futures (mapv (fn [index]
+                                 (nanocodex.tools/call remote
+                                   {{:message (str "turn-{turn}-call-" index)
+                                     :delay_ms {PARALLEL_CALL_DELAY_MS}}}))
+                               (range {parallel_calls}))
+      successful (await (clojure.core.async/join-all successful-futures))
+      remote-failure (nanocodex.tools/call remote {{:message "__fail__"}})
+      patch-failure (nanocodex.tools/call "hashline__patch" {{:patch "definitely not a Hashline patch"}})
+      command-failure (nanocodex.tools/call "exec_command" {{:cmd "exit 23" :login false}})
+      output-failure (nanocodex.tools/call "exec_command"
+                       {{:cmd "yes x | head -c 65536" :login false :max_output_tokens 256}})
+      failures [(try (await remote-failure) {{:status "fulfilled"}}
+                     (catch Exception _ {{:status "rejected"}}))
+                (try (await patch-failure) {{:status "fulfilled"}}
+                     (catch Exception _ {{:status "rejected"}}))
+                (try (await command-failure) {{:status "fulfilled"}}
+                     (catch Exception _ {{:status "rejected"}}))
+                (try (await output-failure) {{:status "fulfilled"}}
+                     (catch Exception _ {{:status "rejected"}}))]
+      yielded (await (nanocodex.tools/call "exec_command"
+                       {{:cmd "printf start; sleep 1; printf end"
+                         :login false
+                         :yield_time_ms 250}}))
+      _ (when-not (:session_id yielded)
+          (throw (ex-info "exec_command completed before exercising write_stdin" {{}})))
+      resumed (await (nanocodex.tools/call "write_stdin"
+                       {{:session_id (:session_id yielded) :yield_time_ms 1000}}))
+      _ (when-not (= (:exit_code resumed) 0)
+          (throw (ex-info "write_stdin did not observe a clean process exit" {{}})))
+      unknown-rejected (try
+                         (await (nanocodex.tools/call "__nanocodex_missing_tool__" {{}}))
+                         false
+                         (catch Exception _ true))]
+  (text {{:successful (count successful)
+         :rejected (count (filter (fn [result] (= (:status result) "rejected")) failures))
+         :resumed (:exit_code resumed)
+         :unknownRejected unknown-rejected}}))
 "#
     )
 }
@@ -573,7 +573,7 @@ fn validate_parallel_code_mode_spans(
     assert_eq!(
         parallel.len(),
         parallel_calls,
-        "trace {trace_id} did not retain every delayed Promise.all call"
+        "trace {trace_id} did not retain every delayed join-all call"
     );
     let parent = span_parent_id(parallel[0])
         .ok_or_else(|| eyre!("parallel tool span in trace {trace_id} had no parent"))?;
@@ -614,7 +614,7 @@ fn validate_parallel_code_mode_spans(
         .unwrap_or_default();
     assert_eq!(
         maximum_overlap, parallel_calls,
-        "trace {trace_id} serialized Code Mode Promise.all calls: maximum overlap was {maximum_overlap}/{parallel_calls}"
+        "trace {trace_id} serialized Code Mode join-all calls: maximum overlap was {maximum_overlap}/{parallel_calls}"
     );
     Ok(())
 }

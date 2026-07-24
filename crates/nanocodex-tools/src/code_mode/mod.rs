@@ -1,11 +1,15 @@
-mod description;
+pub(crate) mod description;
 mod embedded;
 mod output;
 mod spec;
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt::Write as _, path::PathBuf, sync::Arc, time::Instant};
 
-use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use futures_util::{
+    FutureExt, StreamExt,
+    future::{AbortHandle, Abortable, Aborted, BoxFuture},
+    stream::FuturesUnordered,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
@@ -31,25 +35,25 @@ const DEFAULT_WAIT_YIELD: Duration = Duration::from_secs(10);
 const OBSERVER_YIELD_GRACE: Duration = Duration::from_secs(1);
 const MIN_YIELD_FOR_OBSERVER_GRACE: Duration = Duration::from_secs(10);
 const NESTED_YIELD_GRACE: Duration = Duration::from_secs(5);
-const MAX_JS_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
-const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
+const MAX_JSON_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+const EXEC_PRAGMA_PREFIX: &str = ";; @exec:";
 pub(crate) struct CodeModeRuntime {
     cells: Arc<Mutex<CellRegistry>>,
     stored: Arc<Mutex<HashMap<String, Value>>>,
-    host: Arc<Mutex<SharedJsHost>>,
+    host: Arc<Mutex<SharedCljHost>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct CodeModeControl {
     cells: Arc<Mutex<CellRegistry>>,
-    host: Arc<Mutex<SharedJsHost>>,
+    host: Arc<Mutex<SharedCljHost>>,
 }
 
-struct SharedJsHost {
+struct SharedCljHost {
     host: Option<EmbeddedHost>,
 }
 
-impl SharedJsHost {
+impl SharedCljHost {
     fn prewarmed() -> Self {
         let host = match spawn_host() {
             Ok(host) => Some(host),
@@ -57,7 +61,7 @@ impl SharedJsHost {
                 tracing::warn!(
                     target: "nanocodex_tools",
                     %error,
-                    "embedded QuickJS code mode prewarm failed; the first cell will retry"
+                    "embedded cljrs Code Mode prewarm failed; the first cell will retry"
                 );
                 None
             }
@@ -126,7 +130,7 @@ enum CellUpdate {
         content: Vec<ToolOutputContent>,
     },
     ScriptFailed {
-        message: String,
+        diagnostic: CellDiagnostic,
         content: Vec<ToolOutputContent>,
     },
     HostFailed(String),
@@ -154,10 +158,135 @@ pub struct NestedToolCall {
     pub metadata: Option<Box<RawValue>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellDiagnostic {
+    kind: CellDiagnosticKind,
+    message: String,
+    form_index: Option<usize>,
+    location: Option<CellSourceLocation>,
+    exception: Option<CellExceptionInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellDiagnosticKind {
+    Read,
+    Runtime,
+    GasExhausted,
+    ForbiddenEffect,
+    UnboundSymbol,
+    Arity,
+    NotCallable,
+    Thrown,
+    CommitSignatureVerificationFailed,
+    InternalRecur,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellSourceLocation {
+    source: String,
+    byte_start: usize,
+    byte_end: usize,
+    line: u32,
+    column: u32,
+    precision: CellLocationPrecision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CellLocationPrecision {
+    Exact,
+    EnclosingTopLevelForm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellExceptionInfo {
+    message: String,
+    data: Option<Value>,
+    data_unavailable: Option<String>,
+    cause: Option<Box<Self>>,
+}
+
+impl CellDiagnostic {
+    fn runtime(message: impl Into<String>) -> Self {
+        Self {
+            kind: CellDiagnosticKind::Runtime,
+            message: message.into(),
+            form_index: None,
+            location: None,
+            exception: None,
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut rendered = format!("{} error: {}", self.kind.label(), self.message);
+        if let Some(location) = &self.location {
+            let precision = match location.precision {
+                CellLocationPrecision::Exact => "exact reader location",
+                CellLocationPrecision::EnclosingTopLevelForm => "enclosing top-level form",
+            };
+            let _ = write!(
+                rendered,
+                "\n  at {}:{}:{} (bytes {}..{}, {precision})",
+                location.source,
+                location.line,
+                location.column,
+                location.byte_start,
+                location.byte_end
+            );
+        }
+        if let Some(form_index) = self.form_index {
+            let _ = write!(rendered, "\n  top-level form: {form_index}");
+        }
+        if let Some(exception) = &self.exception {
+            render_exception(exception, &mut rendered, 0);
+        }
+        rendered
+    }
+}
+
+impl CellDiagnosticKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Runtime => "runtime",
+            Self::GasExhausted => "gas-exhausted",
+            Self::ForbiddenEffect => "forbidden-effect",
+            Self::UnboundSymbol => "unbound-symbol",
+            Self::Arity => "arity",
+            Self::NotCallable => "not-callable",
+            Self::Thrown => "thrown",
+            Self::CommitSignatureVerificationFailed => "commit-signature-verification",
+            Self::InternalRecur => "internal-recur",
+        }
+    }
+}
+
+fn render_exception(exception: &CellExceptionInfo, rendered: &mut String, depth: usize) {
+    let indent = "  ".repeat(depth.saturating_add(1));
+    if depth > 0 {
+        let _ = write!(rendered, "\n{indent}caused by: {}", exception.message);
+    }
+    if let Some(data) = &exception.data {
+        let _ = write!(rendered, "\n{indent}ex-data: {data}");
+    }
+    if let Some(error) = &exception.data_unavailable {
+        let _ = write!(rendered, "\n{indent}ex-data unavailable: {error}");
+    }
+    if let Some(cause) = &exception.cause {
+        render_exception(cause, rendered, depth.saturating_add(1));
+    }
+}
+
 enum RuntimeEvent {
     ToolCall {
         cell_id: u64,
         id: u64,
+        name: String,
+        input: Value,
+    },
+    CancelTool {
+        cell_id: u64,
+        id: u64,
+        call_id: String,
         name: String,
         input: Value,
     },
@@ -176,7 +305,7 @@ enum RuntimeEvent {
     },
     Error {
         cell_id: u64,
-        message: String,
+        diagnostic: CellDiagnostic,
         content: Vec<ToolOutputContent>,
         stored: HashMap<String, Value>,
     },
@@ -186,6 +315,7 @@ impl RuntimeEvent {
     fn cell_id(&self) -> u64 {
         match self {
             Self::ToolCall { cell_id, .. }
+            | Self::CancelTool { cell_id, .. }
             | Self::Notify { cell_id, .. }
             | Self::Yielded { cell_id, .. }
             | Self::Done { cell_id, .. }
@@ -206,7 +336,7 @@ enum CellTerminal {
         stored: HashMap<String, Value>,
     },
     ScriptFailed {
-        message: String,
+        diagnostic: CellDiagnostic,
         content: Vec<ToolOutputContent>,
         stored: HashMap<String, Value>,
     },
@@ -224,7 +354,7 @@ impl CodeModeRuntime {
                 live_cells: HashMap::new(),
             })),
             stored: Arc::new(Mutex::new(HashMap::new())),
-            host: Arc::new(Mutex::new(SharedJsHost::prewarmed())),
+            host: Arc::new(Mutex::new(SharedCljHost::prewarmed())),
         }
     }
 
@@ -451,7 +581,7 @@ struct ParsedExecSource {
 fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
     if input.trim().is_empty() {
         return Err(
-            "exec expects raw JavaScript source text (non-empty). Provide JS only, optionally with first-line `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`."
+            "exec expects raw Clojure source text (non-empty). Provide Clojure forms only, optionally with first-line `;; @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`."
                 .to_owned(),
         );
     }
@@ -468,7 +598,7 @@ fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
     };
     if rest.trim().is_empty() {
         return Err(
-            "exec pragma must be followed by JavaScript source on subsequent lines".to_owned(),
+            "exec pragma must be followed by Clojure source on subsequent lines".to_owned(),
         );
     }
     let directive = pragma.trim();
@@ -502,7 +632,7 @@ fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
     })?;
     if pragma
         .yield_time_ms
-        .is_some_and(|yield_time_ms| yield_time_ms > MAX_JS_SAFE_INTEGER)
+        .is_some_and(|yield_time_ms| yield_time_ms > MAX_JSON_SAFE_INTEGER)
     {
         return Err(
             "exec pragma field `yield_time_ms` must be a non-negative safe integer".to_owned(),
@@ -510,7 +640,7 @@ fn parse_exec_source(input: &str) -> Result<ParsedExecSource, String> {
     }
     if pragma.max_output_tokens.is_some_and(|max_output_tokens| {
         u64::try_from(max_output_tokens).map_or(true, |max_output_tokens| {
-            max_output_tokens > MAX_JS_SAFE_INTEGER
+            max_output_tokens > MAX_JSON_SAFE_INTEGER
         })
     }) {
         return Err(
@@ -552,7 +682,7 @@ impl LiveCell {
         context: OwnedToolContext,
         stored: HashMap<String, Value>,
         shared_stored: Arc<Mutex<HashMap<String, Value>>>,
-        host: Arc<Mutex<SharedJsHost>>,
+        host: Arc<Mutex<SharedCljHost>>,
         output_token_budget: usize,
     ) -> Self {
         let (updates_tx, updates) = mpsc::unbounded_channel();
@@ -616,7 +746,7 @@ impl Drop for LiveCell {
         }
         if let Some(task) = self.task.take() {
             // The detached actor observes `terminate` and shuts down the shared
-            // host. Aborting here could leave JavaScript running in an isolate
+            // host. Aborting here could leave Clojure evaluation running in an isolate
             // that a later cell is about to reuse.
             drop(task);
         }
@@ -690,11 +820,11 @@ async fn observe_cell(
                 );
             }
             Some(CellUpdate::ScriptFailed {
-                message,
+                diagnostic,
                 mut content,
             }) => {
                 content.push(ToolOutputContent::InputText {
-                    text: format!("Script error:\n{message}"),
+                    text: format!("Script error:\n{}", diagnostic.render()),
                 });
                 return (
                     observed_execution(
@@ -842,7 +972,7 @@ fn expose_running_shell_sessions(
         }
         content.push(ToolOutputContent::InputText {
             text: format!(
-                "Nested shell process is still running with session ID {session_id}. Resume it with tools.write_stdin({{ session_id: {session_id}, chars: \"\" }})."
+                "Nested shell process is still running with session ID {session_id}. Resume it with (await (tool-call \"write_stdin\" {{:session_id {session_id} :chars \"\"}}))."
             ),
         });
     }
@@ -865,16 +995,21 @@ impl EmbeddedHost {
         updates: &mpsc::UnboundedSender<CellUpdate>,
         actor_started_at: Instant,
     ) -> Result<CellTerminal, HostFailure> {
-        let mut pending_calls: FuturesUnordered<BoxFuture<'_, CompletedNestedCall>> =
-            FuturesUnordered::new();
+        let mut pending_calls: FuturesUnordered<
+            BoxFuture<'_, (u64, Result<CompletedNestedCall, Aborted>)>,
+        > = FuturesUnordered::new();
+        let mut abort_handles = HashMap::<u64, AbortHandle>::new();
         let mut event_count = 0_u64;
         loop {
             tokio::select! {
                 completed = pending_calls.next(), if !pending_calls.is_empty() => {
-                    let Some(completed) = completed else {
+                    let Some((id, completed)) = completed else {
                         continue;
                     };
-                    let id = completed.id;
+                    abort_handles.remove(&id);
+                    let Ok(completed) = completed else {
+                        continue;
+                    };
                     let call = self.send_completed_call(cell_id, completed)?;
                     let _ = updates.send(CellUpdate::NestedCall { id, call });
                 }
@@ -904,40 +1039,52 @@ impl EmbeddedHost {
                                     yield_after,
                                 });
                             }
-                            pending_calls
-                                .push(execute_nested_call(tools, id, name, input, context).boxed());
+                            let (abort_handle, abort_registration) = AbortHandle::new_pair();
+                            abort_handles.insert(id, abort_handle);
+                            pending_calls.push(
+                                Abortable::new(
+                                    execute_nested_call(tools, id, name, input, context),
+                                    abort_registration,
+                                )
+                                .map(move |result| (id, result))
+                                .boxed(),
+                            );
+                        }
+                        RuntimeEvent::CancelTool {
+                            id, call_id, name, input, ..
+                        } => {
+                            if let Some(handle) = abort_handles.remove(&id) {
+                                handle.abort();
+                                let call = NestedToolCall {
+                                    call_id,
+                                    name,
+                                    input,
+                                    output: ToolOutputBody::Text(
+                                        "nested tool call cancelled".to_owned(),
+                                    ),
+                                    success: false,
+                                    duration_ns: 0,
+                                    metadata: None,
+                                };
+                                let _ = updates.send(CellUpdate::NestedCall { id, call });
+                            }
                         }
                         RuntimeEvent::Notify { text, .. } => {
                             let _ = updates.send(CellUpdate::Notification(
                                 CodeModeNotification::new(parent_call_id, text),
                             ));
                         }
-                        RuntimeEvent::Yielded {
-                            content,
-                            ..
-                        } => {
+                        RuntimeEvent::Yielded { content, .. } => {
                             let _ = updates.send(CellUpdate::Yielded { content });
                         }
-                        RuntimeEvent::Done {
-                            content,
-                            stored,
-                            ..
-                        } => {
+                        RuntimeEvent::Done { content, stored, .. } => {
                             tracing::Span::current().record("runtime.event_count", event_count);
-                            return Ok(CellTerminal::Completed {
-                                content,
-                                stored,
-                            });
+                            return Ok(CellTerminal::Completed { content, stored });
                         }
-                        RuntimeEvent::Error {
-                            message,
-                            content,
-                            stored,
-                            ..
-                        } => {
+                        RuntimeEvent::Error { diagnostic, content, stored, .. } => {
                             tracing::Span::current().record("runtime.event_count", event_count);
                             return Ok(CellTerminal::ScriptFailed {
-                                message,
+                                diagnostic,
                                 content,
                                 stored,
                             });
@@ -983,9 +1130,13 @@ fn nested_tool_yield_after(name: &str, input: &Value) -> Option<Duration> {
     Some(Duration::from_millis(requested.clamp(minimum, maximum)))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one actor owns host checkout, cancellation, terminal forwarding, and reuse"
+)]
 async fn run_cell_actor(
-    shared_host: Arc<Mutex<SharedJsHost>>,
+    shared_host: Arc<Mutex<SharedCljHost>>,
     cell_id: u64,
     source: String,
     tools: Arc<ToolRegistry>,
@@ -1021,8 +1172,14 @@ async fn run_cell_actor(
         },
     };
     let run = async {
-        host.start_cell(cell_id, &source, stored, tools.nested_tool_metadata())
-            .map_err(HostFailure::new)?;
+        host.start_cell(
+            cell_id,
+            &context.call_id,
+            &source,
+            stored,
+            tools.nested_tool_metadata(),
+        )
+        .map_err(HostFailure::new)?;
         host.drive_cell(
             cell_id,
             &context.call_id,
@@ -1062,12 +1219,15 @@ async fn run_cell_actor(
             let _ = updates.send(CellUpdate::Completed { content });
         }
         Ok(CellTerminal::ScriptFailed {
-            message,
+            diagnostic,
             content,
             stored,
         }) => {
             shared_stored.lock().await.extend(stored);
-            let _ = updates.send(CellUpdate::ScriptFailed { message, content });
+            let _ = updates.send(CellUpdate::ScriptFailed {
+                diagnostic,
+                content,
+            });
         }
         Err(failure) => {
             let _ = updates.send(CellUpdate::HostFailed(failure.message));

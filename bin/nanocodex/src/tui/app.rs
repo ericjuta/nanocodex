@@ -2731,7 +2731,7 @@ mod tests {
 
     #[test]
     fn code_mode_and_multiline_shell_arguments_preserve_line_structure() {
-        let code = "const tasks = inputs.map(run);\nawait Promise.all(tasks);";
+        let code = "(let [tasks (mapv run inputs)]\n  (await (clojure.core.async/join-all tasks)))";
         assert_eq!(summarize_tool_arguments("exec", &json!(code)), code);
         assert_eq!(
             summarize_tool_arguments(

@@ -100,7 +100,7 @@ async fn assistant_events_preserve_commentary_and_final_answer_phases() -> Resul
                         "type": "custom_tool_call",
                         "call_id": "call-exec",
                         "name": "exec",
-                        "input": "text(\"observed\");"
+                        "input": "(text(\"observed\"))"
                     }),
                 ],
             ),
@@ -298,7 +298,7 @@ async fn steering_during_a_tool_call_joins_after_the_tool_result() -> Result<()>
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "const result = await tools.exec_command({cmd: \"printf started > tool-started; while [ ! -f release-tool ]; do sleep 0.01; done; printf shit\"}); text(result.output);"
+                    "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf started > tool-started; while [ ! -f release-tool ]; do sleep 0.01; done; printf shit\"}))] (text (:output result)))"
                 })],
             ),
         )
@@ -505,7 +505,7 @@ async fn cancellation_pairs_an_active_tool_call_before_resuming() -> Result<()> 
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "const result = await tools.exec_command({cmd: \"printf started > tool-started; sleep 30\"}); text(result.output);"
+                    "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf started > tool-started; sleep 30\"}))] (text (:output result)))"
                 })],
             ),
         )
@@ -614,19 +614,19 @@ async fn cancellation_during_second_tool_excludes_later_calls_from_snapshot_and_
                         "type": "custom_tool_call",
                         "call_id": "call-first",
                         "name": "exec",
-                        "input": "const result = await tools.exec_command({cmd: \"printf 1 >> marker.txt\"}); text(\"first completed\");"
+                        "input": "(let [_ (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf 1 >> marker.txt\"}))] (text \"first completed\"))"
                     }),
                     json!({
                         "type": "custom_tool_call",
                         "call_id": "call-second",
                         "name": "exec",
-                        "input": "const result = await tools.exec_command({cmd: \"printf started > tool-two-started; sleep 30\"}); text(result.output);"
+                        "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf started > tool-two-started; sleep 30\"}))] (text (:output result)))"
                     }),
                     json!({
                         "type": "custom_tool_call",
                         "call_id": "call-never-started",
                         "name": "exec",
-                        "input": "const result = await tools.exec_command({cmd: \"printf 3 >> marker.txt\"}); text(result.output);"
+                        "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf 3 >> marker.txt\"}))] (text (:output result)))"
                     }),
                 ],
             ),
@@ -787,7 +787,7 @@ async fn stored_response_local_code_mode_round_trip() -> Result<()> {
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "const result = await tools.exec_command({cmd: \"printf hello\"}); text(result.output);"
+                    "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf hello\"}))] (text (:output result)))"
                 })],
             ),
         )
@@ -917,7 +917,7 @@ async fn code_mode_notify_adds_a_named_exec_output_to_the_next_request() -> Resu
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "notify({phase: \"working\"}); text(\"done\");"
+                    "input": "(notify {:phase \"working\"}) (text \"done\")"
                 })],
             ),
         )
@@ -970,7 +970,7 @@ async fn prepares_images_and_stops_on_invalid_image_requests() -> Result<()> {
                     "type": "custom_tool_call",
                     "call_id": "call-image",
                     "name": "exec",
-                    "input": "image(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\", \"original\");"
+                    "input": "(image \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\" \"original\")"
                 })],
             ),
         )
@@ -1048,7 +1048,7 @@ async fn yielded_exec_cell_continues_through_direct_wait_tool() -> Result<()> {
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "text(\"before\"); await yield_control(); const result = await tools.exec_command({cmd: \"printf after\", login: false}); text(result.output);"
+                    "input": "(text \"before\") (await (yield-control)) (let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf after\" :login false}))] (text (:output result)))"
                 })],
             ),
         )
@@ -1210,7 +1210,7 @@ async fn continues_past_previous_model_call_limit() -> Result<()> {
                         "type": "custom_tool_call",
                         "call_id": call_id,
                         "name": "exec",
-                        "input": "text(\"continue\")"
+                        "input": "(text \"continue\")"
                     })],
                 ),
             )
@@ -1368,7 +1368,7 @@ async fn reconnect_drops_previous_response_id_and_replays_full_history() -> Resu
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "text(\"continued\")"
+                    "input": "(text \"continued\")"
                 })],
             ),
         )
@@ -1471,7 +1471,7 @@ async fn receive_reset_reconnects_without_replaying_completed_tools() -> Result<
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "const result = await tools.exec_command({cmd: \"printf x >> marker.txt\"}); text(result.output);"
+                    "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf x >> marker.txt\"}))] (text (:output result)))"
                 })],
             ),
         )
@@ -1558,7 +1558,7 @@ async fn sol_compacts_with_a_trigger_and_installs_the_returned_context() -> Resu
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "const result = await tools.hashline__transaction({action:{type:\"commit\"},mutations:[{type:\"create\",path:\"AGENTS.md\",contents:\"fresh compacted instructions\\n\"}]}); text(\"tool completed\")"
+                    "input": "(let [_ (await (nanocodex.tools/call \"hashline__transaction\" {:action {:type \"commit\"} :mutations [{:type \"create\" :path \"AGENTS.md\" :contents \"fresh compacted instructions\\n\"}]}))] (text \"tool completed\"))"
                 })],
                 372_001,
             ),
@@ -1651,19 +1651,19 @@ async fn fork_during_compaction_inherits_completed_tool_boundary() -> Result<()>
                         "type": "custom_tool_call",
                         "call_id": "call-first",
                         "name": "exec",
-                        "input": "const result = await tools.exec_command({cmd: \"printf 1 >> marker.txt\"}); text(\"first tool completed\");"
+                        "input": "(let [_ (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf 1 >> marker.txt\"}))] (text \"first tool completed\"))"
                     }),
                     json!({
                         "type": "custom_tool_call",
                         "call_id": "call-second",
                         "name": "exec",
-                        "input": "throw new Error(\"second tool failed\")"
+                        "input": "(throw (ex-info \"second tool failed\" {}))"
                     }),
                     json!({
                         "type": "custom_tool_call",
                         "call_id": "call-third",
                         "name": "exec",
-                        "input": "const result = await tools.exec_command({cmd: \"printf 3 >> marker.txt\"}); text(\"third tool completed\");"
+                        "input": "(let [_ (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf 3 >> marker.txt\"}))] (text \"third tool completed\"))"
                     }),
                 ],
                 372_001,
@@ -1934,7 +1934,7 @@ async fn failed_continuation_replays_complete_safe_history_on_next_turn() -> Res
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "const result = await tools.exec_command({cmd: \"printf x >> marker.txt\"}); text(result.output);"
+                    "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf x >> marker.txt\"}))] (text (:output result)))"
                 })],
             ),
         )
@@ -2189,7 +2189,7 @@ async fn active_boundary_fork_sends_tool_and_steer_delta_then_replays_on_checkpo
                     "type": "custom_tool_call",
                     "call_id": "call-exec",
                     "name": "exec",
-                    "input": "const result = await tools.exec_command({cmd: \"printf started > tool-started; while [ ! -f release-tool ]; do sleep 0.01; done; printf shit\"}); text(result.output);"
+                    "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf started > tool-started; while [ ! -f release-tool ]; do sleep 0.01; done; printf shit\"}))] (text (:output result)))"
                 })],
             ),
         )
@@ -2529,7 +2529,7 @@ async fn fork_executes_tools_in_its_fresh_runtime() -> Result<()> {
                     "type": "custom_tool_call",
                     "call_id": "call-branch-exec",
                     "name": "exec",
-                    "input": "const result = await tools.exec_command({cmd: \"printf branch-tool > btw-tool.txt\"}); text(result.output);"
+                    "input": "(let [result (await (nanocodex.tools/call \"exec_command\" {:cmd \"printf branch-tool > btw-tool.txt\"}))] (text (:output result)))"
                 })],
             ),
         )
