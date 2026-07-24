@@ -1134,7 +1134,9 @@ fn model_description_uses_clojure_declarations() {
     assert!(description.contains("equivalent namespaced primitive"));
     assert!(description.contains("(tool-info name)"));
     assert!(description.contains("(pending-tools)"));
-    assert!(description.contains("(cancel-tool future)"));
+    assert!(description.contains("(cancel-tool future-or-id)"));
+    assert!(description.contains("(code-mode-info)"));
+    assert!(description.contains("join-all-settled"));
     assert!(description.contains(":nested-tool-failure"));
     assert!(description.contains("Detailed input schema (JSON):"));
     assert!(

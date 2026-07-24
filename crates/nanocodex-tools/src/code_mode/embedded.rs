@@ -4,9 +4,13 @@ use std::{
     rc::Rc,
     sync::{Arc, mpsc as std_mpsc},
     thread,
+    time::Instant,
 };
 
-use cljrs_async::{eval_async::eval_async, isolate::Isolate, task_scope::FutureTaskScope};
+use cljrs_async::{
+    await_value, cancel_future, eval_async::eval_async, isolate::Isolate, spawn_future,
+    task_scope::FutureTaskScope,
+};
 use cljrs_env::{
     env::Env,
     error::EvalError,
@@ -62,6 +66,20 @@ struct PendingTool {
     call_id: String,
     name: String,
     input: JsonValue,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopePolicy {
+    CancelPending,
+    KeepRunning,
+}
+
+struct ToolScope {
+    id: u64,
+    on_error: ScopePolicy,
+    on_exit: ScopePolicy,
+    tool_ids: Vec<u64>,
 }
 
 struct ExecutionState {
@@ -70,6 +88,8 @@ struct ExecutionState {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     pending_tools: HashMap<u64, PendingTool>,
     next_tool_id: u64,
+    tool_scopes: Vec<ToolScope>,
+    next_scope_id: u64,
     content: Vec<ToolOutputContent>,
     stored: HashMap<String, JsonValue>,
     stored_writes: HashMap<String, JsonValue>,
@@ -225,6 +245,8 @@ async fn run_execution(
         event_tx: event_tx.clone(),
         pending_tools: HashMap::new(),
         next_tool_id: 1,
+        tool_scopes: Vec::new(),
+        next_scope_id: 1,
         content: Vec::new(),
         stored: start.stored,
         stored_writes: HashMap::new(),
@@ -233,6 +255,7 @@ async fn run_execution(
     }));
     install_helpers(globals, &cell_ns, &state);
 
+    let cell_source = start.source.clone();
     let mut parser = Parser::new(start.source, format!("<{cell_ns}>"));
     let forms = match parser.parse_all() {
         Ok(forms) => forms,
@@ -256,7 +279,7 @@ async fn run_execution(
                         return Err(CellEvalFailure {
                             error,
                             form_index: index.saturating_add(1),
-                            location: form_location(&form.span),
+                            location: form_location(&form.span, &cell_source),
                         });
                     }
                 };
@@ -519,25 +542,156 @@ fn install_helpers(
             cancel_tool(&cancel_state, args)
         }),
     );
+
+    let status_state = Rc::clone(state);
+    registry.define_in(
+        cell_ns,
+        "tool-status",
+        NativeFn::with_closure("nanocodex/tool-status", Arity::Fixed(1), move |args| {
+            Ok(tool_status(&status_state, args))
+        }),
+    );
+
+    let await_state = Rc::clone(state);
+    registry.define_in(
+        cell_ns,
+        "await-tool",
+        NativeFn::with_closure("nanocodex/await-tool", Arity::Fixed(1), move |args| {
+            await_tool(&await_state, args)
+        }),
+    );
+
+    let scope_state = Rc::clone(state);
+    registry.define_in(
+        cell_ns,
+        "with-tool-scope",
+        NativeFn::with_closure("nanocodex/with-tool-scope", Arity::Fixed(2), move |args| {
+            with_tool_scope(&scope_state, args)
+        }),
+    );
+
+    let runtime_info_state = Rc::clone(state);
+    registry.define_in(
+        cell_ns,
+        "code-mode-info",
+        NativeFn::with_closure("nanocodex/code-mode-info", Arity::Fixed(0), move |_args| {
+            Ok(code_mode_info(&runtime_info_state))
+        }),
+    );
 }
 
 fn all_tools(state: &Rc<RefCell<ExecutionState>>, args: &[Value]) -> Result<Value, ValueError> {
     if args.len() > 1 {
         return Err(ValueError::Other(
-            "all-tools accepts at most one string query".to_owned(),
+            "all-tools accepts at most one string or map query".to_owned(),
         ));
     }
-    let query = args
-        .first()
-        .map(tool_name)
-        .transpose()?
-        .map(|query| query.to_lowercase());
-    let tools = state
-        .borrow()
-        .tools
-        .iter()
+    match args.first() {
+        None | Some(Value::Nil) => {
+            let tools = state.borrow().tools.clone();
+            json_to_value(JsonValue::Array(tools)).map_err(ValueError::Other)
+        }
+        Some(Value::Map(query)) => all_tools_map_query(state, query),
+        Some(other) => {
+            let query = tool_name(other)?.to_lowercase();
+            let tools = state
+                .borrow()
+                .tools
+                .iter()
+                .filter(|tool| {
+                    tool.get("name")
+                        .and_then(JsonValue::as_str)
+                        .is_some_and(|name| name.to_lowercase().contains(&query))
+                        || tool
+                            .get("description")
+                            .and_then(JsonValue::as_str)
+                            .is_some_and(|description| description.to_lowercase().contains(&query))
+                })
+                .cloned()
+                .collect();
+            json_to_value(JsonValue::Array(tools)).map_err(ValueError::Other)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "map-query option parsing stays local to one discovery helper"
+)]
+fn all_tools_map_query(
+    state: &Rc<RefCell<ExecutionState>>,
+    query: &MapValue,
+) -> Result<Value, ValueError> {
+    let mut unknown = Vec::new();
+    query.for_each(|key, _| {
+        if let Value::Keyword(k) = key {
+            let name = k.get().name.as_ref();
+            if !matches!(
+                name,
+                "query" | "kind" | "dynamic" | "limit" | "cursor" | "include-schema"
+            ) {
+                unknown.push(name.to_owned());
+            }
+        }
+    });
+    if !unknown.is_empty() {
+        unknown.sort();
+        return Err(ValueError::Other(format!(
+            "all-tools unknown options: {}",
+            unknown.join(", ")
+        )));
+    }
+
+    let text_query = query
+        .get(&Value::keyword(Keyword::simple("query")))
+        .and_then(|value| match value {
+            Value::Str(s) => Some(s.get().to_lowercase()),
+            Value::Keyword(k) => Some(k.get().full_name().to_lowercase()),
+            _ => None,
+        });
+    let kind_filter = query
+        .get(&Value::keyword(Keyword::simple("kind")))
+        .and_then(|value| match value {
+            Value::Str(s) => Some(s.get().clone()),
+            Value::Keyword(k) => Some(k.get().name.as_ref().to_owned()),
+            _ => None,
+        });
+    let dynamic_filter = query
+        .get(&Value::keyword(Keyword::simple("dynamic")))
+        .and_then(|value| match value {
+            Value::Bool(b) => Some(b),
+            _ => None,
+        });
+    let limit = query
+        .get(&Value::keyword(Keyword::simple("limit")))
+        .and_then(|value| match value {
+            Value::Long(n) if n >= 0 => usize::try_from(n).ok(),
+            _ => None,
+        });
+    let cursor = query
+        .get(&Value::keyword(Keyword::simple("cursor")))
+        .and_then(|value| match value {
+            Value::Str(s) => s.get().parse::<usize>().ok(),
+            Value::Long(n) if n >= 0 => usize::try_from(n).ok(),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let include_schema = match query.get(&Value::keyword(Keyword::simple("include-schema"))) {
+        Some(Value::Bool(b)) => b,
+        Some(Value::Nil) => false,
+        _ => true,
+    };
+
+    let mut tools = state.borrow().tools.clone();
+    tools.sort_by(|left, right| {
+        left.get("name")
+            .and_then(JsonValue::as_str)
+            .cmp(&right.get("name").and_then(JsonValue::as_str))
+    });
+    let filtered = tools
+        .into_iter()
         .filter(|tool| {
-            query.as_ref().is_none_or(|query| {
+            text_query.as_ref().is_none_or(|query| {
                 tool.get("name")
                     .and_then(JsonValue::as_str)
                     .is_some_and(|name| name.to_lowercase().contains(query))
@@ -545,11 +699,31 @@ fn all_tools(state: &Rc<RefCell<ExecutionState>>, args: &[Value]) -> Result<Valu
                         .get("description")
                         .and_then(JsonValue::as_str)
                         .is_some_and(|description| description.to_lowercase().contains(query))
+            }) && kind_filter.as_ref().is_none_or(|kind| {
+                tool.get("kind").and_then(JsonValue::as_str) == Some(kind.as_str())
+            }) && dynamic_filter.is_none_or(|dynamic| {
+                tool.get("dynamic").and_then(JsonValue::as_bool) == Some(dynamic)
             })
         })
-        .cloned()
-        .collect();
-    json_to_value(JsonValue::Array(tools)).map_err(ValueError::Other)
+        .collect::<Vec<_>>();
+    let page = filtered
+        .into_iter()
+        .skip(cursor)
+        .take(limit.unwrap_or(usize::MAX))
+        .map(|mut tool| {
+            if !include_schema && let Some(object) = tool.as_object_mut() {
+                object.remove("input_schema");
+                object.remove("output_schema");
+            }
+            tool
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = cursor.saturating_add(page.len());
+    json_to_value(json!({
+        "tools": page,
+        "next_cursor": next_cursor,
+    }))
+    .map_err(ValueError::Other)
 }
 
 fn tool_info(state: &Rc<RefCell<ExecutionState>>, args: &[Value]) -> Result<Value, ValueError> {
@@ -587,6 +761,9 @@ fn pending_tools(state: &Rc<RefCell<ExecutionState>>) -> Result<Value, ValueErro
                 "call_id": tool.call_id,
                 "name": tool.name,
                 "input": tool.input,
+                "state": future_state_name(tool.value.as_ref()),
+                "started_at_ms": u64::try_from(tool.started_at.elapsed().as_millis())
+                    .unwrap_or(u64::MAX),
             })
         })
         .collect::<Vec<_>>();
@@ -595,34 +772,29 @@ fn pending_tools(state: &Rc<RefCell<ExecutionState>>) -> Result<Value, ValueErro
 }
 
 fn cancel_tool(state: &Rc<RefCell<ExecutionState>>, args: &[Value]) -> Result<Value, ValueError> {
-    let Value::Future(target) = &args[0] else {
-        return Err(ValueError::Other(format!(
-            "cancel-tool expects a nested tool future, got {}",
-            args[0].type_name()
-        )));
+    let Some(id) = resolve_tool_id(state, &args[0]) else {
+        return Ok(Value::Bool(false));
     };
+    cancel_tool_id(state, id)
+}
+
+fn cancel_tool_id(state: &Rc<RefCell<ExecutionState>>, id: u64) -> Result<Value, ValueError> {
     let cancellation = {
         let state = state.borrow();
-        state.pending_tools.iter().find_map(|(id, tool)| {
-            let Value::Future(candidate) = tool.value.as_ref() else {
-                return None;
-            };
-            GcPtr::ptr_eq(candidate, target).then(|| {
-                (
-                    *id,
-                    RuntimeEvent::CancelTool {
-                        cell_id: state.execution_id,
-                        id: *id,
-                        call_id: tool.call_id.clone(),
-                        name: tool.name.clone(),
-                        input: tool.input.clone(),
-                    },
-                    state.event_tx.clone(),
-                )
-            })
+        state.pending_tools.get(&id).map(|tool| {
+            (
+                RuntimeEvent::CancelTool {
+                    cell_id: state.execution_id,
+                    id,
+                    call_id: tool.call_id.clone(),
+                    name: tool.name.clone(),
+                    input: tool.input.clone(),
+                },
+                state.event_tx.clone(),
+            )
         })
     };
-    let Some((id, event, event_tx)) = cancellation else {
+    let Some((event, event_tx)) = cancellation else {
         return Ok(Value::Bool(false));
     };
     event_tx
@@ -636,13 +808,203 @@ fn cancel_tool(state: &Rc<RefCell<ExecutionState>>, args: &[Value]) -> Result<Va
 
 fn cancel_tool_future(tool: &PendingTool) {
     if let Value::Future(future) = tool.value.as_ref() {
-        let mut future_state = future
-            .get()
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *future_state = FutureState::Cancelled;
-        future.get().cond.notify_all();
+        cancel_future(future);
+    }
+}
+
+fn tool_status(state: &Rc<RefCell<ExecutionState>>, args: &[Value]) -> Value {
+    let Some(id) = resolve_tool_id(state, &args[0]) else {
+        return Value::Nil;
+    };
+    let id_value = Value::Long(i64::try_from(id).unwrap_or(i64::MAX));
+    let state = state.borrow();
+    let Some(tool) = state.pending_tools.get(&id) else {
+        return Value::Map(MapValue::from_pairs(vec![
+            (Value::keyword(Keyword::simple("id")), id_value),
+            (
+                Value::keyword(Keyword::simple("state")),
+                Value::keyword(Keyword::simple("unknown")),
+            ),
+        ]));
+    };
+    Value::Map(MapValue::from_pairs(vec![
+        (Value::keyword(Keyword::simple("id")), id_value),
+        (
+            Value::keyword(Keyword::simple("call-id")),
+            Value::Str(GcPtr::new(tool.call_id.clone())),
+        ),
+        (
+            Value::keyword(Keyword::simple("name")),
+            Value::Str(GcPtr::new(tool.name.clone())),
+        ),
+        (
+            Value::keyword(Keyword::simple("state")),
+            Value::keyword(Keyword::simple(future_state_name(tool.value.as_ref()))),
+        ),
+        (
+            Value::keyword(Keyword::simple("elapsed-ms")),
+            Value::Long(i64::try_from(tool.started_at.elapsed().as_millis()).unwrap_or(i64::MAX)),
+        ),
+    ]))
+}
+
+fn await_tool(state: &Rc<RefCell<ExecutionState>>, args: &[Value]) -> Result<Value, ValueError> {
+    let Some(id) = resolve_tool_id(state, &args[0]) else {
+        return Err(ValueError::Other(
+            "await-tool expects a pending tool future or id".to_owned(),
+        ));
+    };
+    let future = {
+        let state = state.borrow();
+        let Some(tool) = state.pending_tools.get(&id) else {
+            return Err(ValueError::Other(format!(
+                "await-tool: no pending tool with id {id}"
+            )));
+        };
+        tool.value.as_ref().clone()
+    };
+    Ok(future)
+}
+
+fn with_tool_scope(
+    state: &Rc<RefCell<ExecutionState>>,
+    args: &[Value],
+) -> Result<Value, ValueError> {
+    let opts = match args.first() {
+        Some(Value::Map(map)) => map.clone(),
+        Some(Value::Nil) | None => MapValue::empty(),
+        Some(other) => {
+            return Err(ValueError::Other(format!(
+                "with-tool-scope expects an options map, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let thunk = args.get(1).cloned().unwrap_or(Value::Nil);
+    let on_error_opt = opts.get(&Value::keyword(Keyword::simple("on-error")));
+    let on_exit_opt = opts.get(&Value::keyword(Keyword::simple("on-exit")));
+    let on_error = scope_policy(on_error_opt.as_ref(), ScopePolicy::KeepRunning)?;
+    let on_exit = scope_policy(on_exit_opt.as_ref(), ScopePolicy::CancelPending)?;
+    let state = Rc::clone(state);
+    let (globals, ns) = cljrs_env::callback::capture_eval_context().ok_or_else(|| {
+        ValueError::Other("with-tool-scope called outside an eval context".to_owned())
+    })?;
+    Ok(spawn_future(async move {
+        let scope_id = {
+            let mut state = state.borrow_mut();
+            let id = state.next_scope_id;
+            state.next_scope_id = state.next_scope_id.saturating_add(1);
+            state.tool_scopes.push(ToolScope {
+                id,
+                on_error,
+                on_exit,
+                tool_ids: Vec::new(),
+            });
+            id
+        };
+        let mut env = Env::new(globals, &ns);
+        let applied = cljrs_env::apply::apply_value(&thunk, Vec::new(), &mut env);
+        let result = match applied {
+            Ok(value) => await_value(value).await,
+            Err(error) => Err(error),
+        };
+        finish_tool_scope(&state, scope_id, result.is_err());
+        result
+    }))
+}
+
+fn scope_policy(value: Option<&Value>, default: ScopePolicy) -> Result<ScopePolicy, ValueError> {
+    match value {
+        None | Some(Value::Nil) => Ok(default),
+        Some(Value::Keyword(k)) if k.get().name.as_ref() == "cancel-pending" => {
+            Ok(ScopePolicy::CancelPending)
+        }
+        Some(Value::Keyword(k)) if k.get().name.as_ref() == "keep-running" => {
+            Ok(ScopePolicy::KeepRunning)
+        }
+        Some(other) => Err(ValueError::Other(format!(
+            "scope policy must be :cancel-pending or :keep-running, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn finish_tool_scope(state: &Rc<RefCell<ExecutionState>>, scope_id: u64, errored: bool) {
+    let (policy, tool_ids) = {
+        let mut state = state.borrow_mut();
+        let Some(index) = state
+            .tool_scopes
+            .iter()
+            .position(|scope| scope.id == scope_id)
+        else {
+            return;
+        };
+        let scope = state.tool_scopes.remove(index);
+        let policy = if errored {
+            scope.on_error
+        } else {
+            scope.on_exit
+        };
+        (policy, scope.tool_ids)
+    };
+    if policy == ScopePolicy::CancelPending {
+        for id in tool_ids {
+            let _ = cancel_tool_id(state, id);
+        }
+    }
+}
+
+fn code_mode_info(state: &Rc<RefCell<ExecutionState>>) -> Value {
+    let pending = state.borrow().pending_tools.len();
+    let tool_count = state.borrow().tools.len();
+    json_to_value(json!({
+        "runtime": "cljrs",
+        "cljrs_async": "0.1.228",
+        "nanocodex_tools": env!("CARGO_PKG_VERSION"),
+        "supported_async_forms": [
+            "await", "do", "if", "let", "loop", "try", "binding", "and", "or", "letfn", "with-out-str"
+        ],
+        "supported_combinators": [
+            "timeout", "alts", "join-all", "join-all-settled", "race", "await-with-timeout", "with-tool-scope"
+        ],
+        "pending_tools": pending,
+        "enabled_tools": tool_count,
+        "budgets": {
+            "gas": "policy-owned",
+            "cell_local_handles": true
+        }
+    }))
+    .unwrap_or(Value::Nil)
+}
+
+fn resolve_tool_id(state: &Rc<RefCell<ExecutionState>>, value: &Value) -> Option<u64> {
+    match value {
+        Value::Long(id) if *id >= 0 => u64::try_from(*id).ok(),
+        Value::Future(target) => state.borrow().pending_tools.iter().find_map(|(id, tool)| {
+            let Value::Future(candidate) = tool.value.as_ref() else {
+                return None;
+            };
+            GcPtr::ptr_eq(candidate, target).then_some(*id)
+        }),
+        _ => None,
+    }
+}
+
+fn future_state_name(value: &Value) -> &'static str {
+    let Value::Future(future) = value else {
+        return "unknown";
+    };
+    match &*future
+        .get()
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        FutureState::Running => "running",
+        FutureState::Done(_) => "done",
+        FutureState::Failed(_) => "failed",
+        FutureState::GasExhausted => "gas-exhausted",
+        FutureState::Cancelled => "cancelled",
     }
 }
 
@@ -660,6 +1022,7 @@ fn start_tool_call(
         }
     };
     let input = value_to_json(&args[1]).map_err(ValueError::Other)?;
+    validate_tool_input(state, &name, &input)?;
     let future = GcPtr::new(CljxFuture::new());
     let rooted = Box::new(Value::Future(future.clone()));
     let root = root_value(rooted.as_ref());
@@ -668,6 +1031,9 @@ fn start_tool_call(
     let id = state.next_tool_id;
     state.next_tool_id = state.next_tool_id.saturating_add(1);
     let call_id = format!("{}/code-{id}", state.parent_call_id);
+    if let Some(scope) = state.tool_scopes.last_mut() {
+        scope.tool_ids.push(id);
+    }
     state.pending_tools.insert(
         id,
         PendingTool {
@@ -676,6 +1042,7 @@ fn start_tool_call(
             call_id,
             name: name.clone(),
             input: input.clone(),
+            started_at: Instant::now(),
         },
     );
     state
@@ -688,6 +1055,64 @@ fn start_tool_call(
         })
         .map_err(|_| ValueError::Other("Code Mode observer closed".to_owned()))?;
     Ok(Value::Future(future))
+}
+
+fn validate_tool_input(
+    state: &Rc<RefCell<ExecutionState>>,
+    name: &str,
+    input: &JsonValue,
+) -> Result<(), ValueError> {
+    let schema = state.borrow().tools.iter().find_map(|tool| {
+        (tool.get("name").and_then(JsonValue::as_str) == Some(name))
+            .then(|| tool.get("input_schema").cloned())
+            .flatten()
+    });
+    let Some(schema) = schema else {
+        return Ok(());
+    };
+    if schema.is_null() {
+        return Ok(());
+    }
+    if let Err(error) = jsonschema::validate(&schema, input) {
+        let path = error.instance_path().to_string();
+        let schema_path = error.schema_path().to_string();
+        let message = format!("tool input invalid for `{name}`: {error}");
+        let data = MapValue::from_pairs(vec![
+            (
+                Value::keyword(Keyword::simple("type")),
+                Value::keyword(Keyword::simple("tool-input-invalid")),
+            ),
+            (
+                Value::keyword(Keyword::simple("tool")),
+                Value::Str(GcPtr::new(name.to_owned())),
+            ),
+            (
+                Value::keyword(Keyword::simple("instance-path")),
+                Value::Str(GcPtr::new(path)),
+            ),
+            (
+                Value::keyword(Keyword::simple("schema-path")),
+                Value::Str(GcPtr::new(schema_path)),
+            ),
+            (
+                Value::keyword(Keyword::simple("expected")),
+                json_to_value(schema).unwrap_or(Value::Nil),
+            ),
+            (
+                Value::keyword(Keyword::simple("value")),
+                json_to_value(input.clone()).unwrap_or(Value::Nil),
+            ),
+        ]);
+        return Err(ValueError::Thrown(Value::Error(GcPtr::new(
+            ExceptionInfo::new(
+                ValueError::Other(message.clone()),
+                message,
+                Some(data),
+                None,
+            ),
+        ))));
+    }
+    Ok(())
 }
 
 fn settle_tool_result(
@@ -719,8 +1144,11 @@ fn settle_tool_result(
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *future_state = next;
-    future.get().cond.notify_all();
+    if matches!(*future_state, FutureState::Running) {
+        *future_state = next;
+        drop(future_state);
+        future.get().cond.notify_all();
+    }
 }
 
 fn tool_failure_value(pending: &PendingTool, output: JsonValue) -> Value {
@@ -944,7 +1372,8 @@ fn exception_info(exception: &ExceptionInfo, depth: usize) -> CellExceptionInfo 
     }
 }
 
-fn form_location(span: &Span) -> CellSourceLocation {
+fn form_location(span: &Span, source: &str) -> CellSourceLocation {
+    let (excerpt, caret_column) = source_excerpt(source, span.start, span.col);
     CellSourceLocation {
         source: span.file.as_ref().clone(),
         byte_start: span.start,
@@ -952,6 +1381,8 @@ fn form_location(span: &Span) -> CellSourceLocation {
         line: span.line,
         column: span.col,
         precision: CellLocationPrecision::EnclosingTopLevelForm,
+        excerpt,
+        caret_column,
     }
 }
 
@@ -962,6 +1393,7 @@ fn exact_source_location(
     byte_len: usize,
 ) -> CellSourceLocation {
     let (line, column) = byte_line_column(source, byte_start);
+    let (excerpt, caret_column) = source_excerpt(source, byte_start, column);
     CellSourceLocation {
         source: source_name.to_owned(),
         byte_start,
@@ -969,7 +1401,27 @@ fn exact_source_location(
         line,
         column,
         precision: CellLocationPrecision::Exact,
+        excerpt,
+        caret_column,
     }
+}
+
+fn source_excerpt(source: &str, byte_start: usize, column: u32) -> (Option<String>, Option<u32>) {
+    const MAX_EXCERPT_CHARS: usize = 160;
+    let offset = byte_start.min(source.len());
+    let line_start = source[..offset].rfind('\n').map_or(0, |idx| idx + 1);
+    let line_end = source[offset..]
+        .find('\n')
+        .map_or(source.len(), |idx| offset + idx);
+    let mut line = source[line_start..line_end].to_owned();
+    if line.chars().count() > MAX_EXCERPT_CHARS {
+        line = line.chars().take(MAX_EXCERPT_CHARS).collect();
+        line.push('…');
+    }
+    if line.is_empty() {
+        return (None, None);
+    }
+    (Some(line), Some(column.max(1)))
 }
 
 fn byte_line_column(source: &str, offset: usize) -> (u32, u32) {

@@ -5,7 +5,7 @@ use nanocodex_core::JsonSchema;
 const EXEC_DESCRIPTION: &str = r#"Run Clojure code to orchestrate and compose tool calls
 - Evaluates the provided Clojure forms in a fresh namespace on a prewarmed cljrs isolate. Yielded cells keep running independently until completion or termination.
 - Call a nested tool with `(tool-call "tool_name" input)`; it returns a Clojure future. Use `(await ...)` to obtain its result. The equivalent namespaced primitive `(nanocodex.tools/call "tool_name" input)` remains supported.
-- Start independent calls before awaiting them, then compose them with `(await (clojure.core.async/join-all [first second]))`. A failed nested tool rejects its future; `join-all` short-circuits and propagates the first failure. `alts` also propagates a winning failure. Catch expected failures with `try` and `(catch :default error ...)`.
+- Start independent calls before awaiting them, then compose them with `(await (clojure.core.async/join-all [first second]))`. A failed nested tool rejects its future; `join-all` short-circuits and propagates the first failure. Use `(join-all futures {:on-error :cancel-pending})` to cancel siblings, `(join-all-settled futures)` for ordered fulfilled/rejected maps, `(race futures {:cancel-losers true})`, or `(await-with-timeout future ms)`. `alts` also propagates a winning failure. Catch expected failures with `try` and `(catch :default error ...)`.
 
 Handle an expected tool failure without failing the cell:
 ```clojure
@@ -50,10 +50,13 @@ Helpers available in every cell:
 - `(store key value)` and `(load key)`: persist JSON-compatible values across `exec` calls in the same session. Missing keys load as nil.
 - `(await (yield-control))`: yields accumulated output while the cell keeps running; pending nested tools continue in the background.
 - `(exit)`: completes the current cell successfully.
-- `(all-tools & [query])`: returns enabled tool metadata, optionally filtered by name or description.
+- `(all-tools & [query])`: returns enabled tool metadata. A string filters by name/description; a map accepts `:query`, `:kind`, `:dynamic`, `:limit`, `:cursor`, and `:include-schema`.
 - `(tool-info name)`: returns one tool's metadata and schemas, or nil when unknown.
-- `(pending-tools)`: returns metadata for this cell's unsettled nested calls.
-- `(cancel-tool future)`: cancels that nested call and returns true, or false if it is no longer pending.
+- `(pending-tools)`: returns metadata for this cell's unsettled nested calls, including id, state, and elapsed time.
+- `(cancel-tool future-or-id)`: cancels that nested call and returns true, or false if it is no longer pending.
+- `(tool-status future-or-id)` / `(await-tool future-or-id)`: inspect or re-acquire a pending nested-call handle.
+- `(await (with-tool-scope {:on-error :cancel-pending :on-exit :cancel-pending} (fn [] ...)))`: owns nested calls created in the thunk and applies cancel/keep policy.
+- `(code-mode-info)`: returns runtime versions, supported async forms/combinators, and active budgets.
 - `(await (clojure.core.async/timeout milliseconds))`: cooperatively waits without blocking the isolate."#;
 
 const MAX_EXEC_DESCRIPTION_BYTES: usize = 39_000;

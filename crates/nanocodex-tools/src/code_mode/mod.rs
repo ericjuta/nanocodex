@@ -189,6 +189,10 @@ struct CellSourceLocation {
     line: u32,
     column: u32,
     precision: CellLocationPrecision,
+    /// Bounded single-line excerpt captured from cell source at failure time.
+    excerpt: Option<String>,
+    /// 1-based caret column within `excerpt`, when known.
+    caret_column: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +236,13 @@ impl CellDiagnostic {
                 location.byte_start,
                 location.byte_end
             );
+            if let Some(excerpt) = &location.excerpt {
+                let _ = write!(rendered, "\n  {excerpt}");
+                if let Some(column) = location.caret_column {
+                    let caret = format!("{:>width$}", "^", width = column as usize);
+                    let _ = write!(rendered, "\n  {caret}");
+                }
+            }
         }
         if let Some(form_index) = self.form_index {
             let _ = write!(rendered, "\n  top-level form: {form_index}");
@@ -276,6 +287,10 @@ fn render_exception(exception: &CellExceptionInfo, rendered: &mut String, depth:
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "terminal payloads intentionally carry full diagnostics and content"
+)]
 enum RuntimeEvent {
     ToolCall {
         cell_id: u64,
@@ -330,6 +345,10 @@ struct CompletedNestedCall {
     call: NestedToolCall,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "script failures carry the full rendered diagnostic payload"
+)]
 enum CellTerminal {
     Completed {
         content: Vec<ToolOutputContent>,
