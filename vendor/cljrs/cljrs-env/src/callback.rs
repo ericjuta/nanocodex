@@ -1,0 +1,172 @@
+//! Thread-local eval context for Rust→Clojure callbacks.
+//!
+//! When a native (Rust) builtin needs to call a Clojure function — for example,
+//! a comparator passed to `sort-by` — it can use [`invoke`] to do so.  The eval
+//! context is pushed automatically before every native function call and popped
+//! afterward, so `invoke` is always available inside builtins.
+
+use std::cell::RefCell;
+use std::sync::Arc;
+
+use cljrs_value::{Value, ValueError, ValueResult};
+
+use crate::env::{Env, GlobalEnv};
+
+// ── Thread-local context stack ───────────────────────────────────────────────
+
+struct EvalContext {
+    globals: Arc<GlobalEnv>,
+    current_ns: Arc<str>,
+    /// True when the active call originates from inside an `^:async` function
+    /// body. Lets blocking builtins (`deref`) reject use that should be `await`.
+    is_async: bool,
+}
+
+thread_local! {
+    static EVAL_CONTEXT: RefCell<Vec<EvalContext>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push the current eval context before calling a native function.
+pub fn push_eval_context(env: &Env) {
+    EVAL_CONTEXT.with(|stack| {
+        stack.borrow_mut().push(EvalContext {
+            globals: env.globals.clone(),
+            current_ns: env.current_ns.clone(),
+            is_async: env.is_async,
+        });
+    });
+}
+
+/// True when the innermost active eval context is inside an `^:async` function
+/// body. Returns `false` when there is no active context.
+pub fn current_is_async() -> bool {
+    EVAL_CONTEXT.with(|stack| stack.borrow().last().is_some_and(|ec| ec.is_async))
+}
+
+/// Pop the eval context after a native function returns.
+pub fn pop_eval_context() {
+    EVAL_CONTEXT.with(|stack| {
+        stack.borrow_mut().pop();
+    });
+}
+
+/// Capture the current eval context so it can be installed on another thread.
+///
+/// Returns `None` if there is no active context.
+pub fn capture_eval_context() -> Option<(Arc<GlobalEnv>, Arc<str>)> {
+    EVAL_CONTEXT.with(|stack| {
+        let s = stack.borrow();
+        let ec = s.last()?;
+        Some((ec.globals.clone(), ec.current_ns.clone()))
+    })
+}
+
+/// Install a previously captured eval context on the current thread.
+///
+/// Call this at the start of a spawned thread so that `invoke` works.
+pub fn install_eval_context(globals: Arc<GlobalEnv>, ns: Arc<str>) {
+    EVAL_CONTEXT.with(|stack| {
+        stack.borrow_mut().push(EvalContext {
+            globals,
+            current_ns: ns,
+            // Cross-thread installs (agent/future worker threads) run blocking,
+            // synchronous work — never an async-yielding context.
+            is_async: false,
+        });
+    });
+}
+
+/// RAII guard that pops one eval context on drop (including on unwind).
+///
+/// Returned by [`install_eval_context_guard`]; use it when the push and pop
+/// must stay balanced across early returns or panics.
+pub struct EvalContextGuard {
+    _priv: (),
+}
+
+impl Drop for EvalContextGuard {
+    fn drop(&mut self) {
+        pop_eval_context();
+    }
+}
+
+/// Like [`install_eval_context`], but returns a guard that pops the context
+/// when dropped.
+///
+/// Used by the JIT-native dispatch seam: native code resolves globals and
+/// calls function values through rt_abi bridges that all require an eval
+/// context on the calling thread.
+pub fn install_eval_context_guard(globals: Arc<GlobalEnv>, ns: Arc<str>) -> EvalContextGuard {
+    install_eval_context(globals, ns);
+    EvalContextGuard { _priv: () }
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/// Call a Clojure-callable `Value` with the given arguments.
+///
+/// This can be called from any Rust code running inside an active evaluation
+/// (i.e., inside a builtin function, a `Thunk::force`, etc.).
+///
+/// # Errors
+///
+/// Returns `Err` if called outside an eval context, or if the callee raises
+/// an error.
+/// Execute a closure with access to a temporary `Env` constructed from the
+/// current eval context.
+///
+/// This is used by the IR interpreter for calling builtins that need an `Env`
+/// (e.g., for nested `apply_value` calls from inside a `NativeFunction`
+/// closure).
+///
+/// # Errors
+///
+/// Returns `Err` if called outside an eval context.
+pub fn with_eval_context<F, R>(f: F) -> Result<R, crate::error::EvalError>
+where
+    F: FnOnce(&mut Env) -> Result<R, crate::error::EvalError>,
+{
+    let (globals, ns) = EVAL_CONTEXT.with(|stack| {
+        let s = stack.borrow();
+        let ec = s.last().ok_or_else(|| {
+            crate::error::EvalError::Runtime(
+                "with_eval_context called outside eval context".to_string(),
+            )
+        })?;
+        Ok::<_, crate::error::EvalError>((ec.globals.clone(), ec.current_ns.clone()))
+    })?;
+    let mut env = Env::new(globals, &ns);
+    f(&mut env)
+}
+
+pub fn invoke(f: &Value, args: Vec<Value>) -> ValueResult<Value> {
+    let (globals, ns) = EVAL_CONTEXT.with(|stack| {
+        let s = stack.borrow();
+        let ec = s
+            .last()
+            .ok_or_else(|| ValueError::Other("invoke called outside eval context".into()))?;
+        Ok((ec.globals.clone(), ec.current_ns.clone()))
+    })?;
+    let mut env = Env::new(globals, &ns);
+    // Fast path for Clojure functions: call directly through the GlobalEnv
+    // function pointer, bypassing the large apply_value stack frame.
+    // Unwrap metadata so a WithMeta-wrapped fn is callable.
+    let f = f.unwrap_meta();
+    let result = if let Value::Fn(cljx_fn) = f {
+        // Honor `^:async` dispatch (spawn the body, return a Future) just like
+        // `apply_value` — otherwise a compiled/native caller invoking an async
+        // fn would run its body synchronously and never get a Future.
+        if let Some(fut) = crate::apply::dispatch_if_async(f, &args, &env) {
+            Ok(fut)
+        } else {
+            env.call_cljrs_fn(cljx_fn.get(), &args)
+        }
+    } else {
+        crate::apply::apply_value(f, args, &mut env)
+    };
+    result.map_err(|e| match e {
+        crate::error::EvalError::Thrown(v) => ValueError::Thrown(v),
+        crate::error::EvalError::GasExhausted => ValueError::GasExhausted,
+        other => ValueError::Other(format!("{other}")),
+    })
+}

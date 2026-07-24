@@ -1,0 +1,23 @@
+[package]
+name = "cljrs-env"
+version = "0.1.228"
+edition = "2024"
+description = "Namespace and environment management for clojurust"
+license.workspace = true
+repository.workspace = true
+
+[features]
+no-gc = ["cljrs-gc/no-gc"]
+
+[dependencies]
+cljrs-types   = { workspace = true }
+cljrs-gc      = { workspace = true }
+cljrs-reader  = { workspace = true }
+cljrs-value   = { workspace = true }
+cljrs-logging = { workspace = true }
+cljrs-deps    = { workspace = true }
+log = "0.4.29"
+thiserror = "2.0.18"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cljrs-vcs = { workspace = true }

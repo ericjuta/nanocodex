@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "513ecd4ab950128cc8e08e76c0af65e696518dc5"
+  },
+  "path_in_vcs": "crates/cljrs-async"
+}

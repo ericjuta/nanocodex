@@ -1,0 +1,24 @@
+[package]
+name = "cljrs-async"
+version = "0.1.228"
+edition = "2024"
+description = "Async support for clojurust — clojure.core.async via Tokio"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cljrs-types    = { workspace = true }
+cljrs-gc       = { workspace = true }
+cljrs-reader   = { workspace = true }
+cljrs-value    = { workspace = true }
+cljrs-env      = { workspace = true }
+cljrs-builtins = { workspace = true }
+cljrs-interp   = { workspace = true }
+tokio          = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+futures-util   = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }
