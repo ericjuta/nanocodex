@@ -348,6 +348,113 @@ stable cache/session headers, custom JavaScript tools, unified events, and the
 browser host contract. Native cancellation remains owned by the Phase 2 turn
 lifecycle rather than a binding-specific alternate runtime.
 
+### Phase 4: cljrs Code Mode structured concurrency and ergonomics (planned)
+
+This milestone closes the remaining synchronous evaluator paths before adding
+higher-level orchestration APIs. It keeps ordinary Clojure futures and existing
+`tool-call`, `await`, and one-argument `join-all` behavior source-compatible.
+Task ownership remains local to one Code Mode cell; this is not a generic agent
+scheduler, persistent user-code namespace, or alternate runtime.
+
+#### 4.1 Async-complete evaluation
+
+- Inventory every cljrs special form, macro expansion, callable head, and
+  form-intercepted native. Add a table-driven test matrix that places `await` in
+  each valid expression position.
+- Remove synchronous fallback for any path whose descendants may yield. Implement
+  async handlers for `binding` and other relevant special forms, and move
+  intercepted-native argument evaluation onto the async evaluator while preserving
+  `apply`, atom, dynamic-binding, `recur`, `try`, and macro semantics.
+- A sync-only form that cannot safely contain `await` must reject it immediately
+  with a located diagnostic; it must never block the LocalSet or use a condvar wait.
+
+#### 4.2 Cancellable futures, handles, and task scopes
+
+- Give `CljxFuture` an optional idempotent cancellation hook. Terminal completion,
+  failure, and cancellation race through one state transition; the first terminal
+  state wins and wakes all waiters exactly once.
+- Register each nested tool future with its cell-local opaque handle. Extend
+  `cancel-tool` to accept a future or handle, and add `tool-status` and `await-tool`.
+  Handles expire with the cell and do not expose transport, response, or turn IDs.
+- Add `with-tool-scope` as an execution-local structured-concurrency boundary.
+  Calls created in the scope are owned by it. Explicit `:on-error` and `:on-exit`
+  policies choose `:cancel-pending` or `:keep-running`; cancellation never reaches
+  calls created outside that scope.
+- Route cancellation through the existing Rust handler future so shell processes,
+  MCP calls, and application tools receive normal future-drop cleanup. Emit exactly
+  one nested-call terminal event even when completion and cancellation race.
+
+#### 4.3 Composition and deadline APIs
+
+- Preserve `(join-all futures)` as ordered fail-fast composition with its current
+  sibling behavior. Add `(join-all futures {:on-error :cancel-pending})` only after
+  generic future cancellation hooks exist.
+- Add `join-all-settled`, returning ordered
+  `{:status :fulfilled :value ...}` or
+  `{:status :rejected :error ...}` entries without discarding `ExceptionInfo`,
+  causes, or `ex-data`.
+- Add `race` with explicit `:cancel-losers`, plus `await-with-timeout` with explicit
+  `:cancel`. A timeout throws typed `ExceptionInfo` containing timeout, tool, input,
+  call-handle, and elapsed metadata when available.
+- Empty collections, duplicate futures, already-settled futures, nested scopes, and
+  cancellation from a catch/finally path receive deterministic documented behavior.
+
+#### 4.4 Located async diagnostics
+
+- Preserve source spans and macro-origin links through expansion and async
+  continuations. Runtime failures should point to the exact expression when known,
+  falling back explicitly to the enclosing top-level form.
+- Record a bounded Clojure call stack across awaited continuations. Render a source
+  excerpt, caret, form index, async frames, structured `ex-data`, and cause chain
+  without losing the existing machine-readable classification.
+- Keep diagnostics bounded and UTF-8 safe. Diagnostic rendering must not perform
+  filesystem reads or expose ambient host state.
+
+#### 4.5 Discovery, validation, and capabilities
+
+- Keep `(all-tools)` and `(all-tools "query")`. Add a map query with deterministic
+  name ordering, kind/dynamic filters, `:limit`, opaque cursor, and
+  `:include-schema`; reject unknown options.
+- Validate nested-tool input against its advertised schema in `ToolRegistry` before
+  handler side effects. Compile validators once per immutable registry generation.
+  Return `:tool-input-invalid` with bounded instance/schema paths and expected shape.
+- Add `(code-mode-info)` for cljrs/Nanocodex runtime versions, supported async
+  forms and combinators, cell limits, prompt/schema budgets, and active
+  capabilities. Keep structural limits out of the stable prompt unless needed.
+
+#### Delivery order
+
+Each numbered slice is one reviewable commit and must leave focused tests green:
+
+1. [ ] Complete async evaluation and land the await-position conformance matrix.
+2. [ ] Add cancellable future state, cell-local handles, and race-safe Rust cleanup.
+3. [ ] Add tool scopes, settled composition, races, and cancelling deadlines.
+4. [ ] Carry exact spans and async frames into bounded diagnostics.
+5. [ ] Add structured discovery, pre-dispatch schema validation, and
+   `code-mode-info`; then update guidance and examples.
+
+Gate:
+
+- Deterministic tests cover every yielding evaluator position and prove no test can
+  block the LocalSet. A watchdog test fails if a nominal timeout cannot run.
+- Concurrency tests cover success, first failure, timeout, explicit cancellation,
+  cell exit, host replacement, completion/cancel races, and nested scope ownership.
+  No owned subprocess, local MCP request future, tool future, GC root, or
+  pending-call entry survives the policy that owns it.
+- Composition tests prove stable result order, complete structured failures, loser
+  policy, duplicate/already-settled behavior, and backward compatibility for
+  existing one-argument `join-all` and `cancel-tool future` calls.
+- Diagnostic snapshots cover reader errors, macro-expanded failures, nested async
+  calls, tool failures, causes, non-ASCII source, and truncation boundaries.
+- Schema corpus tests cover static and dynamically activated tools, local refs,
+  unions, recursive schemas, invalid paths, and validator reuse before side effects.
+- Representative cell benchmarks gate evaluator/combinator latency, allocations,
+  retained pending-call memory, cancellation latency, and schema-validator reuse.
+- Run vendored cljrs fmt, warnings-denied Clippy, and tests; workspace fmt,
+  warnings-denied Clippy, tests, no-default-features checks, and public examples;
+  `just run`; focused Harbor trials while iterating; and the full configured
+  `just eval` before marking the milestone complete.
+
 ## Performance policy
 
 - Optimize representative retained API/JSONL traces and real turns, not type
