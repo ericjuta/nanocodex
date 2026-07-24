@@ -111,7 +111,7 @@ Socket tasks and mutable driver details stay private.
   Code Mode tools without inflating the stable prompt prefix.
 - MCP servers handshake and list tools concurrently at startup. `tool_search`
   activates matching canonical `mcp__server__tool` names, including an
-  immediate dynamic call in the same JavaScript cell. Stdio, Streamable HTTP,
+  immediate dynamic call in the same Clojure cell. Stdio, Streamable HTTP,
   bearer tokens, custom headers, environment-resolved secrets, filters, and
   bounded startup/tool calls are covered by the public API.
 

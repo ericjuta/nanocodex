@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
 
     let turn = agent
         .prompt(
-            "In one Code Mode exec cell, await tools.tool_search for a relevant read-only MCP tool, then call one returned tool with tools[result.tools[0].name](arguments). Briefly summarize its result.",
+            "In one Code Mode exec cell, call `tool_search` with `nanocodex.tools/call`, then call one returned read-only MCP tool by passing its name to `nanocodex.tools/call`. Briefly summarize its result.",
         )
         .await?;
     events.write_turn_jsonl(std::io::stdout()).await?;

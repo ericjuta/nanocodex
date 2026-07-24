@@ -10,7 +10,7 @@ async fn multiply(left: i64, right: i64) -> std::result::Result<i64, &'static st
 #[tokio::main]
 async fn main() -> Result<()> {
     let api_key = std::env::var("OPENAI_API_KEY").wrap_err("OPENAI_API_KEY is required")?;
-    // Registered tools are exposed to code mode as `tools.<definition name>(args)`.
+    // Registered tools are available through `nanocodex.tools/call` in Code Mode.
     let tools = Tools::builder().without_defaults().tool(multiply).build()?;
     let (agent, mut events) = Nanocodex::builder(api_key)
         .thinking(Thinking::Low)
@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
 
     let turn = agent
         .prompt(
-            "In code mode, call `await tools.multiply({ left: 6, right: 7 })` exactly once. Reply with only the product.",
+            "In Code Mode, evaluate `(await (nanocodex.tools/call \"multiply\" {:left 6 :right 7}))` exactly once. Reply with only the product.",
         )
         .await?;
     events.write_turn_jsonl(std::io::stdout()).await?;

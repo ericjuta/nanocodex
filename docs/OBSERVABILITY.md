@@ -98,7 +98,7 @@ independent aggregates even when both panes are presented by one terminal
 frame. Select `nanocodex_stream_timing=trace` (or use
 `just run-otel-detail`) for the individual correlated records.
 
-Code Mode promise fan-out and attached child agents appear as overlapping
+Code Mode `join-all` fan-out and attached child agents appear as overlapping
 sibling branches under the active cell/tool operation. A child or follow-up
 prompt made outside an active orchestration is instead a new bounded root and
 remains correlatable through `session.id`, `parent.session.id`,
@@ -138,7 +138,7 @@ just otel-down
 
 The manual stress gate uses a deterministic local Responses WebSocket rather
 than spending model tokens. It still drives the real CLI, retained Nanocodex
-session, the session-persistent Code Mode Node host, shell process lifecycle,
+session, the session-persistent Code Mode cljrs isolate, shell process lifecycle,
 MCP stdio transport, local tracing subscriber, batch OTLP exporter, and Jaeger
 backend:
 
@@ -149,10 +149,10 @@ just otel-stress
 The default workload runs 32 sequential prompts on one session. Every turn
 fans out 16 concurrent MCP calls, then mixes in a synthetic MCP error, malformed
 patch, non-zero shell, bounded high-volume output, yielded/resumed process, and
-unknown JavaScript tool. The gate verifies event counts, exactly one trace root
+unknown Clojure tool. The gate verifies event counts, exactly one trace root
 per accepted prompt, all parent references, expected success/error span volume,
 shared cell-actor parentage and complete interval overlap for the delayed
-`Promise.all` fan-out,
+`clojure.core.async/join-all` fan-out,
 presence of structural model/tool fields and API-visible reasoning summaries,
 presence of prompt, readable and encrypted reasoning, and tool-argument
 sentinels in ordered span events, and absence of the separately configured API
@@ -177,7 +177,7 @@ Run the focused attached-subagent topology gate separately:
 just otel-subagent-stress
 ```
 
-It drives two child agents concurrently from one Code Mode `Promise.all`, then
+It drives two child agents concurrently from one Code Mode `join-all`, then
 queries Jaeger to verify that both child `agent.turn` spans share the parent
 trace, sit below their corresponding `spawn_agent` tool spans, retain their
 independent session identities, and overlap in exported wall-clock intervals.

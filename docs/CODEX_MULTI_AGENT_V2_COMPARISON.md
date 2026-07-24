@@ -18,7 +18,7 @@ can expose as Code Mode tools:
   completed turn while the mainline may continue.
 
 The model can generate the orchestration topology in Code Mode, including
-loops, conditional delegation, and concurrent fan-out with `Promise.all`. The
+loops, conditional delegation, and concurrent fan-out with `join-all`. The
 SDK does not encode a workflow DAG or maintain a global agent graph.
 
 Codex MultiAgentsV2 is a larger actor-like collaboration runtime. Its
@@ -41,7 +41,7 @@ projection, and TUI integration.
 | Inherited state | Exact completed Responses conversation state | Sanitized messages and durable context; tool calls, outputs, and reasoning are removed |
 | API request | Child starts from the parent response ID and sends its delta | New thread initially sends reconstructed inherited input |
 | Prompt cache | Contextual forks share explicit cache lineage | The V2 tree shares its root session ID, which is also the default cache key |
-| Code Mode | Child tools can be nested tools inside generated JavaScript | Collaboration tools are intentionally unavailable inside `functions.exec` |
+| Code Mode | Child tools can be nested tools inside generated Clojure | Collaboration tools are intentionally unavailable inside `functions.exec` |
 | Communication | Application-defined tool result flow | Mailboxes, `send_message`, `followup_task`, and `wait_agent` |
 | Lifecycle | The application adapter owns accepted child invocations, propagates cancellation through descendants, rejects wait cycles, and drains shutdown; no durable registry | Status registry, interruption, residency, unload, reload, and durable resume |
 | Limits | Depth, concurrent-child, token, deadline, rollout, and residency budgets remain application-defined | Built-in execution, residency, thread, and rollout budgets |

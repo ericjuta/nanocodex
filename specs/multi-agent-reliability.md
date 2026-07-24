@@ -436,7 +436,7 @@ caller session ID to target child ID. Before inserting an edge, resolve child ID
 to native session IDs and reject it if the target can already reach the caller.
 A dedicated guard removes the edge on success, error, cancellation, and future
 drop. Support multiple concurrent acyclic edges from one caller so
-`Promise.all` fan-out remains valid. Return a concise model-visible error such
+`join-all` fan-out remains valid. Return a concise model-visible error such
 as "prompt_agent would create a child wait cycle"; do not expose internal turn
 or transport IDs.
 
@@ -724,7 +724,7 @@ Regression checks:
   tool handlers.
 - Active snapshots continue excluding partial streamed output and unmatched tool
   calls.
-- `Promise.all` fan-out to independent children remains concurrent.
+- `join-all` fan-out to independent children remains concurrent.
 - Unknown child IDs remain clear tool failures.
 - Child events remain optional independent streams, not a new merged bus.
 

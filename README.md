@@ -58,7 +58,7 @@ nanocodex = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Node.js 12.22 or newer must be available on `PATH` for Code Mode.
+Native Code Mode embeds cljrs; it does not require a separate Node.js runtime.
 
 ## Model and harness co-design
 
@@ -95,16 +95,17 @@ we are actually building.
 
 Most tool-calling agents expose a flat catalog and return to the model between
 operations. Nanocodex instead presents caller-defined Rust tools and MCP tools
-as typed JavaScript functions behind one Code Mode entrypoint. The model can
-write a small program that uses loops, conditions, data transformations, and
-`Promise.all`, so related tool work can be composed inside one cell without a
-model round trip between every operation.
+through one Clojure Code Mode entrypoint. The model can write a small program
+that uses loops, conditions, data transformations, and
+`clojure.core.async/join-all`, so related tool work can be composed inside one
+cell without a model round trip between every operation.
 
 This keeps the model-facing surface small while the application keeps normal
 Rust ownership. Tool implementations, credentials, retry policy, and mutable
 state stay outside the generated program. Code Mode runs cells on a prewarmed,
-session-persistent Node host and gives the model explicit controls for yielding,
-resuming long work, and bounding returned output.
+session-persistent cljrs isolate and gives the model explicit controls for tool
+discovery, pending-call inspection and cancellation, yielding, resuming long work,
+and bounding returned output.
 
 Subagents make that composition especially useful. An application can expose
 `AgentHandle::spawn()` as a clean-room worker, `AgentHandle::fork()` as a worker
@@ -112,24 +113,24 @@ with the latest safe conversation context, and another tool for follow-up turns
 on a retained child. Code Mode can then generate the orchestration topology for
 the task instead of selecting a hard-coded workflow DAG:
 
-```js
-const [independent, contextual] = await Promise.all([
-  tools.spawn_agent({
-    role: "reviewer",
-    task: "Find assumptions the parent may have missed."
-  }),
-  tools.fork_agent({
-    role: "investigator",
-    task: "Trace the suspected regression using our existing context."
-  })
-]);
-
-const followUp = await tools.prompt_agent({
-  agent_id: independent.agent_id,
-  task: `Challenge this conclusion:\n\n${contextual.report}`
-});
-
-text({ independent, contextual, followUp });
+```clojure
+(let [independent-call
+      (tool-call "spawn_agent"
+        {:role "reviewer"
+         :task "Find assumptions the parent may have missed."})
+      contextual-call
+      (tool-call "fork_agent"
+        {:role "investigator"
+         :task "Trace the suspected regression using our existing context."})
+      [independent contextual]
+      (await (clojure.core.async/join-all [independent-call contextual-call]))
+      follow-up
+      (await (tool-call "prompt_agent"
+        {:agent_id (:agent_id independent)
+         :task (str "Challenge this conclusion:\n\n" (:report contextual))}))]
+  (text {:independent independent
+         :contextual contextual
+         :follow-up follow-up}))
 ```
 
 That allows dynamic fan-out, fan-in, independent checks, contextual branches,
@@ -506,15 +507,15 @@ ordering rules.
 schema. `Tools::builder()` accepts generated or manual `Tool` implementations;
 `Mcp::builder()` adds deferred Streamable HTTP or stdio MCP providers. The model
 normally sees only Code Mode and its wait operation, then composes nested tools
-with generated JavaScript, including loops, conditionals, and `Promise.all`.
+with generated Clojure, including loops, conditionals, and async `join-all`.
 
 Hashline is part of the standard workspace tool bundle, which is enabled by
 default. An explicit tool selection can enable it with
 `Tools::builder().workspace(true).build()?`; `without_defaults()` or
 `.workspace(false)` removes Hashline together with the other workspace tools.
-Hashline is exposed to the model through Code Mode as `tools.hashline__read`,
-`tools.hashline__find_block`, `tools.hashline__patch`, and
-`tools.hashline__transaction`.
+Hashline is exposed to the model through Code Mode by passing
+`"hashline__read"`, `"hashline__find_block"`, `"hashline__patch"`, or
+`"hashline__transaction"` to `nanocodex.tools/call`.
 Paths may be absolute or relative to the configured workspace. Routine patches
 may opt into a compact `root`; while set, section and `MV` paths are strict
 root-relative lexical paths. This scoping is not transaction-grade symlink or
@@ -525,13 +526,12 @@ parents must already exist.
 For a direct single-file edit, copy `patchHeader` and a line anchor from a recent
 read, then pass the operations as one Hashline DSL string—not as a JSON array:
 
-```javascript
-const observed = await tools.hashline__read({ path: "notes.txt" });
-await tools.hashline__patch({
-  header: observed.patchHeader,
-  operations: "SWAP 2:f589:\n+bravo",
-  dry_run: true,
-});
+```clojure
+(let [observed (await (nanocodex.tools/call "hashline__read" {:path "notes.txt"}))]
+  (await (nanocodex.tools/call "hashline__patch"
+    {:header (:patchHeader observed)
+     :operations "SWAP 2:f589:\n+bravo"
+     :dry_run true})))
 ```
 
 Here `2:f589` is copied from the read output. Reread and rebuild the patch after
@@ -553,10 +553,10 @@ during later transaction activity to a limit of 64. Transaction output reports
 this bounded recovery policy without exposing receipt names, absolute paths, or
 before-images.
 
-Code Mode prewarms one persistent Node host alongside the first model call and
+Code Mode prewarms one persistent cljrs isolate alongside the first model call and
 reuses it for the session. Cells receive one shared owned history snapshot;
 resumed waits do not copy history they cannot read. A nested shell request can
-extend the default outer-cell yield deadline while an explicit `@exec` deadline
+extend the default outer-cell yield deadline while an explicit `;; @exec` deadline
 still wins. Live shell session IDs remain visible for later `write_stdin`
 calls, and stdout/stderr drains share one bounded completion deadline.
 
@@ -682,10 +682,12 @@ binding, and Rust/WASM binding all consume that same API.
 
 ### How Fast?
 
-Focused local profiling also covers the ordinary streaming and tool path. On an
-M1 Max, prewarming the retained Node host reduced first-cell host latency from
-301 ms to 1.7–2.7 ms and complete top-level Code Mode time from 312 ms to 11–13
-ms across three trials. On a retained 41-task workload, model generation and
+Focused local profiling also covers the ordinary streaming and tool path. The
+retained Node-host measurements below predate the cljrs replacement and do not
+characterize the current native runtime. On an M1 Max, that earlier prewarm
+reduced first-cell host latency from 301 ms to 1.7–2.7 ms and complete top-level
+Code Mode time from 312 ms to 11–13 ms across three trials. On a retained
+41-task workload, model generation and
 caller-requested subprocesses accounted for 99.864% of summed run time; the
 unattributed local remainder was 0.136%. These are diagnostic measurements, not
 model-service speed guarantees. See
@@ -726,7 +728,7 @@ Nanocodex currently supports one model family (`gpt-5.6-sol`), one Responses
 WebSocket transport, and caller-defined tools. Sessions and branches live only
 as long as your process. Your application owns sandboxing, permissions,
 durability, and recursive cancellation policy for application-defined child
-agents. Code Mode requires Node.js 12.22 or newer on `PATH`.
+agents. Native Code Mode embeds a restricted cljrs runtime; it does not require Node.js.
 
 That is substantially less product than Codex. It is also much less machinery
 between your code and an agent turn.

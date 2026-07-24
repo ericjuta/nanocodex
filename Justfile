@@ -227,14 +227,14 @@ eval-task task effort="low" config=default_eval: build-agent
 eval-hosted config=default_eval: check-hosted-auth build-agent-hosted
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
     @job_name="$(date +%Y-%m-%d__%H-%M-%S)-eval-daytona-$BASHPID"; \
-        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --agent-kwarg "install_node=true" --job-name "$job_name" --n-concurrent "{{hosted_eval_concurrency}}"
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --job-name "$job_name" --n-concurrent "{{hosted_eval_concurrency}}"
 
 eval-task-hosted task effort="low" config=default_eval: check-hosted-auth build-agent-hosted
     @test -x "{{harbor}}" || { echo "run 'just bootstrap' first" >&2; exit 2; }
     @task="{{task}}"; \
         dataset=$(HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --print-config | jq -er '.datasets | if length == 1 then .[0] | "\(.name)@\(.ref)" else error("expected exactly one dataset") end'); \
         job_name="$(date +%Y-%m-%d__%H-%M-%S)-${task##*/}-daytona-$BASHPID"; \
-        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --dataset "$dataset" --include-task-name "$task" --job-name "$job_name" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --agent-kwarg "install_node=true" --agent-kwarg "effort={{effort}}"
+        HARBOR_TELEMETRY=off "{{harbor}}" run --config "{{config}}" --env daytona --verifier "{{canonical_verifier}}" --dataset "$dataset" --include-task-name "$task" --job-name "$job_name" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --agent-kwarg "effort={{effort}}"
 
 # Open all locally retained Harbor jobs unless another jobs directory is supplied.
 view jobs=default_jobs:
@@ -250,7 +250,7 @@ check:
     .venv/bin/python -m unittest discover -s harbor_adapter -p 'test_*.py'
     .venv/bin/python -m compileall -q harbor_adapter
     "{{harbor}}" run --config "{{default_eval}}" --print-config >/dev/null
-    "{{harbor}}" run --config "{{default_eval}}" --env daytona --verifier "{{canonical_verifier}}" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --agent-kwarg "install_node=true" --print-config >/dev/null
+    "{{harbor}}" run --config "{{default_eval}}" --env daytona --verifier "{{canonical_verifier}}" --agent-kwarg "binary_path={{hosted_agent_artifact}}" --print-config >/dev/null
 
 # Validate the versioned artifacts before creating a release tag.
 release-check version:
