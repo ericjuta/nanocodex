@@ -13,14 +13,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cljrs_env::env::{Env, GlobalEnv};
-use cljrs_env::error::EvalResult;
+use cljrs_env::error::{EvalError, EvalResult};
 use cljrs_gc::GcPtr;
 use cljrs_interp::destructure::value_to_seq_vec;
 use cljrs_value::{
-    Arity, NativeFn, NativeObjectBox, PersistentVector, Value, ValueError, ValueResult,
-    gc_native_object,
+    Arity, ExceptionInfo, Keyword, MapValue, NativeFn, NativeObjectBox, PersistentVector, Value,
+    ValueError, ValueResult, gc_native_object,
 };
 
+use crate::cancel::cancel_future;
 use crate::channel::{CHANNEL_TAG, CljChannel, CljMult, MULT_TAG, RvOffer, RvStatus};
 use crate::eval_async::{await_value, spawn_future};
 
@@ -42,7 +43,18 @@ pub(crate) fn register(globals: &Arc<GlobalEnv>, ns: &str) {
         ("offer!", Arity::Fixed(2), builtin_offer),
         ("async-spawn", Arity::Fixed(1), builtin_async_spawn),
         // Phase F: higher-level utilities
-        ("join-all", Arity::Fixed(1), builtin_join_all),
+        ("join-all", Arity::Variadic { min: 1 }, builtin_join_all),
+        (
+            "join-all-settled",
+            Arity::Fixed(1),
+            builtin_join_all_settled,
+        ),
+        ("race", Arity::Variadic { min: 1 }, builtin_race),
+        (
+            "await-with-timeout",
+            Arity::Variadic { min: 2 },
+            builtin_await_with_timeout,
+        ),
         ("thread-call", Arity::Fixed(1), builtin_thread_call),
         ("onto-chan!", Arity::Fixed(2), builtin_onto_chan),
         ("to-chan!", Arity::Fixed(1), builtin_to_chan),
@@ -277,21 +289,222 @@ fn builtin_async_spawn(args: &[Value]) -> ValueResult<Value> {
 
 // ── Phase F: higher-level async utilities ────────────────────────────────────
 
-/// `(join-all futures-seq)` — await all futures in `futures-seq` concurrently,
-/// returning a vector of their resolved values. The first error in any future
-/// propagates immediately.
+/// `(join-all futures)` / `(join-all futures {:on-error :cancel-pending})`.
+///
+/// Ordered fail-fast composition. Without options, sibling futures keep running
+/// after the first failure (backward compatible). With
+/// `:on-error :cancel-pending`, remaining running futures are cancelled.
 fn builtin_join_all(args: &[Value]) -> ValueResult<Value> {
     let futures = match args.first() {
         Some(v) => value_to_seq_vec(v),
         None => Vec::new(),
     };
+    let cancel_pending = opts_keyword(args.get(1), "on-error").is_some_and(
+        |v| matches!(v, Value::Keyword(k) if k.get().name.as_ref() == "cancel-pending"),
+    );
     Ok(spawn_future(async move {
-        let branches = futures.into_iter().map(await_value);
-        let values = futures_util::future::try_join_all(branches).await?;
-        Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+        join_all_impl(futures, cancel_pending).await
+    }))
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "EvalResult is the public cljrs async error contract"
+)]
+async fn join_all_impl(futures: Vec<Value>, cancel_pending: bool) -> EvalResult {
+    if futures.is_empty() {
+        return Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+            Vec::<Value>::new(),
+        ))));
+    }
+    let owned = futures.clone();
+    let branches = futures.into_iter().map(await_value);
+    match futures_util::future::try_join_all(branches).await {
+        Ok(values) => Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
             values,
+        )))),
+        Err(error) => {
+            if cancel_pending {
+                cancel_value_futures(&owned);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// `(join-all-settled futures)` — await every future and return ordered
+/// `{:status :fulfilled/:rejected ...}` maps without discarding structured errors.
+fn builtin_join_all_settled(args: &[Value]) -> ValueResult<Value> {
+    let futures = match args.first() {
+        Some(v) => value_to_seq_vec(v),
+        None => Vec::new(),
+    };
+    Ok(spawn_future(async move {
+        let mut results = Vec::with_capacity(futures.len());
+        let branches: Vec<_> = futures
+            .into_iter()
+            .map(|fut| async move { await_value(fut).await })
+            .collect();
+        let settled = futures_util::future::join_all(branches).await;
+        for result in settled {
+            results.push(settled_entry(result));
+        }
+        Ok(Value::Vector(GcPtr::new(PersistentVector::from_iter(
+            results,
         ))))
     }))
+}
+
+fn settled_entry(result: EvalResult) -> Value {
+    match result {
+        Ok(value) => Value::Map(MapValue::from_pairs(vec![
+            (
+                Value::keyword(Keyword::simple("status")),
+                Value::keyword(Keyword::simple("fulfilled")),
+            ),
+            (Value::keyword(Keyword::simple("value")), value),
+        ])),
+        Err(EvalError::Thrown(error)) => Value::Map(MapValue::from_pairs(vec![
+            (
+                Value::keyword(Keyword::simple("status")),
+                Value::keyword(Keyword::simple("rejected")),
+            ),
+            (Value::keyword(Keyword::simple("error")), error),
+        ])),
+        Err(other) => Value::Map(MapValue::from_pairs(vec![
+            (
+                Value::keyword(Keyword::simple("status")),
+                Value::keyword(Keyword::simple("rejected")),
+            ),
+            (
+                Value::keyword(Keyword::simple("error")),
+                other.to_error_value(),
+            ),
+        ])),
+    }
+}
+
+/// `(race futures)` / `(race futures {:cancel-losers true})`.
+fn builtin_race(args: &[Value]) -> ValueResult<Value> {
+    let futures = match args.first() {
+        Some(v) => value_to_seq_vec(v),
+        None => Vec::new(),
+    };
+    let cancel_losers = opts_bool(args.get(1), "cancel-losers").unwrap_or(false);
+    Ok(spawn_future(async move {
+        if futures.is_empty() {
+            return Ok(Value::Nil);
+        }
+        let owned = futures.clone();
+        let branches: Vec<AltBranch> = futures
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                Box::pin(async move {
+                    let result = await_value(v).await;
+                    (result, i)
+                }) as AltBranch
+            })
+            .collect();
+        let ((result, winner), _idx, remainder) = futures_util::future::select_all(branches).await;
+        drop(remainder);
+        if cancel_losers {
+            for (i, fut) in owned.iter().enumerate() {
+                if i != winner {
+                    cancel_one(fut);
+                }
+            }
+        }
+        result
+    }))
+}
+
+/// `(await-with-timeout future ms)` / `(await-with-timeout future ms {:cancel true})`.
+fn builtin_await_with_timeout(args: &[Value]) -> ValueResult<Value> {
+    let future = args.first().cloned().unwrap_or(Value::Nil);
+    let ms = match args.get(1) {
+        Some(Value::Long(n)) => (*n).max(0) as u64,
+        other => {
+            return Err(ValueError::WrongType {
+                expected: "long (timeout ms)",
+                got: other.map(|v| v.type_name().to_string()).unwrap_or_default(),
+            });
+        }
+    };
+    let cancel_on_timeout = opts_bool(args.get(2), "cancel").unwrap_or(true);
+    Ok(spawn_future(async move {
+        let started = std::time::Instant::now();
+        let work = await_value(future.clone());
+        let timer = async move {
+            platform_sleep(ms).await;
+        };
+        tokio::pin!(work);
+        tokio::pin!(timer);
+        match futures_util::future::select(work, timer).await {
+            futures_util::future::Either::Left((result, _)) => result,
+            futures_util::future::Either::Right((_, _work)) => {
+                if cancel_on_timeout {
+                    cancel_one(&future);
+                }
+                let elapsed_ms = started.elapsed().as_millis() as i64;
+                let message = format!("await-with-timeout exceeded {ms}ms");
+                Err(EvalError::Thrown(Value::Error(GcPtr::new(
+                    ExceptionInfo::new(
+                        ValueError::Other(message.clone()),
+                        message,
+                        Some(MapValue::from_pairs(vec![
+                            (
+                                Value::keyword(Keyword::simple("type")),
+                                Value::keyword(Keyword::simple("timeout")),
+                            ),
+                            (
+                                Value::keyword(Keyword::simple("timeout")),
+                                Value::Long(ms as i64),
+                            ),
+                            (
+                                Value::keyword(Keyword::simple("elapsed")),
+                                Value::Long(elapsed_ms),
+                            ),
+                        ])),
+                        None,
+                    ),
+                ))))
+            }
+        }
+    }))
+}
+
+fn opts_map(opts: Option<&Value>) -> Option<&MapValue> {
+    match opts {
+        Some(Value::Map(m)) => Some(m),
+        Some(Value::Nil) | None => None,
+        Some(_) => None,
+    }
+}
+
+fn opts_keyword(opts: Option<&Value>, name: &str) -> Option<Value> {
+    let map = opts_map(opts)?;
+    map.get(&Value::keyword(Keyword::simple(name)))
+}
+
+fn opts_bool(opts: Option<&Value>, name: &str) -> Option<bool> {
+    match opts_keyword(opts, name)? {
+        Value::Bool(b) => Some(b),
+        Value::Nil => Some(false),
+        _ => None,
+    }
+}
+
+fn cancel_one(value: &Value) {
+    if let Value::Future(future) = value {
+        cancel_future(future);
+    }
+}
+
+fn cancel_value_futures(values: &[Value]) {
+    for value in values {
+        cancel_one(value);
+    }
 }
 
 /// `(thread-call f)` — run zero-arg function `f` as an async task on the

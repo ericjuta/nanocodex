@@ -1042,3 +1042,112 @@ fn await_position_watchdog_does_not_block_localset() {
     });
 }
 
+#[test]
+fn join_all_cancel_pending_on_error() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_F, &mut env);
+        eval_sync(
+            "(defn ^:async fail-fast [] (throw (ex-info \"boom\" {})))",
+            &mut env,
+        );
+        eval_sync(
+            "(defn ^:async linger [] (await (timeout 1000)) :late)",
+            &mut env,
+        );
+        let started = std::time::Instant::now();
+        let result = eval_async(
+            &parse_one("(await (join-all [(fail-fast) (linger)] {:on-error :cancel-pending}))"),
+            &mut env,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "cancel-pending should not wait for the lingering sibling"
+        );
+    });
+}
+
+#[test]
+fn join_all_settled_preserves_ordered_statuses() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_F, &mut env);
+        eval_sync(
+            "(require '[clojure.core.async :refer [join-all-settled]])",
+            &mut env,
+        );
+        eval_sync("(defn ^:async ok [] :ok)", &mut env);
+        eval_sync(
+            "(defn ^:async boom [] (throw (ex-info \"nope\" {:k 1})))",
+            &mut env,
+        );
+        let r = eval_async(
+            &parse_one("(await (join-all-settled [(ok) (boom)]))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        let s = pr(&r);
+        assert!(s.contains(":fulfilled"), "{s}");
+        assert!(s.contains(":rejected"), "{s}");
+        assert!(s.contains(":ok") || s.contains("ok"), "{s}");
+    });
+}
+
+#[test]
+fn race_cancels_losers_when_requested() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_F, &mut env);
+        eval_sync("(require '[clojure.core.async :refer [race]])", &mut env);
+        eval_sync("(defn ^:async fast [] (await (timeout 5)) :fast)", &mut env);
+        eval_sync(
+            "(defn ^:async slow [] (await (timeout 1000)) :slow)",
+            &mut env,
+        );
+        let started = std::time::Instant::now();
+        let r = eval_async(
+            &parse_one("(await (race [(fast) (slow)] {:cancel-losers true}))"),
+            &mut env,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Value::keyword(cljrs_value::Keyword::simple("fast")));
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+    });
+}
+
+#[test]
+fn await_with_timeout_cancels_and_throws() {
+    let globals = async_env();
+    block_on_local(async move {
+        let mut env = Env::new(globals, "user");
+        eval_sync(REQUIRE_F, &mut env);
+        eval_sync(
+            "(require '[clojure.core.async :refer [await-with-timeout]])",
+            &mut env,
+        );
+        eval_sync(
+            "(defn ^:async slow [] (await (timeout 1000)) :late)",
+            &mut env,
+        );
+        let started = std::time::Instant::now();
+        let err = eval_async(
+            &parse_one("(await (await-with-timeout (slow) 20 {:cancel true}))"),
+            &mut env,
+        )
+        .await
+        .expect_err("timeout should throw");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("timeout") || msg.contains("await-with-timeout"),
+            "{msg}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+    });
+}
