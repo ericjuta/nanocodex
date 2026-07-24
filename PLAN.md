@@ -348,7 +348,7 @@ stable cache/session headers, custom JavaScript tools, unified events, and the
 browser host contract. Native cancellation remains owned by the Phase 2 turn
 lifecycle rather than a binding-specific alternate runtime.
 
-### Phase 4: cljrs Code Mode structured concurrency and ergonomics (planned)
+### Phase 4: cljrs Code Mode structured concurrency and ergonomics (in progress)
 
 This milestone closes the remaining synchronous evaluator paths before adding
 higher-level orchestration APIs. It keeps ordinary Clojure futures and existing
@@ -426,11 +426,11 @@ scheduler, persistent user-code namespace, or alternate runtime.
 
 Each numbered slice is one reviewable commit and must leave focused tests green:
 
-1. [ ] Complete async evaluation and land the await-position conformance matrix.
-2. [ ] Add cancellable future state, cell-local handles, and race-safe Rust cleanup.
-3. [ ] Add tool scopes, settled composition, races, and cancelling deadlines.
-4. [ ] Carry exact spans and async frames into bounded diagnostics.
-5. [ ] Add structured discovery, pre-dispatch schema validation, and
+1. [x] Complete async evaluation and land the await-position conformance matrix.
+2. [x] Add cancellable future state, cell-local handles, and race-safe Rust cleanup.
+3. [x] Add tool scopes, settled composition, races, and cancelling deadlines.
+4. [x] Carry exact spans and async frames into bounded diagnostics.
+5. [x] Add structured discovery, pre-dispatch schema validation, and
    `code-mode-info`; then update guidance and examples.
 
 Gate:
